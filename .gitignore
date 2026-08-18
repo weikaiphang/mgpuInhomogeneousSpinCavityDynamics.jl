@@ -1,0 +1,11 @@
+*.jld2
+*.png
+*.pdf
+*.gif
+*.mp4
+*.o*
+*.e*
+Manifest.toml
+data/
+fig/
+test/*.jdl2

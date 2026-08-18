@@ -1,0 +1,40 @@
+name = "InhomogeneousSpinCavityDynamics"
+uuid = "d5b32329-195a-4cf2-8166-e16172a7f364"
+version = "0.1.0"
+authors = ["Sicheng Bao <sichengbao@u.nus.edu>"]
+
+[deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+DiffEqCallbacks = "459566f4-90b8-5000-8ac3-15dfb0a30def"
+DifferentialEquations = "0c46a032-eb83-5123-abaf-570d42b7fbaa"
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Measures = "442fdcdd-2543-5da2-b0f3-8c86c306513e"
+NCCL = "3fe64909-d7a1-4096-9b7d-7a0f12cf0f6b"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+OrdinaryDiffEqLowStorageRK = "b0944070-b475-4768-8dec-fb6eb410534d"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+QuadGK = "1fd47b50-473d-5c70-9696-f719f8f3bcdc"
+
+[compat]
+CUDA = "6.2.1"
+DiffEqCallbacks = "4.18.1"
+DifferentialEquations = "8.0.2"
+Distributions = "0.25.129"
+JLD2 = "0.6.5"
+JSON3 = "1.14.3"
+LinearAlgebra = "1.12.0"
+Measures = "0.3.3"
+NCCL = "0.1.3"
+OrdinaryDiffEq = "7.6.0"
+OrdinaryDiffEqLowStorageRK = "3.3.0"
+Plots = "1.41.6"
+Printf = "1.11.0"
+QuadGK = "2.11.3"
+julia = "1.12"
+
+[extras]
+CUDA_Runtime_jll = "76a88914-d11a-5bdc-97e0-2f5a05c973a2"
