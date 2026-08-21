@@ -139,7 +139,7 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     )
 
     filename = CONFIG.saved_file_name
-    @save filename data
+    save_run_data(filename, data)
 
     println("Saving to: ", filename)
 

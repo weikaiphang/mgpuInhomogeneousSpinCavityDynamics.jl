@@ -214,7 +214,7 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
     # Freed above, before this (potentially slow) disk write, rather than
     # after -- the GPU allocation has no reason to be held hostage by I/O.
     filename = CONFIG.saved_file_name
-    @save filename data
+    save_run_data(filename, data)
     verbose && println("Saving to: ", filename)
 
     return data

@@ -4,10 +4,13 @@ using CUDA
 using DiffEqCallbacks
 using DifferentialEquations
 using Distributions
+using ForwardDiff
 using JLD2
 using LinearAlgebra
+using Plots
 using Printf
 using QuadGK
+using Random
 
 # Configurations
 include("config.jl")
@@ -22,6 +25,16 @@ include("initial_conditions_1st_order.jl")
 include("rhs_1st_order.jl")
 include("peak_detection_helpers.jl")
 include("solver_1st_order.jl")
+
+# Differentiable composite pi-pulse optimisation (ForwardDiff/Adam +
+# basin-hopping port of InhomogeneousSpinCavityDynamics.py's
+# pulse_optimized_spline.py, driving THIS package's own rhs_1st_order!/
+# prepare_derived rather than the Python side's simplified toy model)
+include("bspline.jl")
+include("composite_pulse.jl")
+include("canon_pulses.jl")
+include("pulse_optimizer.jl")
+include("jld2_pulse_loader.jl")
 
 # 2nd-order simulation (single-GPU)
 include("state_layout_2nd_order.jl")
@@ -76,6 +89,25 @@ export SolverOptions, ObservableStore
 # Pulse exports
 export build_E_of_t
 export sample_E_of_t
+export save_E_samples
+export save_run_data
+export plot_E_of_t
+
+# Differentiable composite pi-pulse optimisation exports
+export build_full_config, prepare_derived  # needed to build the `d` argument below
+export make_clamped_knots, bspline_basis, bspline_eval, bspline_area, bspline_antiderivative
+export CompositePulse, n_params, decode, initial_guess, total_area, pulse_duration
+export k_of_seed_kind, seed_hs1, seed_composite_with_ghosts, seed_corpse, seed_bb1, seed_canonical
+export run_sim_1st_order_pure, pulse_metrics, pulse_cost
+export AdamState, adam_step!, run_local_adam, optimise_composite_pulse
+export optimise_composite_pulse_over_k
+
+# JLD2-driven signal/control pulse optimisation exports
+export load_jld2_run, split_signal_control, build_signal_E_of_t
+export run_sim_1st_order_trajectory, reconcile_against_jld2
+export optrunlog_paths, save_optimisation_run_log
+export optimise_control_pulse_from_jld2
+export optimise_control_pulse_from_jld2_over_k
 
 # Noise exports
 export NoiseSimulationData

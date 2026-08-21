@@ -545,7 +545,7 @@ function run_sim_1st_order(
     )
 
     filename = CONFIG.saved_file_name
-    @save filename data
+    save_run_data(filename, data)
 
     println()
     println("Saving to: ", filename)
