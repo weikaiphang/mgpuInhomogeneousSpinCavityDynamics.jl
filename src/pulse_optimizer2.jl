@@ -1,7 +1,21 @@
 # ============================================================
-# DIFFERENTIABLE PULSE OPTIMISATION
+# DIFFERENTIABLE PULSE OPTIMISATION (dual-trajectory)
 #
-# Julia port of InhomogeneousSpinCavityDynamics.py/pulse_optimized_spline.py.
+# Julia port of InhomogeneousSpinCavityDynamics.py/pulse_optimized_spline.py,
+# extended with a DUAL-TRAJECTORY cost (see pulse_metrics/pulse_cost below):
+# where pulse_optimizer.jl scores a candidate pulse from a single :ground
+# solve, this file runs the SAME pulse u from two independent initial
+# conditions -- :ground (inversion) and :equator (collective silencing
+# factor |F|, a cooperativity-weighted mode-overlap integral, NOT a
+# per-bin coherence average -- see _weighted_silencing_factor) -- and
+# optimises both simultaneously via a target_F-driven penalty (target_F=1
+# for RASE-style revival, target_F=0 for ROSE-style silencing), plus an
+# L2 power penalty on the decoded amplitude coefficients (w_power). This
+# is the finalised, actively-maintained pulse-optimisation entry point
+# for this package (see InhomogeneousSpinCavityDynamics.jl's own include
+# list); pulse_optimizer.jl predates the dual-trajectory cost and is no
+# longer included in the module.
+#
 # Ports the algorithmic structure (B-spline composite pulse, Adam descent
 # with early stopping, basin-hopping outer loop) while driving THIS
 # package's own real physics (rhs_1st_order!, prepare_derived) rather
@@ -15,6 +29,21 @@
 # caveat, since forward-mode propagates dual numbers through ordinary
 # arithmetic rather than needing a custom reverse-mode/checkpointing rule
 # for complex state).
+#
+# Cost is expensive: each epoch differentiates through TWO full ODE
+# solves (one per initial condition) via a single combined
+# ForwardDiff.gradient call. On the M=20000 real ensemble
+# (data/data_1st_order/duration_100us_gstd_1em06Hz.jld2), a 15-epoch,
+# single-hop run took ~6 hours and produced a genuinely good result under
+# this file's PREDECESSOR cost (a per-bin |Sp| coherence average, not
+# the silencing factor below): inversion 0.91, coherence 0.93, up from
+# 0.47/0.88 at init -- verified end-to-end, not just gradient-checked on
+# the small toy config. That result is evidence the dual-trajectory
+# (:ground + :equator) approach itself works end-to-end; the silencing
+# factor replacing coherence has been gradient-checked on the small toy
+# config only (see _weighted_silencing_factor's own docstring for why a
+# naive per-bin phasor version was rejected) -- a full real-ensemble run
+# under the new cost has not been repeated yet.
 # ============================================================
 
 """
@@ -28,16 +57,25 @@ so the initial state promotes correctly alongside the ODE's `E_of_t`-
 driven trajectory.
 """
 function build_u0_1st_order_cpu(M::Integer, Nj::AbstractVector, ::Type{T},
-                                 initial_condition::Symbol=:ground) where {T}
+    initial_condition::Symbol=:ground) where {T}
     u0 = zeros(Complex{T}, state_length_1st_order(M))
+    sp = IDX1_Sp_start:idx1_Sz_start(M)-1
+    sz = idx1_Sz_start(M):state_length_1st_order(M)
     if initial_condition == :ground
-        u0[idx1_Sz_start(M):end] .= .-Nj ./ 2
+        # South pole: Sz = -Nj/2, Sp = 0
+        u0[sz] .= .-Nj ./ 2
     elseif initial_condition == :inverted
-        u0[idx1_Sz_start(M):end] .= Nj ./ 2
+        # North pole: Sz = +Nj/2, Sp = 0
+        u0[sz] .= Nj ./ 2
+    elseif initial_condition == :equator
+        # +x equator: Sz = 0, Sp = Nj/2 (real). Same Bloch radius Nj/2 as
+        # :ground / :inverted, so a π_x pulse can invert z AND leave +x
+        # on the equator (the dual-trajectory π-pulse cost).
+        u0[sp] .= Nj ./ 2
     elseif initial_condition == :custom
         # already zero
     else
-        error("Unknown initial_condition = $(initial_condition). Use :ground, :inverted, or :custom.")
+        error("Unknown initial_condition = $(initial_condition). Use :ground, :inverted, :equator, or :custom.")
     end
     return u0
 end
@@ -139,96 +177,192 @@ function run_sim_1st_order_pure(
     return a, collect(Sp), collect(Sz), d.Nj
 end
 
-"""
-    pulse_metrics(u, pulse, d; kwargs...) -> (inversion, coherence)
+function _forbid_initial_condition(kwargs)
+    :initial_condition in keys(kwargs) && error(
+        "dual-trajectory cost fixes initial conditions to :ground (inversion) and " *
+        ":equator (silencing). Do not pass initial_condition into pulse_cost / " *
+        "pulse_metrics / optimise_composite_pulse."
+    )
+    return nothing
+end
 
-Runs [`run_sim_1st_order_pure`](@ref) and reduces the final state to two
-scalars in `[0, 1]`, higher = better:
-- `inversion`: `Nj`-population-weighted mean fractional population
-  inversion (`real(Sz)/(Nj/2)` mapped from `[-1,1]` to `[0,1]`).
-- `coherence`: `Nj`-population-weighted mean normalised `|Sp|`.
-
-`Nj`-weighting (`Nj ./ sum(Nj)`, rather than the 1D `p_delta` this
-package's `prepare_derived` also returns) is used so this generalises
-correctly whether `M_g == 1` or not, without needing to reshape the
-flattened `(M_delta*M_g,)` bins back to `(M_delta, M_g)`.
-
-`|Sp|` is computed as `sqrt(abs2(Sp) + 1e-30)`, not `abs(Sp)`: `abs` of a
-complex Dual has a removable-singularity derivative at exactly `z=0`
-(`d|z| = (re*d(re)+im*d(im))/|z|`, i.e. `0/0`), and `Sp` lands exactly at
-`0` (to every order) whenever the composite pulse's active window has no
-overlap with `d.timespan` at all -- e.g. an optimiser step pushed far
-enough past `pulse.T_max` that nothing in `run_sim_1st_order_pure` ever
-sees a nonzero drive. `ForwardDiff.gradient` returns `NaN` there
-otherwise, which would corrupt the whole `u` vector on the next `Adam`
-step even though every other term (including the `w_tmax` penalty
-pulling back toward the window) still has a perfectly good gradient at
-that point. The `1e-30` epsilon matches the one already used below for
-the `Nj/2` denominator and is negligible at any `Sp` scale this ensemble
-actually produces.
-"""
-function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; kwargs...)
-    _, Sp, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; kwargs...)
-    T = eltype(u)
+function _weighted_inversion(Sz, Nj, ::Type{T}) where {T}
     weight = Nj ./ sum(Nj)
     Sz_fraction = real.(Sz) ./ (Nj ./ 2 .+ 1e-30)
-    inversion = sum(weight .* clamp.((Sz_fraction .+ 1) ./ 2, zero(T), one(T)))
-    Sp_abs = sqrt.(abs2.(Sp) .+ 1e-30)
-    Sp_fraction = Sp_abs ./ (Nj ./ 2 .+ 1e-30)
-    coherence = sum(weight .* clamp.(Sp_fraction, zero(T), one(T)))
-    return inversion, coherence
+    return sum(weight .* clamp.((Sz_fraction .+ 1) ./ 2, zero(T), one(T)))
 end
 
 """
-    pulse_cost(u, pulse, d; w_inv=1.0, w_coh=0.7, w_time=0.15, w_tmax=1.0, kwargs...) -> (cost, inversion, coherence, duration)
+    _weighted_coherence(Sp, Nj, ::Type{T}) -> T
 
-Scalar cost to be minimised:
+Per-bin `Nj`-weighted mean of `|Sp_j|/(Nj_j/2)`, in `[0, 1]`. NOT used by
+[`pulse_cost`](@ref)/[`pulse_metrics`](@ref) (superseded there by
+[`_weighted_silencing_factor`](@ref)'s collective mode-overlap `|F|`) --
+kept only so [`save_optimisation_run_log`](@ref) can log this simpler,
+per-bin-average metric alongside the silencing factor actually being
+optimised, for comparison. Same `1e-30` epsilon pattern as
+`_weighted_inversion`'s denominator (`abs(Dual(0))` is `0/0` otherwise).
+"""
+function _weighted_coherence(Sp, Nj, ::Type{T}) where {T}
+    weight = Nj ./ sum(Nj)
+    Sp_abs = sqrt.(abs2.(Sp) .+ 1e-30)
+    Sp_fraction = Sp_abs ./ (Nj ./ 2 .+ 1e-30)
+    return sum(weight .* clamp.(Sp_fraction, zero(T), one(T)))
+end
 
-    J = -w_inv*inversion - w_coh*coherence + w_time*(duration/T_max)
-        + w_tmax*max(t_end[end]-T_max, 0)^2/T_max^2
+"""
+    _weighted_silencing_factor(Sp, g_b, Nj, ::Type{T}) -> T
 
-Both duration-related terms are normalised by `pulse.T_max` so they sit
-on the same `O(1)` scale as `inversion`/`coherence`, rather than in
-seconds (`~1e-4`-`1e-7` for these pulses): `w_time*duration` alone (no
-`/T_max`) is numerically inert at any sane `w_time` -- it never
-meaningfully competed with the other two terms for gradient signal, so
-in practice it did nothing.
+Collective mode-overlap silencing factor `|F| ∈ [0, 1]` from the
+equatorial track's end-state `Sp = <S^+>`:
 
-`w_tmax` is ON by default (`1.0`, not `0`): [`pulse_duration`](@ref) is
-measured from `t=0` (so a longer leading gap already raises the
-`w_time*duration` term), but nothing else stops `t_end[end]` drifting
-past `pulse.T_max` during optimisation, which is silently truncated in
-`run_sim_1st_order_pure` (only `d.timespan` is ever integrated) --
-`w_tmax`'s quadratic penalty is what actually keeps the optimiser inside
-the simulated window; without it there is nothing but the (much softer)
-`w_time` pressure standing between Adam and a pulse the ODE never fully
-sees. Set `w_tmax=0` to disable it and go back to the un-penalised
-behaviour.
+    F = (Σ_j Nj_j g_j² Sp_j) / (Σ_j Nj_j g_j² (Nj_j/2))
 
-If the ODE solve fails, this returns `Inf` for the cost rather than
-using a partial `sol.u[end]`. Direct callers of
-[`run_sim_1st_order_pure`](@ref) still see a thrown
-`PulseSolveFailed`.
+The denominator is the maximum magnitude the numerator could reach if
+every bin retained full coherence (`|Sp_j| = Nj_j/2`, the standard
+Dicke-state bound this file already assumes elsewhere -- see
+[`_weighted_inversion`](@ref)'s `Sz_fraction` clamp) AND every bin's
+phase were perfectly aligned; `|Σ w_j Sp_j| <= Σ w_j |Sp_j| <= Σ w_j
+(Nj_j/2)` by the triangle inequality, so `|F| <= 1` always, matching a
+`|Sp|`-based coherence metric's own `[0, 1]` scale. `Nj_j g_j²`
+weighting (not plain `Nj_j`) is the standard cooperativity-style
+weighting (`g2_avg` in ensemble.jl) so bins that actually couple
+strongly to the cavity mode dominate the collective sum.
+
+The denominator is a FIXED (`u`-independent) constant built only from
+`g_b`/`Nj` -- deliberately not `Σ_j Nj_j g_j² |Sp_j|` or any other
+per-bin normalisation. Dividing each bin's `Sp_j` by ITS OWN `|Sp_j|`
+(extracting a per-bin unit phasor) was considered and rejected: `d(|z|^2)
+= 2*Re(z^* dz)`, which is exactly `0` AT `z=0` regardless of `dz`, so
+`Sp_j / sqrt(abs2(Sp_j)+eps)`'s derivative scales like `1/sqrt(eps) ~
+1e15` for any bin whose `Sp_j` passes near `0` -- routine across a wide
+inhomogeneous ensemble (many bins, wide detuning spread), not a rare
+edge case, and it would inject an enormously amplified, physically
+meaningless gradient component with no `NaN`/`Inf` to flag it (silent
+corruption, not a clean failure). Summing the raw (non-unit-normalised)
+`Sp_j` first and normalising the WHOLE sum by a constant afterward has
+no such singularity anywhere: the only division is by a fixed number
+that never depends on `u`.
+"""
+function _weighted_silencing_factor(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector, ::Type{T}) where {T}
+    weight = Nj .* abs2.(g_b)
+    max_coherent_sum = sum(weight .* Nj) / 2
+    F_complex = sum(weight .* Sp) / (max_coherent_sum + 1e-30)
+    abs_F = sqrt(abs2(F_complex) + 1e-30)
+    return clamp(abs_F, zero(T), one(T))
+end
+
+"""
+    pulse_metrics(u, pulse, d; kwargs...) -> (inversion, silencing, coherence)
+
+Dual-trajectory metrics used by [`pulse_cost`](@ref). `inversion` and
+`silencing` are both in `[0, 1]`, higher = better, and are NOT two
+coordinates of one Bloch vector:
+
+- `inversion`: from `:ground` (`Sz = -Nj/2`, `Sp = 0`). `Nj`-weighted mean
+  of `real(Sz)/(Nj/2)` mapped from `[-1, 1]` to `[0, 1]`. A π pulse scores
+  near 1.
+- `silencing`: from `:equator` (`Sz = 0`, `Sp = Nj/2` along +x). Collective,
+  cooperativity-weighted mode-overlap factor `|F|` (see
+  [`_weighted_silencing_factor`](@ref)) -- how much of the ensemble's
+  equatorial coherence survives IN PHASE with the cavity mode, not a
+  per-bin magnitude average. `F=1`: every bin coherent and phase-aligned
+  (RASE-style revival). `F=0`: fully decohered OR fully destructively
+  interfering (ROSE-style silencing) -- these are NOT distinguishable
+  from `|F|` alone, by design (both `target_F=0` and this metric only
+  ever measure the SIZE of the collective coherent sum).
+- `coherence`: the OLDER, simpler per-bin `Nj`-weighted mean of
+  `|Sp|/(Nj/2)` (see [`_weighted_coherence`](@ref)), from the SAME
+  `:equator` solve as `silencing` (no extra ODE solve). DIAGNOSTIC ONLY --
+  never fed into [`pulse_cost`](@ref)'s optimised objective, recorded
+  purely so callers/logs can compare it against the collective `|F|`
+  actually being optimised.
+
+`Nj`-weighting for `inversion` (`Nj ./ sum(Nj)`, rather than the 1D
+`p_delta` this package's `prepare_derived` also returns) is used so this
+generalises correctly whether `M_g == 1` or not. Do not pass
+`initial_condition` — both ICs are fixed here. Solver kwargs
+(`signal_E_of_t`, `reltol`, ...) are forwarded to both solves.
+"""
+function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; kwargs...)
+    _forbid_initial_condition(kwargs)
+    T = eltype(u)
+    _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; kwargs..., initial_condition=:ground)
+    inversion = _weighted_inversion(Sz, Nj, T)
+    _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; kwargs..., initial_condition=:equator)
+    silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
+    coherence = _weighted_coherence(Sp, Nj_eq, T)
+    return inversion, silencing, coherence
+end
+
+"""
+    pulse_cost(u, pulse, d; w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
+        -> (cost, inversion, silencing, duration, coherence)
+
+Scalar cost to be minimised. Inversion and silencing are scored on
+**two independent ODE solves** of the same pulse `u` (see
+[`pulse_metrics`](@ref)): `:ground` → inversion, `:equator` → collective
+silencing factor `|F|`. `target_F` picks which cavity-QED protocol this
+pulse is being optimised for: `target_F=1.0` (default) rewards
+preserving collective coherence (RASE-style revival); `target_F=0.0`
+rewards destroying it (ROSE-style echo silencing). Do not set `w_inv`/
+`w_sil` to 0 unless you want only one of the two objectives.
+
+    J = -w_inv*inversion + w_sil*(silencing - target_F)²
+        + w_time*(duration/T_max) + w_tmax*max(t_end[end]-T_max, 0)²/T_max²
+        + w_power*mean(|cA/amp_scale|²)
+
+`w_power` is an L2 penalty on the decoded, scale-normalised amplitude
+coefficients (i.e. `softplus.(raw_cA)`). Failed solves return `Inf`.
+Do not pass `initial_condition`.
+
+`coherence` is the OLDER, simpler per-bin `Nj`-weighted mean of
+`|Sp|/(Nj/2)` (see [`_weighted_coherence`](@ref)/[`pulse_metrics`](@ref)),
+computed from the SAME `:equator` solve as `silencing` whenever
+`w_sil > 0` (no extra ODE solve); it stays `zero(T)` when `w_sil <= 0`
+disables that solve, exactly mirroring `silencing`'s own on/off behaviour
+in that regime. It is DIAGNOSTIC ONLY -- recorded for comparison, never
+part of `cost`, which depends only on `inversion` and `silencing`.
 """
 function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
-                     w_inv=1.0, w_coh=0.7, w_time=0.15, w_tmax=1.0, kwargs...)
+                     w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
+    _forbid_initial_condition(kwargs)
     T = eltype(u)
     duration = pulse_duration(pulse, u)
-    _, t_end, _, _ = decode(pulse, u)
+    _, t_end, cA, _ = decode(pulse, u)
+
     tmax_excess = max(t_end[end] - pulse.T_max, zero(T))
     tmax_penalty = w_tmax * (tmax_excess / pulse.T_max)^2
 
-    inversion, coherence = try
-        pulse_metrics(u, pulse, d; kwargs...)
+    normalized_cA = cA ./ pulse.amp_scale
+    power_penalty = w_power * (sum(abs2, normalized_cA) / length(normalized_cA))
+
+    inversion = zero(T)
+    silencing = zero(T)
+    coherence = zero(T)
+
+    try
+        if w_inv > 0.0
+            _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; kwargs..., initial_condition=:ground)
+            inversion = _weighted_inversion(Sz, Nj, T)
+        end
+        if w_sil > 0.0
+            _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; kwargs..., initial_condition=:equator)
+            silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
+            # Diagnostic only -- reuses the equator solve already run above
+            # for `silencing`, so this costs nothing extra; NOT part of `cost`.
+            coherence = _weighted_coherence(Sp, Nj_eq, T)
+        end
     catch e
         e isa PulseSolveFailed || rethrow()
         infT = convert(T, Inf)
         nanT = convert(T, NaN)
-        return infT, nanT, nanT, duration
+        return infT, nanT, nanT, duration, nanT
     end
 
-    cost = -w_inv * inversion - w_coh * coherence + w_time * (duration / pulse.T_max) + tmax_penalty
-    return cost, inversion, coherence, duration
+    silencing_penalty = w_sil * (silencing - convert(T, target_F))^2
+    cost = -w_inv * inversion + silencing_penalty + w_time * (duration / pulse.T_max) + tmax_penalty + power_penalty
+    return cost, inversion, silencing, duration, coherence
 end
 
 # ============================================================
@@ -274,7 +408,7 @@ end
 # ============================================================
 
 """
-    run_local_adam(u_start, pulse, d, cost_kwargs; hop=0, num_epochs=30, patience=5, tol=1e-3, learning_rate=0.05, label="", kwargs...) -> (best_u, best_cost, best_inversion, best_coherence, best_duration, history)
+    run_local_adam(u_start, pulse, d, cost_kwargs; hop=0, num_epochs=30, patience=5, tol=1e-3, learning_rate=0.05, label="", kwargs...) -> (best_u, best_cost, best_inversion, best_silencing, best_duration, history)
 
 One basin's local descent: Adam from `u_start`, stopped either after
 `num_epochs` or after `patience` consecutive epochs without a cost
@@ -304,7 +438,7 @@ stalling.
 Retrying is NOT re-evaluated from scratch: `last_good_u` is the exact
 point already solved (one ODE solve + AD gradient) the moment it was
 first accepted, so every backoff retry from it reuses that cached
-`(grad, cost, inversion, coherence, duration)` instead of re-running an
+`(grad, cost, inversion, silencing, duration)` instead of re-running an
 identical, deterministic, and potentially expensive (`MaxIters`-bound
 before it even reports failure) computation for a point already known.
 `Adam`'s own `(m, v, t)` are similarly snapshotted the moment `last_good_u`
@@ -318,40 +452,45 @@ best point -- the caller is responsible for tracking the GLOBAL best across
 basins (a basin's local best is not necessarily better than a previous
 basin's) -- plus `history`, a `Vector{<:NamedTuple}` with one entry per
 epoch actually run
-(`hop, epoch, k, cost, inversion, coherence, duration, improved`),
-tagged with the caller-supplied `hop` index so a caller accumulating
-history across many basins can tell which hop each row came from. `k`
-(the sub-pulse count, from `pulse.k`) is recorded on every row too, even
-though it's constant within a single call, so history rows stay
+(`hop, epoch, k, cost, inversion, silencing, duration, coherence,
+improved`), tagged with the caller-supplied `hop` index so a caller
+accumulating history across many basins can tell which hop each row came
+from. `k` (the sub-pulse count, from `pulse.k`) is recorded on every row
+too, even though it's constant within a single call, so history rows stay
 self-describing if ever concatenated across runs with a different `k`
 (e.g. a later warm-started continuation using a different `CompositePulse`
-shape).
+shape). `coherence` is [`pulse_cost`](@ref)'s DIAGNOSTIC-ONLY per-bin
+`|Sp|/(Nj/2)` average from the same `:equator` solve as `silencing` (see
+[`_weighted_coherence`](@ref)) -- recorded for comparison alongside the
+collective `|F|` actually being optimised, never part of `cost` itself.
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
                          learning_rate::Real=0.05, label::AbstractString="", solve_kwargs...)
+    _forbid_initial_condition(solve_kwargs)
     u = copy(u_start)
     n = length(u)
     adam = AdamState(n)
-    aux = Ref{NTuple{4,Float64}}((NaN, NaN, NaN, NaN))
+    aux = Ref{NTuple{5,Float64}}((NaN, NaN, NaN, NaN, NaN))
     function cost_only(uu)
-        c, inv_, coh_, dur_ = pulse_cost(uu, pulse, d; cost_kwargs..., solve_kwargs...)
+        c, inv_, sil_, dur_, coh_ = pulse_cost(uu, pulse, d; cost_kwargs..., solve_kwargs...)
         aux[] = (
             Float64(ForwardDiff.value(c)),
             Float64(ForwardDiff.value(inv_)),
-            Float64(ForwardDiff.value(coh_)),
+            Float64(ForwardDiff.value(sil_)),
             Float64(ForwardDiff.value(dur_)),
+            Float64(ForwardDiff.value(coh_)),
         )
         return c
     end
 
     best_u = copy(u_start)
-    best_cost, best_inv, best_coh, best_dur = Inf, 0.0, 0.0, 0.0
+    best_cost, best_inv, best_sil, best_dur = Inf, 0.0, 0.0, 0.0
     epochs_since_improve = 0
     history = NamedTuple[]
     last_good_u = copy(u_start)
     last_good_grad = zeros(n)
-    last_good_aux = (NaN, NaN, NaN, NaN)
+    last_good_aux = (NaN, NaN, NaN, NaN, NaN)
     adam_m0 = zeros(n)
     adam_v0 = zeros(n)
     adam_t0 = 0
@@ -372,19 +511,18 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # on top of whatever the previous failed attempt already blended in.
         if just_reverted
             grad = last_good_grad
-            cost, inv_, coh_, dur_ = last_good_aux
+            cost, inv_, sil_, dur_, coh_ = last_good_aux
             adam.m .= adam_m0
             adam.v .= adam_v0
             adam.t = adam_t0
         else
             grad = ForwardDiff.gradient(cost_only, u)
-            cost, inv_, coh_, dur_ = aux[]
+            cost, inv_, sil_, dur_, coh_ = aux[]
         end
-
         if !isfinite(cost)
             epochs_since_improve += 1
             push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
-                             coherence=coh_, duration=dur_, improved=false))
+                             silencing=sil_, duration=dur_, coherence=coh_, improved=false))
             elapsed = time() - t_wall
             u .= last_good_u
             lr /= 2
@@ -404,7 +542,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         lr = min(lr * 1.5, learning_rate)
         last_good_u .= u
         last_good_grad .= grad
-        last_good_aux = (cost, inv_, coh_, dur_)
+        last_good_aux = (cost, inv_, sil_, dur_, coh_)
         adam_m0 .= adam.m
         adam_v0 .= adam.v
         adam_t0 = adam.t
@@ -413,14 +551,14 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         improved = cost < best_cost - tol
         if improved
             best_cost, best_u = cost, copy(u)
-            best_inv, best_coh, best_dur = inv_, coh_, dur_
+            best_inv, best_sil, best_dur = inv_, sil_, dur_
             epochs_since_improve = 0
         else
             epochs_since_improve += 1
         end
 
         push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
-                         coherence=coh_, duration=dur_, improved=improved))
+                         silencing=sil_, duration=dur_, coherence=coh_, improved=improved))
 
         adam_step!(u, grad, adam; lr=lr)
 
@@ -429,7 +567,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         println(
             "$label epoch $(lpad(epoch, 3)): $(round(elapsed, digits=1))s  " *
             "cost=$(round(cost, digits=4)) $mark inversion=$(round(inv_, digits=4)) " *
-            "coherence=$(round(coh_, digits=4)) duration=$(round(dur_, sigdigits=4))s"
+            "silencing=$(round(sil_, digits=4)) duration=$(round(dur_, sigdigits=4))s"
         )
 
         if epochs_since_improve >= patience
@@ -438,15 +576,16 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         end
     end
 
-    return best_u, best_cost, best_inv, best_coh, best_dur, history
+    return best_u, best_cost, best_inv, best_sil, best_dur, history
 end
 
 """
     optimise_composite_pulse(k, n_coeff_A, n_coeff_f, d;
         num_epochs=30, learning_rate=0.05, patience=5, tol=1e-3,
         n_hops=3, hop_patience=2, hop_step_size=0.5, temperature=1.0,
-        degree=3, taper_frac=0.1, w_tmax=1.0, seed=42, warm_start_u=nothing,
-        label_prefix="", solve_kwargs...)
+        degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
+        w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, seed=42,
+        warm_start_u=nothing, label_prefix="", solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Basin-hopping global search over composite-pulse solutions for THIS
@@ -476,28 +615,32 @@ docstrings carry: `num_epochs`/`n_hops` default to modest smoke-test
 budgets, not a converged global optimum.
 
 `degree` / `taper_frac` are forwarded to [`CompositePulse`](@ref) (defaults
-3 and 0.1, same as constructing the pulse by hand). `w_tmax` is forwarded
-to [`pulse_cost`](@ref) and defaults to `1.0`, matching that function's
-own default (ON: penalise `t_end[end]` drifting past `pulse.T_max`) --
-pass `w_tmax=0` here to disable it. These three are explicit keywords so
-they are NOT passed through to the ODE solver.
+3 and 0.1, same as constructing the pulse by hand). `w_tmax`, `w_power`,
+`w_inv`, `w_sil`, `target_F`, and `w_time` are forwarded to
+[`pulse_cost`](@ref). Defaults keep both dual-trajectory weights on
+(`w_inv=1`, `w_sil=0.7`) targeting `target_F=1.0` (RASE-style revival;
+pass `target_F=0.0` for ROSE-style silencing instead). These are explicit
+keywords so they are NOT passed through to the ODE solver. Do not pass
+`initial_condition` — the cost fixes `:ground` and `:equator` itself.
 
 Besides the optimised `(best_u, best_cost, pulse)`, also returns: `u0`
 (the initial/candidate parameterisation hop 0 actually started from --
 either a fresh random guess or `warm_start_u`, see below),
-`initial_metrics` (`(cost, inversion, coherence, duration)` at `u0`, from
-[`pulse_cost`](@ref)), `history` -- the [`run_local_adam`](@ref) per-epoch
+`initial_metrics` (`(cost, inversion, silencing, duration, coherence)` at
+`u0`, from [`pulse_cost`](@ref) -- `coherence` is diagnostic only, never
+part of `cost`), `history` -- the [`run_local_adam`](@ref) per-epoch
 log from EVERY hop, concatenated in run order (each row tagged with its
 own `hop`/`epoch`) -- `final_metrics` (the same `(cost, inversion,
-coherence, duration)` shape, for `best_u` specifically -- NOT necessarily
+silencing, duration, coherence)` shape, for `best_u` specifically -- NOT necessarily
 `history[end]`, since `best_u` can come from an earlier epoch than the
 last one run), and `optimizer_settings`, a `NamedTuple` of every setting
 that actually affected this run: `k`/`n_coeff_A`/`n_coeff_f`/`degree`/
 `taper_frac` plus every one of this function's own explicit keyword
 arguments (`num_epochs`, `learning_rate`, `patience`, `tol`, `n_hops`,
-`hop_patience`, `hop_step_size`, `temperature`, `w_tmax`, `seed`), plus
+`hop_patience`, `hop_step_size`, `temperature`, `w_tmax`, `w_power`,
+`w_inv`, `w_sil`, `target_F`, `w_time`, `seed`), plus
 any of `solve_kwargs` whose value isn't a `Function` (so e.g. a numeric
-`reltol`/`abstol`/`w_inv`/`w_coh`/`w_time` override is captured, while a
+`reltol`/`abstol`/`w_inv`/`w_sil`/`w_time` override is captured, while a
 non-serialisable closure like `signal_E_of_t` is deliberately excluded --
 that one is captured separately, as `use_signal`/`n_signal`, by
 [`optimise_control_pulse_from_jld2`](@ref), since those two scalars are
@@ -519,23 +662,21 @@ function optimise_composite_pulse(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
     num_epochs::Integer=30, learning_rate::Real=0.05, patience::Integer=5, tol::Real=1e-3,
     n_hops::Integer=3, hop_patience::Integer=2, hop_step_size::Real=0.5, temperature::Real=1.0,
-    degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0,
+    degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
+    w_inv::Real=1.0, w_sil::Real=0.7, target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="", solve_kwargs...,
 )
+    _forbid_initial_condition(solve_kwargs)
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
-    cost_kwargs = (w_tmax=w_tmax,)
+    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time)
     rng = Random.Xoshiro(seed)
 
-    # Every setting that actually affects this run, for a replicable log
-    # entry -- see this function's own docstring. solve_kwargs is filtered
-    # to non-Function values only, so a numeric override (reltol, abstol,
-    # w_inv, ...) is captured but a closure (signal_E_of_t) is not.
     solve_settings = NamedTuple(kv for kv in pairs(solve_kwargs) if !(kv[2] isa Function))
     optimizer_settings = merge(
         (k=k, n_coeff_A=n_coeff_A, n_coeff_f=n_coeff_f, degree=degree, taper_frac=taper_frac,
          num_epochs=num_epochs, learning_rate=learning_rate, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
-         w_tmax=w_tmax, seed=seed),
+         w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed),
         solve_settings,
     )
 
@@ -661,6 +802,7 @@ function optimise_composite_pulse_over_k(
     :warm_start_u in keys(optimizer_kwargs) && error(
         "optimise_composite_pulse_over_k builds a per-k canonical seed; do not pass warm_start_u."
     )
+    _forbid_initial_condition(optimizer_kwargs)
 
     job_specs = _normalise_k_specs(kinds, specs)
     isempty(job_specs) && error("No (k, kind) specs to optimise.")

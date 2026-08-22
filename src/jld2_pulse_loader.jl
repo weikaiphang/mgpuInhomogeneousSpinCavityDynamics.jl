@@ -6,7 +6,7 @@
 # PULSE_CONFIG into a FIXED signal pulse and the file's own original
 # control pulse(s), and reconciles a signal+original-control forward
 # solve (via this package's own CPU rhs_1st_order! machinery -- see
-# pulse_optimizer.jl) against the file's saved trajectory BEFORE allowing
+# pulse_optimizer2.jl) against the file's saved trajectory BEFORE allowing
 # any optimisation to proceed. Once reconciled, optimise_control_pulse_
 # from_jld2 hands off to optimise_composite_pulse with the control pulse
 # replaced by a CompositePulse (B-spline) and the signal pulse layered in
@@ -181,14 +181,15 @@ function reconcile_against_jld2(
 end
 
 """
-    optrunlog_paths(path; out_dir=nothing) -> (optrunlog_path, pulsemat_path)
+    optrunlog_paths(path; out_dir=nothing) -> (optrunlog_path, pulsemat_path, pulsepara_path)
 
-Derives this run's `<basename>_optrunlog.jld2`/`<basename>_opt_pulsemat.csv`
-output paths from the SOURCE `.jld2` path's own basename -- the same
-"same directory, same basename + suffix" convention `save_run_data`
-already uses for its own `_pulsemat.csv` sibling (see `pulses.jl`). Pass
-`out_dir` to write both files elsewhere instead of alongside `path`;
-either way the containing directory is created if it doesn't exist yet.
+Derives this run's `<basename>_optrunlog.jld2`/`<basename>_opt_pulsemat.csv`/
+`<basename>_opt_pulsepara.jld2` output paths from the SOURCE `.jld2` path's
+own basename -- the same "same directory, same basename + suffix"
+convention `save_run_data` already uses for its own `_pulsemat.csv`
+sibling (see `pulses.jl`). Pass `out_dir` to write all three files
+elsewhere instead of alongside `path`; either way the containing directory
+is created if it doesn't exist yet.
 """
 function optrunlog_paths(path::AbstractString; out_dir=nothing)
     endswith(path, ".jld2") || error("Expected a .jld2 path, got $path.")
@@ -196,7 +197,55 @@ function optrunlog_paths(path::AbstractString; out_dir=nothing)
     dir = out_dir === nothing ? dirname(base) : out_dir
     isempty(dir) || mkpath(dir)
     base_name = basename(base)
-    return joinpath(dir, base_name * "_optrunlog.jld2"), joinpath(dir, base_name * "_opt_pulsemat.csv")
+    return joinpath(dir, base_name * "_optrunlog.jld2"),
+           joinpath(dir, base_name * "_opt_pulsemat.csv"),
+           joinpath(dir, base_name * "_opt_pulsepara.jld2")
+end
+
+"""
+    save_optimised_pulse_parameters(pulsepara_path, source_path, pulse, best_u; final_metrics=nothing) -> pulsepara_path
+
+Writes ONLY the FINAL optimised control pulse's exact parameters to
+`pulsepara_path` (`<basename>_opt_pulsepara.jld2`, see
+[`optrunlog_paths`](@ref)) -- deliberately separate from, and much
+smaller than, `_optrunlog.jld2`'s full per-epoch `history`/settings/
+output record, so a caller who only wants the converged pulse can load a
+small, self-contained file without pulling in the whole run log. No
+per-epoch trail is kept here, just this one converged result.
+
+The `.jld2` file holds, under the top-level key `"data"` (same convention
+[`load_jld2_run`](@ref) already reads):
+  - `source_path` -- the ORIGINAL `.jld2` run this optimisation started from
+  - `k`, `n_coeff_A`, `n_coeff_f`, `degree`, `taper_frac`, `T_max`,
+    `amp_scale` -- `pulse`'s own defining fields, everything needed to
+    reconstruct an identical `CompositePulse`
+  - `final_u` -- the optimised raw parameter vector (`best_u`)
+  - `t_start`, `t_end`, `cA`, `cf` -- the DECODED pulse parameters (see
+    [`decode`](@ref)): each sub-pulse's start/end time and its amplitude/
+    frequency B-spline coefficients, i.e. the actual physical pulse shape
+    `best_u` encodes
+  - `final_metrics` -- `(cost, inversion, silencing, duration, coherence)`
+    from [`pulse_cost`](@ref) at `best_u`, if supplied (`nothing`
+    otherwise); context only, not required to reconstruct the pulse
+"""
+function save_optimised_pulse_parameters(
+    pulsepara_path::AbstractString, source_path::AbstractString,
+    pulse::CompositePulse, best_u::AbstractVector;
+    final_metrics=nothing,
+)
+    t_start, t_end, cA, cf = decode(pulse, best_u)
+    pulsepara = (
+        source_path=source_path,
+        k=pulse.k, n_coeff_A=pulse.n_coeff_A, n_coeff_f=pulse.n_coeff_f,
+        degree=pulse.degree, taper_frac=pulse.taper_frac,
+        T_max=pulse.T_max, amp_scale=pulse.amp_scale,
+        final_u=collect(best_u),
+        t_start=collect(t_start), t_end=collect(t_end), cA=collect(cA), cf=collect(cf),
+        final_metrics=final_metrics,
+    )
+    JLD2.save(pulsepara_path, "data", pulsepara)
+    println("Saved optimised pulse parameters to $pulsepara_path")
+    return pulsepara_path
 end
 
 """
@@ -204,15 +253,22 @@ end
                                n_signal, use_signal, u0, initial_metrics,
                                best_u, final_metrics, history, optimizer_settings;
                                out_dir=nothing, pulsemat_N=nothing)
-        -> (optrunlog_path, pulsemat_path)
+        -> (optrunlog_path, pulsemat_path, pulsepara_path)
 
 Writes this run's full record to `<basename>_optrunlog.jld2` (see
-[`optrunlog_paths`](@ref)) and samples the FINAL/optimal CONTROL pulse's
-own drive (`build_E_of_t(pulse, best_u)` -- the control pulse alone, NOT
+[`optrunlog_paths`](@ref)), samples the FINAL/optimal CONTROL pulse's own
+drive (`build_E_of_t(pulse, best_u)` -- the control pulse alone, NOT
 combined with the signal, since the signal is a separate FIXED input that
 was never part of what got optimised) to `<basename>_opt_pulsemat.csv`
 via the existing [`sample_E_of_t`](@ref)/[`save_E_samples`](@ref) (same
-format/read pattern as every other `_pulsemat.csv` in this package).
+format/read pattern as every other `_pulsemat.csv` in this package), and
+writes the same final pulse's exact/decoded parameters to
+`<basename>_opt_pulsepara.jld2` via
+[`save_optimised_pulse_parameters`](@ref) (a small, standalone file --
+see its own docstring for what it holds; `final_u` also still lives
+inside `_optrunlog.jld2` below, unchanged, since
+[`optimise_composite_pulse`](@ref)'s `warm_start_u` continues to read it
+from there).
 `pulsemat_N` defaults to the source run's own `SIM_SETTING.Nt_save`, for
 comparability with the original file's own sampling density.
 
@@ -229,24 +285,43 @@ convention [`load_jld2_run`](@ref) already reads):
     `learning_rate`, `patience`, `tol`, `n_hops`, `hop_patience`,
     `hop_step_size`, `temperature`, `w_tmax`, `seed`, `degree`,
     `taper_frac`, and any numeric
-    `solve_kwargs` override such as `reltol`/`abstol`/`w_inv`/`w_coh`/
-    `w_time`) -- see [`optimise_composite_pulse`](@ref)'s own docstring
-    for exactly what it captures and why (and what it deliberately
-    excludes, e.g. non-serialisable closures)
+    `solve_kwargs` override such as `reltol`/`abstol`/`w_inv`/`w_sil`/
+    `target_F`/`w_time`) -- see [`optimise_composite_pulse`](@ref)'s own
+    docstring for exactly what it captures and why (and what it
+    deliberately excludes, e.g. non-serialisable closures)
   - `initial_u` (the candidate pulse's own raw parameterisation, `u0`,
     used only after reconciliation passed)
-  - `initial_metrics` (`(cost, inversion, coherence, duration)` at `u0`,
-    from [`pulse_cost`](@ref) -- depends only on inversion, coherence,
-    and duration, no area/pi-pulse-area term)
+  - `initial_metrics` (`(cost, inversion, silencing, duration, coherence)`
+    at `u0`, from [`pulse_cost`](@ref) -- `cost` depends only on
+    inversion and the collective silencing factor `|F|` (see
+    [`_weighted_silencing_factor`](@ref)) plus the time/power penalties;
+    `coherence` rides along in the same tuple but, like `duration`, is
+    NOT part of `cost` -- it is the OLDER per-bin `Nj`-weighted mean of
+    `|Sp|/(Nj/2)` (see [`_weighted_coherence`](@ref)), DIAGNOSTIC ONLY,
+    recorded purely for comparison against the collective `|F|` actually
+    being optimised)
+  - `initial_coherence` -- same `coherence` value as `initial_metrics`
+    above, evaluated once at `u0` from an `:equator` solve, kept as its
+    own top-level key purely for convenience so a saved run can be
+    compared against that simpler metric without digging into the
+    `initial_metrics` tuple
   - `initial_output` (`(a, Sigma_p, Sigma_z)` at `t1`, from actually
     simulating `u0` -- the candidate pulse's raw simulated output)
   - `history` -- one row per optimiser epoch, across every hop (see
-    [`run_local_adam`](@ref)): `hop, epoch, k, cost, inversion,
-    coherence, duration, improved`
+    [`run_local_adam`](@ref)): `hop, epoch, k, cost, inversion, silencing,
+    duration, coherence, improved`. `coherence` here is the SAME
+    diagnostic-only per-bin metric as `initial_coherence`/`final_coherence`
+    below, recorded for every epoch (reusing the `:equator` solve already
+    run for `silencing`, so it costs nothing extra) -- never fed into
+    `cost`, which the optimiser actually descends on. History rows do NOT
+    carry the raw pulse parameter vector `u` for that epoch -- only the
+    FINAL optimised pulse's exact parameters are saved, and in a separate
+    file (see [`save_optimised_pulse_parameters`](@ref)/
+    `_opt_pulsepara.jld2` below), not embedded here
   - `final_u` (the optimised control pulse's raw parameterisation,
     `best_u`)
-  - `final_metrics`/`final_output` -- same shape as the initial ones,
-    for `best_u`
+  - `final_metrics`/`final_output`/`final_coherence` -- same shape as
+    the initial ones, for `best_u`
 """
 function save_optimisation_run_log(
     path::AbstractString, data, d, pulse::CompositePulse, signal_E_of_t,
@@ -255,13 +330,23 @@ function save_optimisation_run_log(
     best_u::AbstractVector, final_metrics, history, optimizer_settings;
     out_dir=nothing, pulsemat_N=nothing,
 )
-    optrunlog_path, pulsemat_path = optrunlog_paths(path; out_dir=out_dir)
+    optrunlog_path, pulsemat_path, pulsepara_path = optrunlog_paths(path; out_dir=out_dir)
 
     a0, Sp0, Sz0, _ = run_sim_1st_order_pure(u0, pulse, d; signal_E_of_t=signal_E_of_t)
     initial_output = (a=a0, Sigma_p=sum(Sp0), Sigma_z=sum(Sz0))
 
     a1, Sp1, Sz1, _ = run_sim_1st_order_pure(best_u, pulse, d; signal_E_of_t=signal_E_of_t)
     final_output = (a=a1, Sigma_p=sum(Sp1), Sigma_z=sum(Sz1))
+
+    # Diagnostic only -- NOT part of the optimised cost (pulse_cost uses
+    # the silencing factor |F|, not this per-bin coherence average).
+    # Logged purely so a saved run can be compared against the old
+    # coherence-based metric without re-running anything: two extra
+    # :equator solves at u0/best_u, done once here, not every epoch.
+    _, Sp0_eq, _, Nj0_eq = run_sim_1st_order_pure(u0, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:equator)
+    initial_coherence = _weighted_coherence(Sp0_eq, Nj0_eq, Float64)
+    _, Sp1_eq, _, Nj1_eq = run_sim_1st_order_pure(best_u, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:equator)
+    final_coherence = _weighted_coherence(Sp1_eq, Nj1_eq, Float64)
 
     full_settings = merge((n_signal=n_signal, USE_SIGNAL=use_signal), optimizer_settings)
 
@@ -271,8 +356,10 @@ function save_optimisation_run_log(
         k=pulse.k, n_coeff_A=pulse.n_coeff_A, n_coeff_f=pulse.n_coeff_f,
         optimizer_settings=full_settings,
         initial_u=collect(u0), initial_metrics=initial_metrics, initial_output=initial_output,
+        initial_coherence=initial_coherence,
         history=history,
         final_u=collect(best_u), final_metrics=final_metrics, final_output=final_output,
+        final_coherence=final_coherence,
     )
     JLD2.save(optrunlog_path, "data", run_log)
     println("Saved optimisation run log to $optrunlog_path")
@@ -281,7 +368,9 @@ function save_optimisation_run_log(
     control_E_of_t = build_E_of_t(pulse, best_u)
     sample_E_of_t(control_E_of_t, pulse.T_max, N; savepath=pulsemat_path)
 
-    return optrunlog_path, pulsemat_path
+    save_optimised_pulse_parameters(pulsepara_path, path, pulse, best_u; final_metrics=final_metrics)
+
+    return optrunlog_path, pulsemat_path, pulsepara_path
 end
 
 """

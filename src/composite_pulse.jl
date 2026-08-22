@@ -153,31 +153,89 @@ end
 
 function CompositePulse(k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
                          degree::Integer=3, taper_frac::Real=0.1)
+    k >= 1 || error("k must be a positive integer, got $k.")
     0 < taper_frac <= 0.5 || error(
         "taper_frac must be in (0, 0.5] (each sub-pulse has one taper region at each " *
         "edge; 0.5 is the largest that still leaves room for both), got $taper_frac."
+    )
+    # make_clamped_knots (bspline.jl) needs at least degree+1 coefficients
+    # per sub-pulse; catch a too-small n_coeff_A/n_coeff_f HERE, at
+    # construction, rather than three frames deep inside the first ODE
+    # solve build_E_of_t triggers (pulse_cost -> run_sim_1st_order_pure ->
+    # build_E_of_t -> make_clamped_knots), where the error message has no
+    # obvious connection back to the (k, n_coeff_A, n_coeff_f) that caused it.
+    n_coeff_A >= degree + 1 || error(
+        "n_coeff_A must be >= degree+1 = $(degree+1) for a clamped B-spline of degree $degree, got $n_coeff_A."
+    )
+    n_coeff_f >= degree + 1 || error(
+        "n_coeff_f must be >= degree+1 = $(degree+1) for a clamped B-spline of degree $degree, got $n_coeff_f."
     )
     T_max = d.timespan[2] - d.timespan[1]
     gap_scale = T_max / (2k)
     dur_scale = T_max / (2k)
     dur_floor = T_max * 1e-3
-    typical_duration = max(dur_scale * k, 1e-30)
+
+    # The relevant timescale for a SINGLE sub-pulse's own physical action is
+    # its own duration (~dur_scale), not the combined half-width of the
+    # entire k-sub-pulse sequence (dur_scale*k = T_max/2, independent of k)
+    # used here previously.
+    typical_duration = max(dur_scale, 1e-30)
+
     # Cavity-informed amplitude scale (steady-state regime: sub-pulse
     # duration >> 1/kappa_t, so the cavity field re-equilibrates to the
     # drive quasi-instantly -- true for this package's typical configs,
     # e.g. kappa_t ~ 2*pi*1e6 gives a ~160ns cavity response time against
-    # ~100us-scale pulses). Target a pi rotation of the spins over
-    # typical_duration: the spins feel Rabi rate Omega_spin = 2*g*|a|, and
-    # a constant drive E produces steady-state |a| = 2*sqrt(kappa_e)*E/kappa_t
+    # ~100us-scale pulses). The spins feel Rabi rate Omega_spin = 2*g*|a|,
+    # and a constant drive E produces steady-state |a| = 2*sqrt(kappa_e)*E/kappa_t
     # (from da/dt = sqrt(kappa_e)*E - 0.5*kappa_t*a, see rhs_1st_order.jl).
-    # Solving Omega_spin*typical_duration = pi for E gives:
-    #     amp_scale = pi*kappa_t / (4*g_mean*sqrt(kappa_e)*typical_duration)
-    # `E(t)` (and hence amp_scale) has units s^-1/2 -- a cavity input-flux
-    # amplitude, not a Rabi frequency -- so this replaces the dimensionally
-    # mismatched `pi/typical_duration` (units s^-1) that was here before.
+    #
+    # A single "Omega*typical_duration = pi" target (the ONLY bound used
+    # here previously) is only the correct amplitude scale for a spin
+    # exactly on resonance (delta=0) -- it has no dependence at all on the
+    # ensemble's own inhomogeneous linewidth `d.FWHM`, so for a broadband
+    # ensemble (FWHM comparable to or larger than that naive Omega) it
+    # systematically undersizes the drive: most of the ensemble sits far
+    # enough off-resonance (generalised Rabi frequency
+    # sqrt(Omega^2+delta^2) >> Omega) that this "pi-pulse" barely rotates
+    # it at all (verified: even the canonical HS1/CORPSE seeds, built at
+    # this scale, achieve nowhere near full inversion; scanning the drive
+    # amplitude up to 2000x this naive scale still only reached
+    # inversion~0.17 for a typical config here). Three physically distinct
+    # lower bounds on the Rabi frequency actually needed are combined via
+    # `max` below, since the amplitude SCALE has to be adequate regardless
+    # of which pulse type (chirped or not) later optimisation settles on:
+    #   - Omega_naive:     the naive on-resonance pi-pulse condition above.
+    #   - Omega_power:     hard-pulse (non-chirped) power broadening -- to
+    #                      invert a spread of width FWHM without sweeping
+    #                      the drive frequency, Omega must be at least of
+    #                      order FWHM itself.
+    #   - Omega_adiabatic: Landau-Zener adiabatic-passage threshold for a
+    #                      CHIRPED sub-pulse sweeping across (order) FWHM
+    #                      over typical_duration -- adiabaticity requires
+    #                      Omega^2 >> sweep_rate = FWHM/typical_duration,
+    #                      i.e. Omega >> sqrt(FWHM/typical_duration).
+    Omega_naive = pi / typical_duration
+    Omega_power = d.FWHM
+    Omega_adiabatic = sqrt(d.FWHM / typical_duration)
+    Omega_target = max(Omega_naive, Omega_power, Omega_adiabatic)
+
+    # Solve the same steady-state cavity relation as before, now for the
+    # cavity input-flux E that achieves Omega_target rather than just the
+    # naive on-resonance Omega. `E(t)` (and hence amp_scale) has units
+    # s^-1/2 -- a cavity input-flux amplitude, not a Rabi frequency.
     # Using kappa_t (not kappa_e alone) keeps this correct when kappa_i is
     # non-negligible; the two coincide whenever kappa_i ~ 0.
-    amp_scale = pi * d.kappa_t / (4 * d.g_mean * d.sqrt_kappa_e * typical_duration)
+    #
+    # NOTE: unlike the single-bound formula this replaces, `amp_scale` is
+    # NOT guaranteed to be independent of `k` in general (Omega_naive and
+    # Omega_adiabatic both grow as typical_duration=dur_scale=T_max/(2k)
+    # shrinks with k; only Omega_power is k-invariant) -- it only happens
+    # to stay k-invariant across realistic k while Omega_power dominates
+    # the max. Any code that grows/shrinks k by re-encoding an existing
+    # raw parameter vector (see pulse_optimizer2_RJMCMC.jl's _grow_pulse/
+    # _shrink_pulse) must re-derive physical cA and re-encode it against
+    # the NEW pulse's own amp_scale, not copy raw_cA across unchanged.
+    amp_scale = (d.kappa_t / (4 * d.g_mean * d.sqrt_kappa_e)) * Omega_target
     freq_scale = d.FWHM
     return CompositePulse(k, n_coeff_A, n_coeff_f, degree, T_max,
                            gap_scale, dur_scale, dur_floor, amp_scale, freq_scale, Float64(taper_frac))

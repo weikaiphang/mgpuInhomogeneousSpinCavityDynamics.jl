@@ -33,8 +33,11 @@ include("solver_1st_order.jl")
 include("bspline.jl")
 include("composite_pulse.jl")
 include("canon_pulses.jl")
-include("pulse_optimizer.jl")
+include("pulse_optimizer2.jl")
+include("pulse_optimizer2_RJMCMC.jl")
+include("multi_seed_pulse_optimizer.jl")
 include("jld2_pulse_loader.jl")
+include("composite_arp_pulses.jl")
 
 # 2nd-order simulation (single-GPU)
 include("state_layout_2nd_order.jl")
@@ -102,12 +105,27 @@ export run_sim_1st_order_pure, pulse_metrics, pulse_cost
 export AdamState, adam_step!, run_local_adam, optimise_composite_pulse
 export optimise_composite_pulse_over_k
 
+# Trans-dimensional (RJMCMC-flavoured) k-hopping extension exports
+# (pulse_optimizer2_RJMCMC.jl) -- distinct names from the fixed-k API
+# above since `pulse.k` is NOT guaranteed to equal the input `k` for
+# these (see that file's own module docstring)
+export optimise_composite_pulse_rjmcmc
+export optimise_composite_pulse_over_k_rjmcmc
+
+# Multi-seed wrapper (multi_seed_pulse_optimizer.jl): one RJMCMC run per
+# starting k against the same ensemble, each canonically seeded where a
+# named form exists
+export multi_seed_optimise_pulse_rjmcmc
+
 # JLD2-driven signal/control pulse optimisation exports
 export load_jld2_run, split_signal_control, build_signal_E_of_t
 export run_sim_1st_order_trajectory, reconcile_against_jld2
-export optrunlog_paths, save_optimisation_run_log
+export optrunlog_paths, save_optimisation_run_log, save_optimised_pulse_parameters
 export optimise_control_pulse_from_jld2
 export optimise_control_pulse_from_jld2_over_k
+
+# Analytic composite ARP pulse exports
+export generate_3arp_pi_pulse
 
 # Noise exports
 export NoiseSimulationData
