@@ -133,7 +133,7 @@ for every UNTOUCHED sub-pulse (see those functions' docstrings for why
 the RAW `u` values themselves cannot simply be copied across a k-change).
 """
 function _physical_gap_dur(pulse::CompositePulse, u::AbstractVector)
-    t_start, t_end, _, _ = decode(pulse, u)
+    t_start, t_end, _, _, _ = decode(pulse, u)
     k = pulse.k
     gap = Vector{Float64}(undef, k)
     dur = Vector{Float64}(undef, k)
@@ -190,7 +190,7 @@ rescale that sub-pulse's physical amplitude. [`_grow_pulse`](@ref)/
 via [`_encode_cA`](@ref) against the NEW pulse's own `amp_scale`.
 """
 function _physical_cA(pulse::CompositePulse, u::AbstractVector)
-    _, _, cA, _ = decode(pulse, u)
+    _, _, _, cA, _ = decode(pulse, u)
     return collect(Float64, cA)
 end
 
@@ -246,7 +246,7 @@ differs between the old and new pulse. `raw_cf = 0` (no chirp;
 `freq_scale = d.FWHM` has no k-dependence, so this needs no re-encoding).
 """
 function _grow_pulse(pulse::CompositePulse, u::AbstractVector, d)
-    _, _, _, raw_cf = unpack(pulse, u)
+    _, _, raw_phi0, _, raw_cf = unpack(pulse, u)
     gap, dur = _physical_gap_dur(pulse, u)
     cA = _physical_cA(pulse, u)
     k = pulse.k
@@ -279,7 +279,16 @@ function _grow_pulse(pulse::CompositePulse, u::AbstractVector, d)
     raw_cf_mat = collect(Float64, raw_cf)
     new_raw_cf = hcat(raw_cf_mat[:, 1:slot-1], zero_cf, raw_cf_mat[:, slot:end])
 
-    new_u = pack(new_pulse, new_raw_gap, new_raw_dur, new_raw_cA, new_raw_cf)
+    # raw_phi0 is UNCONSTRAINED (no softplus, no k-dependent scale -- see
+    # decode's own docstring), so -- exactly like raw_cf -- it needs no
+    # re-encoding across a k-change, only insertion of the new sub-pulse's
+    # own slot. A birthed sub-pulse gets phi0=0 (no discrete jump), matching
+    # its own zero_cf/quiet-cA treatment: no accumulated phase change of any
+    # kind on top of whatever `running` already was at that point.
+    raw_phi0_vec = collect(Float64, raw_phi0)
+    new_raw_phi0 = vcat(raw_phi0_vec[1:slot-1], 0.0, raw_phi0_vec[slot:end])
+
+    new_u = pack(new_pulse, new_raw_gap, new_raw_dur, new_raw_phi0, new_raw_cA, new_raw_cf)
     return new_pulse, new_u
 end
 
@@ -314,7 +323,7 @@ constructor).
 """
 function _shrink_pulse(pulse::CompositePulse, u::AbstractVector, d)
     pulse.k >= 2 || error("_shrink_pulse requires k >= 2, got k=$(pulse.k).")
-    _, _, _, raw_cf = unpack(pulse, u)
+    _, _, raw_phi0, _, raw_cf = unpack(pulse, u)
     gap, dur = _physical_gap_dur(pulse, u)
     cA = _physical_cA(pulse, u)
     k = pulse.k
@@ -340,8 +349,9 @@ function _shrink_pulse(pulse::CompositePulse, u::AbstractVector, d)
     new_raw_cA = _encode_cA(new_pulse, new_cA)
     raw_cf_mat = collect(Float64, raw_cf)
     new_raw_cf = raw_cf_mat[:, keep]
+    new_raw_phi0 = collect(Float64, raw_phi0)[keep]
 
-    new_u = pack(new_pulse, new_raw_gap, new_raw_dur, new_raw_cA, new_raw_cf)
+    new_u = pack(new_pulse, new_raw_gap, new_raw_dur, new_raw_phi0, new_raw_cA, new_raw_cf)
     return new_pulse, new_u
 end
 
@@ -379,7 +389,7 @@ inside each hop still directly minimises the full `pulse_cost` (power
 penalty included), so within-hop amplitude regularisation is unaffected.
 """
 function _extract_physics_cost(cost, u::AbstractVector, pulse::CompositePulse, w_power)
-    _, _, cA, _ = decode(pulse, u)
+    _, _, _, cA, _ = decode(pulse, u)
     normalized_cA = cA ./ pulse.amp_scale
     power_penalty = w_power * (sum(abs2, normalized_cA) / length(normalized_cA))
     return cost - power_penalty

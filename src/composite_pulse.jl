@@ -241,17 +241,19 @@ function CompositePulse(k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
                            gap_scale, dur_scale, dur_floor, amp_scale, freq_scale, Float64(taper_frac))
 end
 
-n_params(pulse::CompositePulse) = 2 * pulse.k + pulse.k * pulse.n_coeff_A + pulse.k * pulse.n_coeff_f
+n_params(pulse::CompositePulse) = 3 * pulse.k + pulse.k * pulse.n_coeff_A + pulse.k * pulse.n_coeff_f
 
 _softplus(x) = x > 30 ? x : log1p(exp(x))
 _softplus_inv(y) = y + log(-expm1(-y))  # y > 0; softplus(_softplus_inv(y)) == y
 
 """
-    unpack(pulse, u) -> (raw_gap, raw_dur, raw_cA, raw_cf)
+    unpack(pulse, u) -> (raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 
-Splits the flat raw parameter vector `u` into its four raw pieces.
+Splits the flat raw parameter vector `u` into its five raw pieces.
 `raw_cA`/`raw_cf` are `(n_coeff, k)` matrices, column `i` holding
-sub-pulse `i`'s own raw coefficients.
+sub-pulse `i`'s own raw coefficients. `raw_phi0` (length `k`) is sub-pulse
+`i`'s own DISCRETE additive phase jump -- see [`decode`](@ref)/
+[`build_E_of_t`](@ref) for how it enters the reconstructed drive.
 """
 function unpack(pulse::CompositePulse, u::AbstractVector)
     n = n_params(pulse)
@@ -263,19 +265,20 @@ function unpack(pulse::CompositePulse, u::AbstractVector)
     nA = k * pulse.n_coeff_A
     raw_gap = u[1:k]
     raw_dur = u[k+1:2k]
-    raw_cA = reshape(u[2k+1:2k+nA], pulse.n_coeff_A, k)
-    raw_cf = reshape(u[2k+nA+1:end], pulse.n_coeff_f, k)
-    return raw_gap, raw_dur, raw_cA, raw_cf
+    raw_phi0 = u[2k+1:3k]
+    raw_cA = reshape(u[3k+1:3k+nA], pulse.n_coeff_A, k)
+    raw_cf = reshape(u[3k+nA+1:end], pulse.n_coeff_f, k)
+    return raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf
 end
 
-function pack(::CompositePulse, raw_gap, raw_dur, raw_cA, raw_cf)
-    return vcat(vec(raw_gap), vec(raw_dur), vec(raw_cA), vec(raw_cf))
+function pack(::CompositePulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
+    return vcat(vec(raw_gap), vec(raw_dur), vec(raw_phi0), vec(raw_cA), vec(raw_cf))
 end
 
 """
-    decode(pulse, u) -> (t_start, t_end, cA, cf)
+    decode(pulse, u) -> (t_start, t_end, phi0, cA, cf)
 
-Raw `u` -> physical `(t_start, t_end, cA, cf)`, valid for ANY `u`:
+Raw `u` -> physical `(t_start, t_end, phi0, cA, cf)`, valid for ANY `u`:
 
 - `gap`/`duration = scale * softplus(raw) [+ floor for duration]` are
   always > 0, and `t_start`/`t_end` are built by cumulatively summing
@@ -286,6 +289,9 @@ Raw `u` -> physical `(t_start, t_end, cA, cf)`, valid for ANY `u`:
   softplus + cumulative-sum reparameterisation the Python port uses, and
   the same technique this package's Python sibling's waveguide.py/
   pulse_optimizer.py already rely on).
+- `phi0 = raw_phi0` is UNCONSTRAINED (any real number is already a valid
+  additive phase -- `cis` wraps it automatically, so no reparameterisation
+  is needed the way `gap`/`dur`/`cA` need softplus).
 - `cA = amp_scale * softplus(raw_cA)` is always `>= 0`.
 - `cf = freq_scale * raw_cf` is unconstrained (chirp may have either
   sign).
@@ -308,7 +314,7 @@ the taper window this file's own module docstring describes) has been
 verified against finite differences to <0.0001% relative error.
 """
 function decode(pulse::CompositePulse, u::AbstractVector)
-    raw_gap, raw_dur, raw_cA, raw_cf = unpack(pulse, u)
+    raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf = unpack(pulse, u)
     k = pulse.k
     T = eltype(u)
     gap = pulse.gap_scale .* _softplus.(raw_gap)
@@ -322,9 +328,10 @@ function decode(pulse::CompositePulse, u::AbstractVector)
         t += dur[i]
         t_end[i] = t
     end
+    phi0 = raw_phi0
     cA = pulse.amp_scale .* _softplus.(raw_cA)
     cf = pulse.freq_scale .* raw_cf
-    return t_start, t_end, cA, cf
+    return t_start, t_end, phi0, cA, cf
 end
 
 """
@@ -334,16 +341,18 @@ Reasonable random initialisation in RAW space -- built by sampling target
 physical multiples of `decode`'s own scales, then encoding them back
 through [`_softplus_inv`](@ref), so the resulting `u` decodes to
 physically-sensible gaps/durations/amplitudes even though `u` itself is
-unconstrained.
+unconstrained. `raw_phi0` is sampled uniformly over `[-π, π]` (already
+unconstrained/physical, no encoding needed).
 """
 function initial_guess(pulse::CompositePulse; seed::Integer=42)
     rng = Random.Xoshiro(seed)
     k, nA, nf = pulse.k, pulse.n_coeff_A, pulse.n_coeff_f
     raw_gap = _softplus_inv.(0.3 .+ 0.7 .* rand(rng, k))
     raw_dur = _softplus_inv.(0.5 .+ 0.7 .* rand(rng, k))
+    raw_phi0 = 2 * pi .* rand(rng, k) .- pi
     raw_cA = _softplus_inv.(0.5 .+ 1.0 .* rand(rng, nA, k))
     raw_cf = 0.3 .* randn(rng, nf, k)
-    return pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+    return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 end
 
 """
@@ -360,18 +369,29 @@ region at `ts`/`te`, regardless of the B-spline's own free edge
 coefficients). `phi(t) = integral of f dt'` is computed EXACTLY via each
 sub-pulse's frequency-spline antiderivative (`bspline_antiderivative`,
 not a numerical quadrature) -- the window is applied to the AMPLITUDE
-only, not the phase, so this exactness is unaffected. Phase accumulates
-across sub-pulses (each sub-pulse continues from the previous one's total
-phase, the same global-accumulation semantics a single cumulative
-integral over the whole timeline would give); silence contributes
-nothing further since `f` is simply absent there. `t_start`/`t_end`/
-`cA`/`cf`/knot vectors/phase offsets are all decoded from `u` ONCE here
-(not on every call to the returned closure), since `u` is fixed for the
-lifetime of one ODE solve but `E_of_t` gets called once per RHS
-evaluation.
+only, not the phase, so this exactness is unaffected. Phase accumulates across sub-pulses (each sub-pulse continues from the
+previous one's total phase, the same global-accumulation semantics a
+single cumulative integral over the whole timeline would give) PLUS its
+own discrete additive jump `phi0[i]` (see [`decode`](@ref)) -- physically,
+an explicit relative phase kick applied at that sub-pulse's own onset, on
+top of whatever phase the drive would have continued to had it kept
+running through the intervening silence; `phi0[1]` in particular is what
+lets sub-pulse 1 itself start at any absolute phase rather than being
+hardcoded to `0`, the gap this file's own module docstring documents
+(composite-pulse families like CORPSE/BB1 already rely on exactly this
+kind of discrete relative phase jump between sub-pulses -- see
+`canon_pulses.jl`'s `seed_composite_with_ghosts`, which worked around its
+former absence via extra near-zero-amplitude "ghost" sub-pulses; this
+parameter makes that workaround unnecessary for anything using it going
+forward, though existing canonical seeds still use their own established
+technique unchanged). Silence contributes nothing further to phase since
+`f` is simply absent there. `t_start`/`t_end`/`phi0`/`cA`/`cf`/knot
+vectors/phase offsets are all decoded from `u` ONCE here (not on every
+call to the returned closure), since `u` is fixed for the lifetime of one
+ODE solve but `E_of_t` gets called once per RHS evaluation.
 """
 function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
-    t_start, t_end, cA, cf = decode(pulse, u)
+    t_start, t_end, phi0, cA, cf = decode(pulse, u)
     k = pulse.k
     degree = pulse.degree
     T = eltype(t_start)
@@ -387,8 +407,8 @@ function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
         knots_fp, d_f = bspline_antiderivative(view(cf, :, i), knots_f, degree)
         knots_fp_list[i] = knots_fp
         d_f_list[i] = d_f
-        phase_offset[i] = running
-        running += d_f[end]
+        phase_offset[i] = running + phi0[i]
+        running = phase_offset[i] + d_f[end]
     end
 
     taper_frac = pulse.taper_frac
@@ -432,7 +452,7 @@ undefined at the origin), a regime `build_E_of_t`'s combined complex value
 does not let a caller isolate.
 """
 function build_A_f_of_t(pulse::CompositePulse, u::AbstractVector)
-    t_start, t_end, cA, cf = decode(pulse, u)
+    t_start, t_end, _, cA, cf = decode(pulse, u)
     k = pulse.k
     degree = pulse.degree
     T = eltype(t_start)
@@ -481,7 +501,7 @@ then most of the spline's mass sits in the untapered middle), not an
 exact one, if you need the true windowed area.
 """
 function total_area(pulse::CompositePulse, u::AbstractVector)
-    t_start, t_end, cA, _ = decode(pulse, u)
+    t_start, t_end, _, cA, _ = decode(pulse, u)
     T = eltype(t_start)
     area = zero(T)
     @inbounds for i in 1:pulse.k
@@ -506,6 +526,6 @@ entire pulse later, right up until `T_max` truncates it) -- see
 addresses landing past the window.
 """
 function pulse_duration(pulse::CompositePulse, u::AbstractVector)
-    _, t_end, _, _ = decode(pulse, u)
+    _, t_end, _, _, _ = decode(pulse, u)
     return t_end[end]
 end

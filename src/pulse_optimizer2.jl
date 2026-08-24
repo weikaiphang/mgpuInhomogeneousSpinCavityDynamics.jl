@@ -167,7 +167,7 @@ function run_sim_1st_order_pure(
     # all once the window is in place -- also verified directly). They're
     # kept here anyway as a harmless hint for the adaptive stepper near
     # each taper region, not because correctness depends on them anymore.
-    t_start, t_end, _, _ = decode(pulse, u)
+    t_start, t_end, _, _, _ = decode(pulse, u)
     tstops = ForwardDiff.value.(vcat(t_start, t_end))
 
     prob = ODEProblem(rhs_1st_order!, u0, d.timespan, p)
@@ -329,7 +329,7 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
     _forbid_initial_condition(kwargs)
     T = eltype(u)
     duration = pulse_duration(pulse, u)
-    _, t_end, cA, _ = decode(pulse, u)
+    _, t_end, _, cA, _ = decode(pulse, u)
 
     tmax_excess = max(t_end[end] - pulse.T_max, zero(T))
     tmax_penalty = w_tmax * (tmax_excess / pulse.T_max)^2
@@ -877,7 +877,7 @@ function fit_composite_pulse_from_samples(
     cf_clip_mult::Real=20.0, num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
 )
     A = sqrt.(I .^ 2 .+ Q .^ 2)
-    _, f = _instantaneous_frequency(t, I, Q)
+    phi, f = _instantaneous_frequency(t, I, Q)
 
     segments = _detect_subpulse_segments(
         t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
@@ -895,9 +895,11 @@ function fit_composite_pulse_from_samples(
 
     raw_gap = Vector{Float64}(undef, k)
     raw_dur = Vector{Float64}(undef, k)
+    raw_phi0 = Vector{Float64}(undef, k)
     raw_cA = Matrix{Float64}(undef, n_coeff, k)
     raw_cf = Matrix{Float64}(undef, n_coeff, k)
     t_prev_end = 0.0
+    running_seed = 0.0
     for (idx, (i_start, i_end)) in enumerate(segments)
         t_s, t_e = t[i_start], t[i_end]
         duration = t_e - t_s
@@ -905,6 +907,17 @@ function fit_composite_pulse_from_samples(
         dur_arg = max(duration - pulse.dur_floor, 0.0)
         raw_gap[idx] = _encode_scaled_softplus(gap, pulse.gap_scale)
         raw_dur[idx] = _encode_scaled_softplus(dur_arg, pulse.dur_scale)
+
+        # build_A_f_of_t's own loss (fit_composite_pulse_af, below) never
+        # references phi0 at all, so ForwardDiff/Adam leaves this component
+        # untouched (zero gradient) -- this seed IS the final fitted value,
+        # not just a starting point. Approximate `running` (build_E_of_t's
+        # own accumulator) with the TARGET trace's own raw phase at each
+        # segment's boundary, since this path's `raw_cf` seed is only a
+        # crude linear ramp (not an exact antiderivative fit) and so has no
+        # equally cheap EXACT `d_f[end]` to accumulate instead.
+        raw_phi0[idx] = phi[i_start] - running_seed
+        running_seed = phi[i_end]
 
         peak_amp = maximum(view(A, i_start:i_end))
         raw_cA[:, idx] .= _encode_scaled_softplus(peak_amp, pulse.amp_scale)
@@ -914,7 +927,7 @@ function fit_composite_pulse_from_samples(
 
         t_prev_end = t_e
     end
-    u_init = pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+    u_init = pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 
     u_fit, fit_report = fit_composite_pulse_af(
         pulse, t, A, f; num_epochs=num_epochs, learning_rate=learning_rate, seed=seed, u_init=u_init,
@@ -1082,6 +1095,7 @@ function fit_composite_pulse_from_samples_linear(
 
     raw_gap = Vector{Float64}(undef, k)
     raw_dur = Vector{Float64}(undef, k)
+    raw_phi0 = Vector{Float64}(undef, k)
     raw_cA = Matrix{Float64}(undef, n_coeff, k)
     raw_cf = Matrix{Float64}(undef, n_coeff, k)
     n_cA_floored = 0
@@ -1091,6 +1105,7 @@ function fit_composite_pulse_from_samples_linear(
     phi_resid = 0.0
     f_weight_sum = 0.0
     t_prev_end = 0.0
+    running_phase = 0.0
 
     for (idx, (i_start, i_end)) in enumerate(segments)
         t_s, t_e = t[i_start], t[i_end]
@@ -1167,10 +1182,24 @@ function fit_composite_pulse_from_samples_linear(
         phi_resid += sum(f_weight .* abs2.(Phi_pred .- phi_seg))
         f_weight_sum += sum(f_weight)
 
+        # `phase_const` IS the fitted value of build_E_of_t's own
+        # `phase_offset[i]` (bspline_antiderivative references `d_f[1]=0`
+        # at each sub-pulse's own t_start, so `Phi_pred` at t_start is
+        # exactly `phase_const`) -- recover the DISCRETE JUMP `raw_phi0`
+        # build_E_of_t actually adds (`phase_offset[i] = running+phi0[i]`)
+        # by subtracting off what `running` will be at this point, tracked
+        # here with the SAME recipe (`running = phase_offset[i]+d_f[end]`),
+        # using `Phi_pred[end]-phase_const` as `d_f[end]` -- exact, since
+        # `t_seg[end] == t_e` is precisely the antiderivative spline's own
+        # right knot (bspline_basis's closed-right-boundary convention).
+        raw_phi0[idx] = phase_const - running_phase
+        d_f_end = Phi_pred[end] - phase_const
+        running_phase = phase_const + d_f_end
+
         t_prev_end = t_e
     end
 
-    u_fit = pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+    u_fit = pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 
     A_energy = sum(abs2, A) + 1e-30
     rel_l2_A = sqrt(A_resid / A_energy)

@@ -45,6 +45,7 @@ function seed_hs1(pulse::CompositePulse, Omega_max::Real, beta::Real, mu::Real)
 
     raw_gap = [_softplus_inv(1e-5 / pulse.gap_scale)]
     raw_dur = [_softplus_inv(max(1e-5, dur - pulse.dur_floor) / pulse.dur_scale)]
+    raw_phi0 = [0.0]
 
     raw_cA = zeros(nA, 1)
     raw_cf = zeros(nf, 1)
@@ -64,7 +65,7 @@ function seed_hs1(pulse::CompositePulse, Omega_max::Real, beta::Real, mu::Real)
         raw_cf[i, 1] = f_val / pulse.freq_scale
     end
 
-    return pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+    return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 end
 
 """
@@ -92,6 +93,7 @@ function seed_composite_with_ghosts(
 
     raw_gap = zeros(pulse.k)
     raw_dur = zeros(pulse.k)
+    raw_phi0 = zeros(pulse.k)
     raw_cA = zeros(nA, pulse.k)
     raw_cf = zeros(nf, pulse.k)
 
@@ -116,7 +118,7 @@ function seed_composite_with_ghosts(
         end
     end
 
-    return pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+    return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 end
 
 """

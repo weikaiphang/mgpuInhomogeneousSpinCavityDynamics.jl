@@ -101,6 +101,7 @@ function _segment_matched_seed_init(control_cfg, pulse::CompositePulse)
 
     raw_gap = Vector{Float64}(undef, k)
     raw_dur = Vector{Float64}(undef, k)
+    raw_phi0 = zeros(k)
     raw_cA = Matrix{Float64}(undef, pulse.n_coeff_A, k)
     raw_cf = Matrix{Float64}(undef, pulse.n_coeff_f, k)
 
@@ -129,7 +130,7 @@ function _segment_matched_seed_init(control_cfg, pulse::CompositePulse)
         t_prev_end = t_start + duration
     end
 
-    return pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+    return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 end
 
 """
@@ -349,7 +350,7 @@ function smoke_test_fit_from_pulsemat(
         )
     end
 
-    t_start, t_end_decoded, cA, cf = decode(pulse, u_fit)
+    t_start, t_end_decoded, phi0, cA, cf = decode(pulse, u_fit)
     fitparas = (
         source_pulsemat=pulsemat_path, source_jld2=jld2_path,
         k=pulse.k, n_coeff_A=pulse.n_coeff_A, n_coeff_f=pulse.n_coeff_f,
@@ -357,7 +358,8 @@ function smoke_test_fit_from_pulsemat(
         T_max=pulse.T_max, gap_scale=pulse.gap_scale, dur_scale=pulse.dur_scale,
         dur_floor=pulse.dur_floor, amp_scale=pulse.amp_scale, freq_scale=pulse.freq_scale,
         u_fit=collect(u_fit),
-        t_start=collect(t_start), t_end=collect(t_end_decoded), cA=collect(cA), cf=collect(cf),
+        t_start=collect(t_start), t_end=collect(t_end_decoded), phi0=collect(phi0),
+        cA=collect(cA), cf=collect(cf),
         fit_report=fit_report, segments=segments, linear=linear,
     )
     JLD2.save(fitparas_path, "data", fitparas)
@@ -573,10 +575,10 @@ The `.jld2` file holds, under the top-level key `"data"` (same convention
     `amp_scale` -- `pulse`'s own defining fields, everything needed to
     reconstruct an identical `CompositePulse`
   - `final_u` -- the optimised raw parameter vector (`best_u`)
-  - `t_start`, `t_end`, `cA`, `cf` -- the DECODED pulse parameters (see
-    [`decode`](@ref)): each sub-pulse's start/end time and its amplitude/
-    frequency B-spline coefficients, i.e. the actual physical pulse shape
-    `best_u` encodes
+  - `t_start`, `t_end`, `phi0`, `cA`, `cf` -- the DECODED pulse parameters
+    (see [`decode`](@ref)): each sub-pulse's start/end time, its own
+    discrete additive phase jump, and its amplitude/frequency B-spline
+    coefficients, i.e. the actual physical pulse shape `best_u` encodes
   - `final_metrics` -- `(cost, inversion, silencing, duration, coherence)`
     from [`pulse_cost`](@ref) at `best_u`, if supplied (`nothing`
     otherwise); context only, not required to reconstruct the pulse
@@ -586,14 +588,15 @@ function save_optimised_pulse_parameters(
     pulse::CompositePulse, best_u::AbstractVector;
     final_metrics=nothing,
 )
-    t_start, t_end, cA, cf = decode(pulse, best_u)
+    t_start, t_end, phi0, cA, cf = decode(pulse, best_u)
     pulsepara = (
         source_path=source_path,
         k=pulse.k, n_coeff_A=pulse.n_coeff_A, n_coeff_f=pulse.n_coeff_f,
         degree=pulse.degree, taper_frac=pulse.taper_frac,
         T_max=pulse.T_max, amp_scale=pulse.amp_scale,
         final_u=collect(best_u),
-        t_start=collect(t_start), t_end=collect(t_end), cA=collect(cA), cf=collect(cf),
+        t_start=collect(t_start), t_end=collect(t_end), phi0=collect(phi0),
+        cA=collect(cA), cf=collect(cf),
         final_metrics=final_metrics,
     )
     JLD2.save(pulsepara_path, "data", pulsepara)
