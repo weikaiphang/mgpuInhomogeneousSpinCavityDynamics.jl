@@ -380,20 +380,31 @@ end
 AdamState(n::Integer) = AdamState(zeros(n), zeros(n), 0)
 
 """
-    adam_step!(u, grad, state::AdamState; lr=0.05, beta1=0.9, beta2=0.999, eps=1e-8)
+    adam_step!(u, grad, state::AdamState; lr=0.05, beta1=0.9, beta2=0.999, eps=1e-8, lr_scale=nothing)
 
 One in-place Adam update of `u` given `grad = ∇cost(u)`, mutating `state`.
-Standard bias-corrected Adam (Kingma & Ba 2015).
+Standard bias-corrected Adam (Kingma & Ba 2015). `lr_scale`, if given, is a
+per-parameter multiplier (same length as `u`) applied to the FINAL step
+only (`u[i] -= lr*lr_scale[i]*m_hat/(sqrt(v_hat)+eps)`) -- the moment
+estimates `state.m`/`state.v` themselves still accumulate the raw
+`grad`, unscaled, so `lr_scale` reshapes the effective per-parameter step
+size without distorting Adam's own gradient-magnitude bookkeeping. Default
+`nothing` reproduces the original uniform-`lr` update exactly (skips the
+per-element multiply entirely, not just multiplies by an implicit `1.0`).
+See [`run_local_adam`](@ref)'s `cf_lr_scale` for why a composite-pulse
+optimisation in particular benefits from decoupling the chirp
+coefficients' own step size from the rest of `u`.
 """
 function adam_step!(u::AbstractVector, grad::AbstractVector, state::AdamState;
-                     lr=0.05, beta1=0.9, beta2=0.999, eps=1e-8)
+                     lr=0.05, beta1=0.9, beta2=0.999, eps=1e-8, lr_scale::Union{AbstractVector,Nothing}=nothing)
     state.t += 1
     @inbounds for i in eachindex(u)
         state.m[i] = beta1 * state.m[i] + (1 - beta1) * grad[i]
         state.v[i] = beta2 * state.v[i] + (1 - beta2) * grad[i]^2
         m_hat = state.m[i] / (1 - beta1^state.t)
         v_hat = state.v[i] / (1 - beta2^state.t)
-        u[i] -= lr * m_hat / (sqrt(v_hat) + eps)
+        step = lr * m_hat / (sqrt(v_hat) + eps)
+        u[i] -= lr_scale === nothing ? step : lr_scale[i] * step
     end
     return u
 end
@@ -534,17 +545,36 @@ end
 # ============================================================
 
 """
-    _instantaneous_frequency(t, I, Q) -> Vector{Float64}
+    _instantaneous_frequency(t, I, Q) -> (phi, f)
 
-Instantaneous angular frequency `f(t_j) = dphi/dt` from a sampled I/Q
-trace: unwrapped `atan(Q, I)` phase, then a central difference (one-sided
-at the two endpoints). `f` is returned at EVERY sample, including where
-`I=Q=0` (phase, and hence `f`, is numerically meaningless there) -- this
-function does not special-case or mask those points; callers (see
-[`fit_composite_pulse_af`](@ref)) are expected to down-weight them via an
-amplitude-based weight instead, since the physically meaningful thing
-("this region carries no drive") is already fully captured by `A~0`
-there, not by discarding samples.
+Unwrapped phase `phi(t_j) = atan(Q,I)` (continuous, no `2π` jumps at
+consecutive samples) and its instantaneous angular frequency `f(t_j) =
+dphi/dt` from a sampled I/Q trace: central difference on the unwrapped
+`phi` (one-sided at the two endpoints). Both are returned at EVERY sample,
+including where `I=Q=0` (phase, and hence `f`, is numerically meaningless
+there) -- this function does not special-case or mask those points;
+callers (see [`fit_composite_pulse_af`](@ref)/
+[`fit_composite_pulse_from_samples_linear`](@ref)) are expected to
+down-weight them via an amplitude-based weight instead, since the
+physically meaningful thing ("this region carries no drive") is already
+fully captured by `A~0` there, not by discarding samples.
+
+`phi` is returned (not just discarded internally the way an earlier
+version of this function did) because it is itself a valid, DIRECT fit
+target: `phi`'s own scale-invariant reference point is arbitrary (whatever
+`atan` happens to return at the first sample, unrelated to
+[`build_E_of_t`](@ref)'s own `phase_offset` convention), but its SHAPE over
+one active sub-pulse is exactly the quantity a `cf`-fit that targets
+[`build_E_of_t`](@ref)'s own EXACT phase integral `Φ(t) = ∫f dτ` should
+match -- fitting `cf` against `f` alone (the OLDER approach) can leave
+`Φ`'s accumulated integral drifting even when the per-point frequency
+residual is tiny, since integration does not average away a small but
+STRUCTURED (not i.i.d.) residual the way an RMS frequency comparison
+would; see [`fit_composite_pulse_from_samples_linear`](@ref)'s own
+docstring for a real, measured case of exactly this (a `rel_l2_f~1e-13`
+per-point frequency fit still producing a ~43% full-complex-trace
+reconstruction error, traced to phase drift concentrated at the trace's
+own peak amplitude).
 """
 function _instantaneous_frequency(t::AbstractVector, I::AbstractVector, Q::AbstractVector)
     n = length(t)
@@ -569,7 +599,7 @@ function _instantaneous_frequency(t::AbstractVector, I::AbstractVector, Q::Abstr
     @inbounds for j in 2:n-1
         f[j] = (phi[j+1] - phi[j-1]) / (t[j+1] - t[j-1])
     end
-    return f
+    return phi, f
 end
 
 """
@@ -729,11 +759,71 @@ function fit_composite_pulse_af(
     return best_u, (loss=best_loss, rel_l2_A=rel_l2_A, history=history)
 end
 
+# ============================================================
+# GRADIENT-SAFETY FLOOR/CLIP FOR SAMPLE-DERIVED SEEDS
+#
+# `decode`'s `gap`/`duration`/`cA` all go through `_softplus_inv` to reach
+# RAW space, and `d(softplus)/d(raw) = sigmoid(raw)` -- for
+# `raw = _softplus_inv(y)` with small `y = physical/scale`,
+# `sigmoid(raw) ≈ y` (verified: `y=1e-6` -> `sigmoid(raw)≈1e-6`, `y=1e-30`
+# -> `sigmoid(raw)≈1e-30`). Encoding a fitted quantity at a tiny fraction
+# of its own scale -- this file previously did so via `max(peak_amp,
+# 1e-30)` for `cA` in `fit_composite_pulse_from_samples`'s seed, and
+# `cA_floor_frac=1e-6` in `fit_composite_pulse_from_samples_linear` --
+# therefore lands that raw parameter at a point where `decode`'s own
+# gradient is attenuated by that same tiny factor from the very first
+# optimisation epoch onward: `run_local_adam`'s Adam step can move such a
+# parameter only as fast as this near-zero local sensitivity allows,
+# regardless of how many epochs run, i.e. a practically dead parameter at
+# the seed. `_GRAD_SAFE_FRAC=1e-2` keeps that attenuation to about 100x
+# instead of 1e6-1e30x -- a deliberate seed-generation trade-off (a truly
+# near-zero target coefficient gets encoded slightly too high) in exchange
+# for guaranteeing every seeded parameter starts somewhere gradient
+# descent can actually move it from.
+# ============================================================
+
+const _GRAD_SAFE_FRAC = 1e-2
+
+"""
+    _encode_scaled_softplus(physical, scale) -> Float64
+
+Gradient-safe RAW encoding of a `decode`-softplus-reparameterised quantity
+(`gap`, `duration`, or `cA`) fitted/derived directly from sampled data:
+`_softplus_inv(max(physical, _GRAD_SAFE_FRAC*scale) / scale)`. See
+[`_GRAD_SAFE_FRAC`](@ref) for why the floor is relative to `scale` rather
+than an absolute numerical epsilon.
+"""
+_encode_scaled_softplus(physical::Real, scale::Real) = _softplus_inv(max(physical, _GRAD_SAFE_FRAC * scale) / scale)
+
+"""
+    _clip_cf_raw(cf_raw, cf_clip_mult) -> raw value(s), clamped
+
+Clamps a fitted, already-scale-normalised chirp coefficient (`cf/freq_scale`)
+to `± cf_clip_mult`. Unlike `gap`/`duration`/`cA`, `cf` is UNCONSTRAINED in
+RAW space (no softplus, see [`decode`](@ref)), so it carries no vanishing-
+gradient tail -- but a weighted least-squares (or MSE) fit against a noisy
+instantaneous-frequency estimate can still occasionally return an outlier
+coefficient far beyond any physically sensible chirp rate (the `A²`
+weighting in [`fit_composite_pulse_af`](@ref)/[`fit_composite_pulse_from_samples_linear`](@ref)
+suppresses, but does not eliminate, noise from low-but-above-threshold-
+amplitude samples). An extreme `cf` makes the very first physics-cost ODE
+solve unnecessarily stiff or prone to outright failure -- and a failed
+solve makes `pulse_cost` return a constant `Inf`/`NaN` with a ZERO
+gradient (see `run_local_adam`), stalling the optimiser at the seed with
+no way to move at all. `cf_clip_mult=20` (this section's default) is
+generous relative to `pulse.freq_scale` (the ensemble's own `FWHM`, already
+the natural chirp scale for this package's physics -- see
+[`CompositePulse`](@ref)'s own `Omega_adiabatic` derivation) so it only
+ever engages on genuine noise-driven outliers, not ordinary chirped
+sub-pulses.
+"""
+_clip_cf_raw(cf_raw, cf_clip_mult::Real) = clamp.(cf_raw, -cf_clip_mult, cf_clip_mult)
+
 """
     fit_composite_pulse_from_samples(t, I, Q, d;
         points_per_segment=22, degree=3, taper_frac=0.1,
         rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
-        num_epochs=1000, learning_rate=0.002, seed=42)
+        cf_clip_mult=20.0, num_epochs=1000, learning_rate=0.002, seed=42)
         -> (pulse::CompositePulse, u_fit, fit_report, segments)
 
 Builds a [`CompositePulse`](@ref) seed DIRECTLY from a sampled I/Q trace,
@@ -765,6 +855,18 @@ are:
 `CompositePulse`'s own `T_max`/scale fields -- `t`'s own span need not
 equal `d.timespan`, though for a physically meaningful seed it should).
 
+Seed encoding is GRADIENT-SAFE by construction (see
+[`_encode_scaled_softplus`](@ref)/[`_clip_cf_raw`](@ref)): `gap`/`duration`/
+`cA` are floored at `_GRAD_SAFE_FRAC` (`1e-2`) of their own scale rather
+than at an arbitrarily small numerical epsilon, and `cf` is clipped to
+`± cf_clip_mult * pulse.freq_scale` -- both guard against handing
+[`optimise_composite_pulse`](@ref)/`run_local_adam` a seed with a
+practically-dead (vanishing-decode-gradient) parameter or a noise-driven
+chirp outlier that makes the very first physics ODE solve fail (a failed
+solve makes `pulse_cost` return `Inf`/`NaN` with a ZERO gradient, stalling
+the optimiser at the seed with no way to move at all -- see
+[`_clip_cf_raw`](@ref)'s own docstring).
+
 Returns `(pulse, u_fit, fit_report, segments)` -- `segments` is the raw
 `(i_start, i_end)` sample-index list from step 1, for inspection/plotting.
 """
@@ -772,10 +874,10 @@ function fit_composite_pulse_from_samples(
     t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
     points_per_segment::Integer=22, degree::Integer=3, taper_frac::Real=0.1,
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
-    num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
+    cf_clip_mult::Real=20.0, num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
 )
     A = sqrt.(I .^ 2 .+ Q .^ 2)
-    f = _instantaneous_frequency(t, I, Q)
+    _, f = _instantaneous_frequency(t, I, Q)
 
     segments = _detect_subpulse_segments(
         t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
@@ -799,16 +901,16 @@ function fit_composite_pulse_from_samples(
     for (idx, (i_start, i_end)) in enumerate(segments)
         t_s, t_e = t[i_start], t[i_end]
         duration = t_e - t_s
-        gap = max(t_s - t_prev_end, pulse.gap_scale * 1e-3)
-        dur_arg = max(duration - pulse.dur_floor, pulse.dur_scale * 1e-3)
-        raw_gap[idx] = _softplus_inv(gap / pulse.gap_scale)
-        raw_dur[idx] = _softplus_inv(dur_arg / pulse.dur_scale)
+        gap = max(t_s - t_prev_end, 0.0)
+        dur_arg = max(duration - pulse.dur_floor, 0.0)
+        raw_gap[idx] = _encode_scaled_softplus(gap, pulse.gap_scale)
+        raw_dur[idx] = _encode_scaled_softplus(dur_arg, pulse.dur_scale)
 
         peak_amp = maximum(view(A, i_start:i_end))
-        raw_cA[:, idx] .= _softplus_inv(max(peak_amp, 1e-30) / pulse.amp_scale)
+        raw_cA[:, idx] .= _encode_scaled_softplus(peak_amp, pulse.amp_scale)
 
         f_lo, f_hi = extrema(view(f, i_start:i_end))
-        raw_cf[:, idx] .= range(f_lo, f_hi; length=n_coeff) ./ pulse.freq_scale
+        raw_cf[:, idx] .= _clip_cf_raw(range(f_lo, f_hi; length=n_coeff) ./ pulse.freq_scale, cf_clip_mult)
 
         t_prev_end = t_e
     end
@@ -824,7 +926,7 @@ end
     fit_composite_pulse_from_samples_linear(t, I, Q, d;
         points_per_segment=6, degree=3, taper_frac=0.1,
         rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
-        cA_floor_frac=1e-6)
+        cA_floor_frac=_GRAD_SAFE_FRAC, cf_clip_mult=20.0)
         -> (pulse::CompositePulse, u_fit, fit_report, segments)
 
 Closed-form alternative to [`fit_composite_pulse_from_samples`](@ref):
@@ -845,19 +947,40 @@ parameter:
     segment's own sample boundaries -- no fitting needed, since
     segmentation already locates them exactly (to sample resolution).
   - Given those (hence given the B-spline's knot vector), `A_spline(t) =
-    Σ cA_i B_i(t)` and `f_spline(t) = Σ cf_i B_i(t)` are both LINEAR in
-    their own coefficients -- so `cA`/`cf` are each the exact solution of
-    an ordinary (`cf`) or taper-weighted (`cA`, folding the KNOWN, FIXED
-    `_taper_window` multiplier into the design matrix so the amplitude
-    term being solved for is `pulse`'s own actual physical envelope, not
-    the bare untapered spline) linear least-squares problem -- one
-    `n_samples x n_coeff` solve per sub-pulse per curve, via `\\`, exact
-    for that sub-problem and typically sub-second even at `n_coeff~80`,
-    instead of thousands of epochs approximating the same optimum.
-    `cf`'s solve is WEIGHTED by `A_target.^2` (same rationale as
-    [`fit_composite_pulse_af`](@ref)'s `weight` default: instantaneous
-    frequency is numerically meaningless wherever the target amplitude is
-    near 0).
+    Σ cA_i B_i(t)` is LINEAR in `cA` -- the exact solution of a
+    taper-weighted (folding the KNOWN, FIXED `_taper_window` multiplier
+    into the design matrix so the amplitude term being solved for is
+    `pulse`'s own actual physical envelope, not the bare untapered spline)
+    linear least-squares problem, via `\\`.
+  - `cf` is fit against the ACCUMULATED PHASE `phi` (the raw unwrapped
+    `atan(Q,I)` from [`_instantaneous_frequency`](@ref)), NOT the
+    pointwise frequency curve `f_spline(t) = Σ cf_i B_i(t)` an earlier
+    version of this function fit directly. `Φ(t) = ∫f dτ` is itself LINEAR
+    in `cf` (de Boor's antiderivative construction -- the same one
+    [`bspline_antiderivative`](@ref) uses, expressed here as an explicit
+    `(n_coeff+1, n_coeff)` linear map so the fit stays a single weighted
+    least-squares solve, verified bit-for-bit equivalent to that
+    function's own cumulative-sum recursion), so this is still one
+    `n_samples x (n_coeff+1)` solve per sub-pulse, exact and just as cheap
+    -- the `+1` column is an unconstrained additive constant absorbing
+    `phi`'s own arbitrary reference point (unrelated to
+    [`build_E_of_t`](@ref)'s own `phase_offset` bookkeeping), discarded
+    after the solve. This matters because a per-point frequency fit can
+    have an excellent RMS residual while its INTEGRAL still drifts
+    (integration doesn't average away a small but structured, rather than
+    i.i.d., residual) -- measured directly on this package's own 3-ARP
+    reference: fitting `cf` against `f` gave `rel_l2_f~1e-13` (an
+    essentially perfect per-point frequency fit) yet the reconstructed
+    COMPLEX pulse (`build_E_of_t(pulse,u_fit)`, resampled and compared
+    point-by-point against the original trace) was off by `rel_l2~0.43`,
+    with >99.9999% of that error concentrated at the trace's own peak
+    amplitude sample -- exactly where a modest phase error costs the most
+    in a squared-error sum. Fitting `cf` against `phi` directly targets the
+    quantity that actually enters `E(t)=A(t)*exp(iΦ(t))`, closing that gap.
+    Both `cf`'s solve and the (retained, diagnostic-only) frequency-domain
+    comparison are WEIGHTED by `A_target.^2` (same rationale as
+    [`fit_composite_pulse_af`](@ref)'s `weight` default: phase/frequency
+    are numerically meaningless wherever the target amplitude is near 0).
 
 `points_per_segment` defaults to `6` (not `fit_composite_pulse_from_samples`'s
 20-25 spec) -- verified on this package's own 3-ARP reference pulse to
@@ -873,28 +996,74 @@ but `CompositePulse`'s own parameterisation requires `cA >= 0`
 (`decode`'s `cA = amp_scale*softplus(raw_cA)`, always non-negative, so
 `_softplus_inv` needs a positive argument) -- any solved coefficient below
 `cA_floor_frac * pulse.amp_scale` is clamped up to that floor before
-encoding. This is a pragmatic guard against small negative
-undershoots near sharp features, NOT a proper non-negative least-squares
-solve; on the same reference case this floor starts triggering (a small
+encoding. This doubles as this seed's GRADIENT-SAFETY floor (see
+[`_GRAD_SAFE_FRAC`](@ref)): `decode`'s own softplus-reparameterisation
+gradient at the seed is attenuated by roughly `cA_floor_frac` itself, so
+the previous default (`1e-6`, chosen only to keep `_softplus_inv`'s
+argument positive) left any floored coefficient with an effectively DEAD
+decode-gradient for the whole physics optimisation that follows --
+`_GRAD_SAFE_FRAC=1e-2` keeps that attenuation to about 100x instead of
+1e6x. This is still a pragmatic guard against small negative undershoots
+near sharp features, NOT a proper non-negative least-squares solve; on the
+package's own 3-ARP reference case this floor starts triggering (a small
 handful of coefficients, out of hundreds) right around `points_per_segment
 = 6`, so `fit_report.n_cA_floored` is worth checking at this default --
 a persistently nonzero count is a sign a true NNLS solve would do better
-than this clamp.
+than this clamp. `cf_clip_mult` guards the frequency side the same way
+[`_clip_cf_raw`](@ref) does for [`fit_composite_pulse_from_samples`](@ref):
+the weighted per-segment linear solve for `cf` has no such floor issue
+(unconstrained, no softplus) but can still return a noise-driven outlier
+coefficient that makes the very first physics ODE solve stiff or prone to
+failure -- clipped to `± cf_clip_mult * pulse.freq_scale`.
 
 Returns `(pulse, u_fit, fit_report, segments)` -- `fit_report =
-(rel_l2_A, rel_l2_f, n_cA_floored)`: `rel_l2_A`/`rel_l2_f` are the same
-scale-free `[0,1]`-ish residual `fit_composite_pulse`/`_af` report (`0` =
-perfect); `n_cA_floored` is the total count of amplitude coefficients
-(across all sub-pulses) that hit the non-negativity floor above.
+(rel_l2_A, rel_l2_f, phi_rms_rad, n_cA_floored, n_cf_clipped)`: `rel_l2_A`
+is the same scale-free `[0,1]`-ish residual `fit_composite_pulse`/`_af`
+report (`0` = perfect); `rel_l2_f` is now a DIAGNOSTIC-ONLY pointwise
+frequency-curve residual (`Basis*cf_seg` vs `f_seg`, evaluated at the
+`cf_seg` the PHASE fit produced) -- kept for comparison, no longer what
+`cf` is actually fit against; `phi_rms_rad` is the `A²`-weighted RMS phase
+residual in RADIANS (`Φ(t)` vs `phi`, the quantity `cf`'s solve DOES
+target) -- unlike `rel_l2_A`/`rel_l2_f` this has no natural `[0,1]` scale
+(it's an absolute angle), so judge it against how many radians of phase
+error would actually matter for your own physics (a fraction of a radian
+is generally fine; an O(1) value at high amplitude is not). `n_cA_floored`/
+`n_cf_clipped` are the total counts of amplitude/frequency coefficients
+(across all sub-pulses) that hit the non-negativity floor / clip bound
+above.
+
+KNOWN LIMITATION -- a near-perfect `phi_rms_rad` does NOT by itself
+guarantee a near-perfect reconstructed COMPLEX pulse: each sub-pulse's
+phase fit here includes a free additive constant (`phase_const` in the
+loop below) that absorbs `phi`'s own arbitrary reference point, and that
+constant is DISCARDED after the solve -- only `cf` (the SHAPE of `Φ(t)`)
+is kept. `build_E_of_t` (composite_pulse.jl) has no parameter to receive
+it back: it hardcodes sub-pulse 1's own phase to start at exactly `0`
+(`phase_offset[1] = 0`) and accumulates every later sub-pulse's own
+`phase_offset[i]` purely from the FITTED sub-pulses' own internal `∫f`,
+never from anything about the target's own true absolute phase reference.
+If the real recorded trace's own phase at a sub-pulse's start is NOT
+(numerically) `0` -- routine for anything with a real carrier/LO
+convention -- the reconstructed complex pulse will disagree with the
+original by a corresponding constant rotation, `2*sin(θ/2)` in relative
+`L2` terms for an offset of `θ` radians, even though `phi_rms_rad` (which
+only measures each segment's own SHAPE, up to that discarded constant)
+reports an excellent fit. Measured directly on this package's own 3-ARP
+reference: sub-pulse 1's own raw phase at its detected start was `0.4466`
+rad, predicting a `2*sin(0.4466/2) = 0.443` relative full-trace error --
+matching the smoke-test-measured `rel_l2 = 0.434` almost exactly, despite
+`phi_rms_rad ~ 1e-13`. Fixing this would mean giving `CompositePulse` an
+actual absolute-phase-offset parameter (currently it has none) -- left as
+a known, documented gap rather than done here.
 """
 function fit_composite_pulse_from_samples_linear(
     t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
     points_per_segment::Integer=6, degree::Integer=3, taper_frac::Real=0.1,
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
-    cA_floor_frac::Real=1e-6,
+    cA_floor_frac::Real=_GRAD_SAFE_FRAC, cf_clip_mult::Real=20.0,
 )
     A = sqrt.(I .^ 2 .+ Q .^ 2)
-    f = _instantaneous_frequency(t, I, Q)
+    phi, f = _instantaneous_frequency(t, I, Q)
 
     segments = _detect_subpulse_segments(
         t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
@@ -916,22 +1085,25 @@ function fit_composite_pulse_from_samples_linear(
     raw_cA = Matrix{Float64}(undef, n_coeff, k)
     raw_cf = Matrix{Float64}(undef, n_coeff, k)
     n_cA_floored = 0
+    n_cf_clipped = 0
     A_resid = 0.0
     f_resid = 0.0
+    phi_resid = 0.0
     f_weight_sum = 0.0
     t_prev_end = 0.0
 
     for (idx, (i_start, i_end)) in enumerate(segments)
         t_s, t_e = t[i_start], t[i_end]
         duration = t_e - t_s
-        gap = max(t_s - t_prev_end, pulse.gap_scale * 1e-3)
-        dur_arg = max(duration - pulse.dur_floor, pulse.dur_scale * 1e-3)
-        raw_gap[idx] = _softplus_inv(gap / pulse.gap_scale)
-        raw_dur[idx] = _softplus_inv(dur_arg / pulse.dur_scale)
+        gap = max(t_s - t_prev_end, 0.0)
+        dur_arg = max(duration - pulse.dur_floor, 0.0)
+        raw_gap[idx] = _encode_scaled_softplus(gap, pulse.gap_scale)
+        raw_dur[idx] = _encode_scaled_softplus(dur_arg, pulse.dur_scale)
 
         t_seg = view(t, i_start:i_end)
         A_seg = view(A, i_start:i_end)
         f_seg = view(f, i_start:i_end)
+        phi_seg = view(phi, i_start:i_end)
         n_seg = length(t_seg)
 
         knots = make_clamped_knots(n_coeff, t_s, t_e, degree)
@@ -947,16 +1119,52 @@ function fit_composite_pulse_from_samples_linear(
         cA_seg = max.(cA_seg, cA_floor)
         raw_cA[:, idx] .= _softplus_inv.(cA_seg ./ pulse.amp_scale)
 
+        # Fit cf against the ACCUMULATED PHASE (the exact quantity
+        # build_E_of_t's Φ(t)=∫f dτ reconstructs), not the pointwise
+        # frequency curve -- see this function's own docstring for why a
+        # pointwise-f fit can leave Φ drifting even when its own per-point
+        # RMS looks excellent. `bspline_antiderivative`'s own degree-(p+1)
+        # antiderivative construction, expressed here as an explicit
+        # (n_coeff+1, n_coeff) linear map `L` (`d = L*cf`) so the whole
+        # fit stays a single weighted linear least-squares solve; verified
+        # bit-for-bit equivalent to `bspline_antiderivative`'s own
+        # cumulative-sum recursion. The augmented constant column absorbs
+        # `phi`'s own arbitrary reference point (whatever `atan` returned
+        # at the trace's first sample) -- unrelated to and decoupled from
+        # `build_E_of_t`'s own `phase_offset` bookkeeping, exactly the way
+        # an intercept term in ordinary linear regression decouples a
+        # slope fit from an unknown additive offset.
+        knots_p1 = vcat(knots[1:1], knots, knots[end:end])
+        Basis_p1 = Matrix{Float64}(undef, n_seg, n_coeff + 1)
+        @inbounds for j in 1:n_seg
+            Basis_p1[j, :] .= bspline_basis(t_seg[j], knots_p1, degree + 1)
+        end
+        L = zeros(Float64, n_coeff + 1, n_coeff)
+        for j in 1:n_coeff
+            width = (knots[j+degree+1] - knots[j]) / (degree + 1)
+            L[j+1:end, j] .= width
+        end
+        M_Phi_base = Basis_p1 * L
+        M_Phi = hcat(M_Phi_base, ones(n_seg))
+
         f_weight = A_seg .^ 2 .+ 1e-30
         sw = sqrt.(f_weight)
-        M_f = Basis .* sw
-        cf_seg = M_f \ (collect(f_seg) .* sw)
-        raw_cf[:, idx] .= cf_seg ./ pulse.freq_scale
+        M_Phi_weighted = M_Phi .* sw
+        phi_target_weighted = collect(phi_seg) .* sw
+        sol = M_Phi_weighted \ phi_target_weighted
+        cf_seg = sol[1:n_coeff]
+        phase_const = sol[end]
+
+        cf_seg_raw = cf_seg ./ pulse.freq_scale
+        n_cf_clipped += count(x -> abs(x) > cf_clip_mult, cf_seg_raw)
+        raw_cf[:, idx] .= _clip_cf_raw(cf_seg_raw, cf_clip_mult)
 
         A_pred = M_A * cA_seg
         f_pred = Basis * cf_seg
+        Phi_pred = M_Phi_base * cf_seg .+ phase_const
         A_resid += sum(abs2, A_pred .- A_seg)
         f_resid += sum(f_weight .* abs2.(f_pred .- f_seg))
+        phi_resid += sum(f_weight .* abs2.(Phi_pred .- phi_seg))
         f_weight_sum += sum(f_weight)
 
         t_prev_end = t_e
@@ -967,8 +1175,12 @@ function fit_composite_pulse_from_samples_linear(
     A_energy = sum(abs2, A) + 1e-30
     rel_l2_A = sqrt(A_resid / A_energy)
     rel_l2_f = sqrt(f_resid / (f_weight_sum + 1e-30)) / pulse.freq_scale
+    phi_rms_rad = sqrt(phi_resid / (f_weight_sum + 1e-30))
 
-    fit_report = (rel_l2_A=rel_l2_A, rel_l2_f=rel_l2_f, n_cA_floored=n_cA_floored)
+    fit_report = (
+        rel_l2_A=rel_l2_A, rel_l2_f=rel_l2_f, phi_rms_rad=phi_rms_rad,
+        n_cA_floored=n_cA_floored, n_cf_clipped=n_cf_clipped,
+    )
     return pulse, u_fit, fit_report, segments
 end
 
@@ -1037,14 +1249,40 @@ shape). `coherence` is [`pulse_cost`](@ref)'s DIAGNOSTIC-ONLY per-bin
 `|Sp|/(Nj/2)` average from the same `:equator` solve as `silencing` (see
 [`_weighted_coherence`](@ref)) -- recorded for comparison alongside the
 collective `|F|` actually being optimised, never part of `cost` itself.
+
+`cf_lr_scale` (default `1.0`, i.e. no change from the original uniform-`lr`
+behaviour) multiplies the effective step size for the CHIRP/frequency
+coefficients (`raw_cf`) only -- `gap`/`duration`/`cA` always step at the
+full `learning_rate`. Motivation: `raw_cf` enters the physical drive
+through an EXACT phase integral (`build_E_of_t`'s `Φ(t) = ∫f dτ`, via
+`bspline_antiderivative`), and the cost depends on that phase only through
+`exp(iΦ(t))` -- a periodic, non-convex function of `raw_cf`. `adam_step!`'s
+own per-parameter second-moment normalisation already keeps every raw
+parameter's step size close to `lr` in magnitude regardless of its raw
+gradient scale, so this is NOT compensating for `cf`'s gradient being
+larger or smaller than `gap`/`dur`/`cA`'s -- it is deliberately slowing
+descent along the periodic sub-manifold specifically, so a single epoch's
+step is less likely to carry `Φ(t)` across a `2π` boundary and land in an
+entirely different (and possibly worse) local phase-alignment than the one
+the rest of `u` was descending toward. Pass e.g. `cf_lr_scale=0.1` to
+soften this; the right value is problem-dependent (how large `pulse.
+freq_scale*duration` is relative to `2π` for your own config), so no
+non-`1.0` value is asserted as a universal default here -- watch
+`history`'s `cost`/`silencing` columns for erratic (non-monotone,
+large-swing) epoch-to-epoch behaviour as the signal that a smaller
+`cf_lr_scale` is worth trying.
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
-                         learning_rate::Real=0.05, label::AbstractString="", solve_kwargs...)
+                         learning_rate::Real=0.05, cf_lr_scale::Real=1.0, label::AbstractString="", solve_kwargs...)
     _forbid_initial_condition(solve_kwargs)
     u = copy(u_start)
     n = length(u)
     adam = AdamState(n)
+    lr_scale = cf_lr_scale == 1.0 ? nothing : pack(
+        pulse, ones(pulse.k), ones(pulse.k), ones(pulse.n_coeff_A, pulse.k),
+        fill(cf_lr_scale, pulse.n_coeff_f, pulse.k),
+    )
     aux = Ref{NTuple{5,Float64}}((NaN, NaN, NaN, NaN, NaN))
     function cost_only(uu)
         c, inv_, sil_, dur_, coh_ = pulse_cost(uu, pulse, d; cost_kwargs..., solve_kwargs...)
@@ -1134,7 +1372,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
                          silencing=sil_, duration=dur_, coherence=coh_, improved=improved))
 
-        adam_step!(u, grad, adam; lr=lr)
+        adam_step!(u, grad, adam; lr=lr, lr_scale=lr_scale)
 
         elapsed = time() - t_wall
         mark = improved ? "*" : " "
@@ -1231,10 +1469,14 @@ one left off. Must have length `n_params(pulse)`, i.e. be a raw parameter
 vector for a `CompositePulse` with the SAME `(k, n_coeff_A, n_coeff_f)`
 as this call's -- an error is raised otherwise, since a length mismatch
 would silently decode into a nonsensical pulse rather than fail loudly.
+
+`cf_lr_scale` (default `1.0`) is forwarded unchanged to every
+[`run_local_adam`](@ref) call (hop 0 and every subsequent hop) -- see that
+function's own docstring for what it does and why.
 """
 function optimise_composite_pulse(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
-    num_epochs::Integer=30, learning_rate::Real=0.05, patience::Integer=5, tol::Real=1e-3,
+    num_epochs::Integer=30, learning_rate::Real=0.05, cf_lr_scale::Real=1.0, patience::Integer=5, tol::Real=1e-3,
     n_hops::Integer=3, hop_patience::Integer=2, hop_step_size::Real=0.5, temperature::Real=1.0,
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
     w_inv::Real=1.0, w_sil::Real=0.7, target_F::Real=1.0, w_time::Real=0.15,
@@ -1248,7 +1490,7 @@ function optimise_composite_pulse(
     solve_settings = NamedTuple(kv for kv in pairs(solve_kwargs) if !(kv[2] isa Function))
     optimizer_settings = merge(
         (k=k, n_coeff_A=n_coeff_A, n_coeff_f=n_coeff_f, degree=degree, taper_frac=taper_frac,
-         num_epochs=num_epochs, learning_rate=learning_rate, patience=patience, tol=tol,
+         num_epochs=num_epochs, learning_rate=learning_rate, cf_lr_scale=cf_lr_scale, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed),
         solve_settings,
@@ -1273,7 +1515,7 @@ function optimise_composite_pulse(
     history = NamedTuple[]
 
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
-        u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate,
+        u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
         label="$(label_prefix)[hop 0]", solve_kwargs...
     )
     append!(history, hop0_history)
@@ -1286,7 +1528,7 @@ function optimise_composite_pulse(
 
         cand_u, cand_cost, _, _, _, hop_history = run_local_adam(
             candidate_u0, pulse, d, cost_kwargs;
-            hop, num_epochs, patience, tol, learning_rate,
+            hop, num_epochs, patience, tol, learning_rate, cf_lr_scale,
             label="$(label_prefix)[hop $hop]", solve_kwargs...,
         )
         append!(history, hop_history)

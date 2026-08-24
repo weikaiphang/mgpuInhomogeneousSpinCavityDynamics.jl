@@ -222,6 +222,176 @@ function fit_composite_pulse_seed_auto_linear(control_cfg, d; N_samples::Integer
 end
 
 """
+    smoke_test_fit_from_pulsemat(pulsemat_path;
+        linear=true, out_dir=nothing, points_per_segment=nothing,
+        degree=3, taper_frac=0.1, rel_thresh=1e-3, min_active_samples=5,
+        min_silence_samples=3, cA_floor_frac=_GRAD_SAFE_FRAC, cf_clip_mult=20.0,
+        num_epochs=1000, learning_rate=0.002, seed=42)
+        -> (pulse, u_fit, fit_report, segments, diff_report, paths)
+
+End-to-end smoke test of the sample-derived seed-fitting pipeline
+([`fit_composite_pulse_from_samples_linear`](@ref)/
+[`fit_composite_pulse_from_samples`](@ref)) against a REAL recorded pulse,
+given nothing but its `_pulsemat.csv`:
+
+  1. Reads `pulsemat_path` via [`load_E_samples`](@ref) for the raw
+     `(t, I, Q)` trace (`t` reconstructed as `range(0.0, t_end;
+     length=N)`, the same grid [`sample_E_of_t`](@ref) wrote it on).
+  2. Loads the SIBLING run `pulsemat_path` was written alongside --
+     same directory, same basename, `.jld2` (the convention
+     [`save_run_data`](@ref) writes both files under) -- and rebuilds `d`
+     via `build_full_config`/`prepare_derived`, exactly like
+     [`optimise_control_pulse_from_jld2`](@ref) does. This is where the
+     cavity/ensemble parameters (`kappa_e`, `g_mean`, `FWHM`, ...) that
+     `CompositePulse`'s own `amp_scale`/`freq_scale` need come from --
+     they are NOT recoverable from `_pulsemat.csv` alone. Errors loudly if
+     the sibling `.jld2`'s own `SIM_SETTING.Ttotal` disagrees with the
+     CSV's own `t_end_us` metadata (the two files not actually belonging
+     together).
+  3. Fits a `CompositePulse` seed directly from the trace: `linear=true`
+     (default) uses [`fit_composite_pulse_from_samples_linear`](@ref)
+     (closed-form, practical at a real trace's sample density);
+     `linear=false` uses the `ForwardDiff`/Adam
+     [`fit_composite_pulse_from_samples`](@ref) instead -- expect this to
+     be drastically slower, see that function's own docstring.
+  4. Saves the fit's full parameterisation to `<basename>_fitparas.jld2`
+     (same shape/convention as
+     [`save_optimised_pulse_parameters`](@ref)'s `_opt_pulsepara.jld2`,
+     plus this fit's own `fit_report`/`segments`/source paths).
+  5. Resamples the FITTED pulse (`build_E_of_t(pulse, u_fit)`) at the same
+     `N` evenly-spaced points the original trace was recorded at, saving
+     it to `<basename>_fitpulsemat.csv` via the existing
+     [`sample_E_of_t`](@ref)/[`save_E_samples`](@ref) (identical format to
+     every other `_pulsemat.csv` in this package, so it round-trips
+     through [`load_E_samples`](@ref) the same way).
+  6. Saves the point-wise `(I - I_fit, Q - Q_fit)` residual to
+     `<basename>_fitsamplediff.csv`, same CSV format again.
+
+`out_dir` redirects the three OUTPUT files elsewhere; the SOURCE `.jld2`
+run is always read from next to `pulsemat_path` regardless.
+
+Returns `(pulse, u_fit, fit_report, segments, diff_report, paths)`.
+`diff_report = (rel_l2, max_abs_diff)`: `rel_l2 =
+sqrt(sum(abs2,diff)/sum(abs2,target))` computed on the FULL COMPLEX
+difference (unlike `fit_report`'s own `rel_l2_A`/`rel_l2_f`, which score
+amplitude/frequency separately) -- this is the smoke test's actual
+pass/fail signal, since it round-trips through the real CSV format a
+caller would use rather than just checking the in-memory arrays
+`fit_composite_pulse_from_samples*` were unit-tested against. `paths =
+(source_pulsemat=..., source_jld2=..., fitparas=..., fitpulsemat=...,
+fitsamplediff=...)`.
+
+Do not be surprised to see `diff_report.rel_l2` stay large (tens of
+percent) even when `fit_report.phi_rms_rad` reports an excellent
+per-sub-pulse phase SHAPE fit -- see
+[`fit_composite_pulse_from_samples_linear`](@ref)'s own "KNOWN LIMITATION"
+paragraph: `CompositePulse` has no parameter for a sub-pulse's ABSOLUTE
+phase reference (sub-pulse 1 always reconstructs starting at phase `0`),
+so a real trace whose own recorded phase at that instant is not
+numerically `0` reconstructs rotated by that difference -- a real,
+currently-unfixed gap in `CompositePulse`/`build_E_of_t`, not a bug in
+this smoke test or in the fit.
+"""
+function smoke_test_fit_from_pulsemat(
+    pulsemat_path::AbstractString;
+    linear::Bool=true,
+    out_dir=nothing,
+    points_per_segment::Union{Integer,Nothing}=nothing,
+    degree::Integer=3, taper_frac::Real=0.1,
+    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
+    cA_floor_frac::Real=_GRAD_SAFE_FRAC, cf_clip_mult::Real=20.0,
+    num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
+)
+    endswith(pulsemat_path, "_pulsemat.csv") || error(
+        "Expected a path ending in \"_pulsemat.csv\", got $pulsemat_path."
+    )
+    base = pulsemat_path[1:end-length("_pulsemat.csv")]
+    jld2_path = base * ".jld2"
+    isfile(jld2_path) || error(
+        "Expected the sibling run $jld2_path (same directory/basename as $pulsemat_path, " *
+        "the convention save_run_data writes both files under) -- not found."
+    )
+
+    out_base = out_dir === nothing ? base : joinpath(out_dir, basename(base))
+    isempty(dirname(out_base)) || mkpath(dirname(out_base))
+    fitparas_path = out_base * "_fitparas.jld2"
+    fitpulsemat_path = out_base * "_fitpulsemat.csv"
+    fitsamplediff_path = out_base * "_fitsamplediff.csv"
+
+    t_end, Ex, Ep = load_E_samples(pulsemat_path)
+    N = length(Ex)
+    t = collect(range(0.0, t_end; length=N))
+
+    data = load_jld2_run(jld2_path)
+    CONFIG = build_full_config(data.SIM_SETTING, data.SYSTEM_CONFIG)
+    d = prepare_derived(CONFIG)
+    isapprox(d.timespan[2] - d.timespan[1], t_end; rtol=1e-9) || error(
+        "T_max mismatch: $jld2_path's own SIM_SETTING.Ttotal implies T_max=" *
+        "$(d.timespan[2]-d.timespan[1])s, but $pulsemat_path's own metadata says " *
+        "t_end=$(t_end)s -- these two files don't actually belong together."
+    )
+
+    fit_kwargs = (
+        degree=degree, taper_frac=taper_frac, rel_thresh=rel_thresh,
+        min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+    )
+    pulse, u_fit, fit_report, segments = if linear
+        pps = points_per_segment === nothing ? 6 : points_per_segment
+        fit_composite_pulse_from_samples_linear(
+            t, Ex, Ep, d; points_per_segment=pps, cA_floor_frac=cA_floor_frac,
+            cf_clip_mult=cf_clip_mult, fit_kwargs...,
+        )
+    else
+        pps = points_per_segment === nothing ? 22 : points_per_segment
+        fit_composite_pulse_from_samples(
+            t, Ex, Ep, d; points_per_segment=pps, cf_clip_mult=cf_clip_mult,
+            num_epochs=num_epochs, learning_rate=learning_rate, seed=seed, fit_kwargs...,
+        )
+    end
+
+    t_start, t_end_decoded, cA, cf = decode(pulse, u_fit)
+    fitparas = (
+        source_pulsemat=pulsemat_path, source_jld2=jld2_path,
+        k=pulse.k, n_coeff_A=pulse.n_coeff_A, n_coeff_f=pulse.n_coeff_f,
+        degree=pulse.degree, taper_frac=pulse.taper_frac,
+        T_max=pulse.T_max, gap_scale=pulse.gap_scale, dur_scale=pulse.dur_scale,
+        dur_floor=pulse.dur_floor, amp_scale=pulse.amp_scale, freq_scale=pulse.freq_scale,
+        u_fit=collect(u_fit),
+        t_start=collect(t_start), t_end=collect(t_end_decoded), cA=collect(cA), cf=collect(cf),
+        fit_report=fit_report, segments=segments, linear=linear,
+    )
+    JLD2.save(fitparas_path, "data", fitparas)
+
+    E_fit = build_E_of_t(pulse, u_fit)
+    Ex_fit, Ep_fit = sample_E_of_t(E_fit, pulse.T_max, N; savepath=fitpulsemat_path)
+
+    dEx = Ex .- Ex_fit
+    dEp = Ep .- Ep_fit
+    save_E_samples(hcat(dEx, dEp), t_end, fitsamplediff_path)
+
+    target_energy = sum(abs2, Ex) + sum(abs2, Ep) + 1e-30
+    diff_energy = sum(abs2, dEx) + sum(abs2, dEp)
+    rel_l2 = sqrt(diff_energy / target_energy)
+    max_abs_diff = max(maximum(abs, dEx), maximum(abs, dEp))
+    diff_report = (rel_l2=rel_l2, max_abs_diff=max_abs_diff)
+
+    println(
+        "Smoke test: fit k=$(pulse.k) sub-pulses from $(length(segments)) detected segments, " *
+        "N=$N samples. rel_l2 (complex, full trace) = $(round(rel_l2, sigdigits=4)), " *
+        "max|diff| = $(round(max_abs_diff, sigdigits=4))."
+    )
+    println("  fitparas      -> $fitparas_path")
+    println("  fitpulsemat   -> $fitpulsemat_path")
+    println("  fitsamplediff -> $fitsamplediff_path")
+
+    paths = (
+        source_pulsemat=pulsemat_path, source_jld2=jld2_path,
+        fitparas=fitparas_path, fitpulsemat=fitpulsemat_path, fitsamplediff=fitsamplediff_path,
+    )
+    return pulse, u_fit, fit_report, segments, diff_report, paths
+end
+
+"""
     _compare_against_saved_trajectory(a_check, Sp_check, Sz_check, data; atol=0.0) -> (rel_a, rel_p, rel_z, err_a, err_p, err_z)
 
 Shared comparison core behind [`reconcile_against_jld2`](@ref) and

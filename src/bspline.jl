@@ -49,17 +49,54 @@ the last basis function doesn't spuriously evaluate to 0 exactly at the
 pulse's own end time -- there is exactly one non-degenerate degree-0
 sub-interval whose right edge is genuinely `knots[end]`, even with
 clamped/repeated end knots, and only that one is closed.
+
+The degree-0 interval membership test is decided on `ForwardDiff.value(t)`/
+`ForwardDiff.value(knots[i])`, NOT on `t`/`knots[i]` directly -- same
+pattern `_gevrey_bump` (composite_pulse.jl) already uses, and for the same
+reason: comparing a `Dual` to a plain value does not reduce to comparing
+primal values the way one might expect. Verified directly (not just by
+inspection): build a toy `f(u) = bspline_eval(t_fixed, c, knots(u),
+degree)` where `knots[end]` is a Dual that happens to equal `t_fixed`'s
+primal value at `u=u0` (exactly the situation this whole package
+constructs on purpose, via `tstops = ForwardDiff.value.(...)` in
+`run_sim_1st_order_pure`, so the ODE solver evaluates the RHS exactly at
+every sub-pulse boundary). With the naive (pre-fix) `t == knots[end]`
+comparison, `ForwardDiff.gradient(f, u0)` silently returns `0.0` for
+`d(f)/d(u)` -- disagreeing with a correct one-sided finite difference of
+`2.52` -- whenever `d(knots[end])/du` is NEGATIVE at that point (increasing
+`u` moves `knots[end]` below `t_fixed`); it happens to agree with finite
+differences whenever that same partial is POSITIVE. This package's own
+`decode` (composite_pulse.jl) never actually triggers the broken sign
+(`t_start`/`t_end` are built from a cumulative sum of strictly non-negative
+`softplus` terms, so their partials w.r.t. every raw parameter are always
+`>= 0`, never negative) -- which is presumably why the existing
+finite-difference verification this package already relies on
+(`CompositePulse`'s own module docstring, `<0.0001%` relative error) never
+caught this. But that non-negativity is an incidental property of the
+CURRENT reparameterisation, not something this function enforces or
+documents anywhere near itself -- a future change to `decode` (e.g.
+allowing sub-pulses to be reordered, or any construction where a knot's
+sensitivity to some parameter can be negative) would silently reintroduce
+wrong gradients here with no error, no NaN, nothing to flag it. Deciding
+the branch on primal values removes the sign-dependence entirely (verified
+the same way, both signs now match finite differences), matching
+`_gevrey_bump`'s existing "branch on `ForwardDiff.value`, compute on the
+real (possibly `Dual`) arithmetic" convention -- `ForwardDiff.value` is a
+no-op on plain `Float64`, so the non-AD code path is unaffected.
 """
 function bspline_basis(t, knots::AbstractVector, degree::Integer)
     K = length(knots)
     n0 = K - 1
     T = promote_type(typeof(t), eltype(knots))
+    tv = ForwardDiff.value(t)
+    knots_end_v = ForwardDiff.value(knots[end])
     B = zeros(T, n0)
     @inbounds for i in 1:n0
         lo, hi = knots[i], knots[i+1]
-        if lo <= t < hi
+        lov, hiv = ForwardDiff.value(lo), ForwardDiff.value(hi)
+        if lov <= tv < hiv
             B[i] = one(T)
-        elseif t == knots[end] && hi == knots[end] && lo < hi
+        elseif tv == knots_end_v && hiv == knots_end_v && lov < hiv
             B[i] = one(T)
         end
     end

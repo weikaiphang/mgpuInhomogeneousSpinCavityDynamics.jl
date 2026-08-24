@@ -175,6 +175,46 @@ function save_E_samples(E_matrix::AbstractMatrix{<:Real}, t_end::Real, path::Abs
 end
 
 """
+    load_E_samples(path) -> (t_end, Ex, Ep)
+
+Reads a `_pulsemat.csv` file back in -- the exact read-side counterpart of
+[`save_E_samples`](@ref)/[`sample_E_of_t`](@ref): the `# t_end_us,<value>`
+metadata line, then the `Re,Im` header, then one `Re,Im` row per sample, in
+the same order they were written. `t_end` is returned in SECONDS (the file
+itself stores microseconds, matching `save_E_samples`'s own `t_end*1e6`
+convention) -- the corresponding sample TIMES are `range(0.0, t_end;
+length=length(Ex))`, since that is exactly the grid `sample_E_of_t` wrote
+them on; this function does not reconstruct that vector itself; a caller
+needing it just calls `collect(range(0.0, t_end; length=length(Ex)))`.
+Dependency-free (no CSV.jl/DelimitedFiles), matching the writer's own
+hand-rolled, Python-readable format.
+"""
+function load_E_samples(path::AbstractString)
+    lines = readlines(path)
+    length(lines) >= 2 || error("$path has fewer than the expected 2 header lines.")
+    startswith(lines[1], "# t_end_us,") || error(
+        "$path's first line does not match the expected \"# t_end_us,<value>\" " *
+        "metadata format written by save_E_samples; got: $(lines[1])"
+    )
+    t_end_us = parse(Float64, split(lines[1], ",")[2])
+    lines[2] == "Re,Im" || error(
+        "$path's second line is not the expected \"Re,Im\" column header; got: $(lines[2])"
+    )
+    N = length(lines) - 2
+    Ex = Vector{Float64}(undef, N)
+    Ep = Vector{Float64}(undef, N)
+    @inbounds for j in 1:N
+        parts = split(lines[2+j], ',')
+        length(parts) == 2 || error(
+            "$path line $(2+j) does not have exactly 2 comma-separated fields: $(lines[2+j])"
+        )
+        Ex[j] = parse(Float64, parts[1])
+        Ep[j] = parse(Float64, parts[2])
+    end
+    return t_end_us * 1e-6, Ex, Ep
+end
+
+"""
 Saves `data` to `filename` via JLD2 -- exactly `@save filename data`, the
 convention every `run_sim_*` function already uses -- and, alongside it,
 regenerates that run's pulse-sample matrix: rebuilds `E_of_t` from
