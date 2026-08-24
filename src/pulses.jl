@@ -153,8 +153,20 @@ Read the sample matrix back with e.g.
 `numpy.loadtxt(path, delimiter=",", skiprows=2)` (skiprows=2 to skip both
 the metadata line and the "Re,Im" column header); read `t_end_us` back
 with e.g. `float(open(path).readline().split(",")[1])`.
+
+`extra_meta`, if non-empty, is appended VERBATIM (comma-prefixed) to that
+same metadata line -- e.g. `extra_meta="rel_l2_complex,0.0004"` writes
+`# t_end_us,1100.0,rel_l2_complex,0.0004`. Existing readers are
+unaffected: [`load_E_samples`](@ref) only ever looks at the SECOND
+comma-separated field, and the documented Python one-liner above
+(`split(",")[1]`) does too, so trailing fields are silently ignored by
+both. Default `""` (no-op) keeps every other caller's output identical to
+before this parameter existed.
 """
-function save_E_samples(E_matrix::AbstractMatrix{<:Real}, t_end::Real, path::AbstractString)
+function save_E_samples(
+    E_matrix::AbstractMatrix{<:Real}, t_end::Real, path::AbstractString;
+    extra_meta::AbstractString="",
+)
     size(E_matrix, 2) == 2 || error(
         "save_E_samples expects an (N, 2) matrix [Re[E(t)] Im[E(t)]], " *
         "got size $(size(E_matrix))."
@@ -164,7 +176,7 @@ function save_E_samples(E_matrix::AbstractMatrix{<:Real}, t_end::Real, path::Abs
     isempty(dir) || mkpath(dir)
 
     open(path, "w") do io
-        @printf(io, "# t_end_us,%.17g\n", t_end * 1e6)
+        @printf(io, "# t_end_us,%.17g%s\n", t_end * 1e6, isempty(extra_meta) ? "" : "," * extra_meta)
         println(io, "Re,Im")
         for row in eachrow(E_matrix)
             @printf(io, "%.17g,%.17g\n", row[1], row[2])

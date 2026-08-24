@@ -678,6 +678,91 @@ function _spline_coeff_count(n_samples::Integer; points_per_segment::Integer=22,
 end
 
 """
+    points_per_segment_for_budget(n_samples_max, k; degree=3, param_budget=60) -> Int
+
+Largest-detail `points_per_segment` (in [`_spline_coeff_count`](@ref)'s own
+sense) that still keeps a `CompositePulse`'s total raw parameter count
+(`n_params = 3*k + 2*k*n_coeff`, since `n_coeff_A = n_coeff_f = n_coeff` --
+see [`n_params`](@ref)) at or under `param_budget`, given `k` sub-pulses and
+`n_samples_max` (the LONGEST detected segment's own sample count --
+`_spline_coeff_count` sizes the single shared `n_coeff` off this one value).
+
+Inverts `_spline_coeff_count`'s own `n_pieces = ceil(n_samples/pps)`,
+`n_coeff = n_pieces + degree`: first finds the largest feasible `n_coeff`
+(`n_coeff_max = (param_budget - 3*k) ÷ (2*k)`, floor division), then the
+SMALLEST `pps` that achieves at most `n_coeff_max - degree` pieces (`pps =
+ceil(n_samples_max / n_pieces_max)`) -- ceiling division only ever pushes
+the resulting `n_pieces` DOWN relative to `n_pieces_max`, never up, so the
+ACTUAL `n_coeff` `_spline_coeff_count` returns for this `pps` is guaranteed
+`<= n_coeff_max`, hence `n_params <= param_budget` exactly (checked below,
+not just argued), not merely approximately.
+
+Throws if `param_budget` cannot be met even at `CompositePulse`'s own
+minimum coefficient count (`degree+1` per sub-pulse -- `_spline_coeff_count`'s
+own floor), i.e. `param_budget < 3*k + 2*k*(degree+1)`: no `points_per_segment`,
+however large, can go lower than that floor, so reduce `k` (fewer detected
+sub-pulses) or `degree`, or raise `param_budget`, instead.
+"""
+function points_per_segment_for_budget(n_samples_max::Integer, k::Integer; degree::Integer=3, param_budget::Integer=60)
+    k >= 1 || error("k must be a positive integer, got $k.")
+    n_samples_max >= 1 || error("n_samples_max must be a positive integer, got $n_samples_max.")
+
+    n_coeff_floor = degree + 1
+    min_budget = 3 * k + 2 * k * n_coeff_floor
+    param_budget >= min_budget || error(
+        "param_budget=$param_budget cannot be met for k=$k sub-pulses at degree=$degree: " *
+        "even the minimum coefficient count per sub-pulse ($n_coeff_floor) already needs " *
+        "$min_budget total parameters (3*k + 2*k*(degree+1)). Reduce k/degree, or raise param_budget."
+    )
+
+    n_coeff_max = (param_budget - 3 * k) ÷ (2 * k)
+    n_pieces_max = n_coeff_max - degree
+    pps = cld(n_samples_max, n_pieces_max)
+
+    n_coeff_actual = _spline_coeff_count(n_samples_max; points_per_segment=pps, degree=degree)
+    n_params_actual = 3 * k + 2 * k * n_coeff_actual
+    n_params_actual <= param_budget || error(
+        "internal inconsistency: computed points_per_segment=$pps still gives " *
+        "n_params=$n_params_actual > param_budget=$param_budget (n_coeff=$n_coeff_actual)."
+    )
+
+    return pps
+end
+
+"""
+    points_per_segment_for_budget(t, I, Q; degree=3, param_budget=60,
+        rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3) -> (pps::Int, segments)
+
+Convenience wrapper over the `(n_samples_max, k)` method above: runs the
+SAME segment detection ([`_detect_subpulse_segments`](@ref)) that
+[`fit_composite_pulse_from_samples`](@ref)/
+[`fit_composite_pulse_from_samples_linear`](@ref) use internally, then sizes
+`points_per_segment` against the resulting `k` and longest-segment sample
+count. Returns `(pps, segments)` so a caller can pass `pps` straight into
+either fitter's own `points_per_segment` keyword -- or just pass
+`param_budget` directly to those fitters, which do exactly this internally
+(see their own docstrings).
+"""
+function points_per_segment_for_budget(
+    t::AbstractVector, I::AbstractVector, Q::AbstractVector;
+    degree::Integer=3, param_budget::Integer=60,
+    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
+)
+    A = sqrt.(I .^ 2 .+ Q .^ 2)
+    segments = _detect_subpulse_segments(
+        t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+    )
+    isempty(segments) && error(
+        "No active sub-pulses detected (rel_thresh=$rel_thresh too high relative to the " *
+        "trace's own peak, or the trace really is all silence)."
+    )
+    k = length(segments)
+    n_samples_max = maximum(i_end - i_start + 1 for (i_start, i_end) in segments)
+    pps = points_per_segment_for_budget(n_samples_max, k; degree=degree, param_budget=param_budget)
+    return pps, segments
+end
+
+"""
     fit_composite_pulse_af(pulse::CompositePulse, t_samples, A_target, f_target;
                             weight=A_target.^2, num_epochs=1000, learning_rate=0.002,
                             seed=42, u_init=nothing) -> (u_fit, fit_report)
@@ -869,12 +954,22 @@ the optimiser at the seed with no way to move at all -- see
 
 Returns `(pulse, u_fit, fit_report, segments)` -- `segments` is the raw
 `(i_start, i_end)` sample-index list from step 1, for inspection/plotting.
+
+Pass `param_budget` (e.g. `60`) instead of hand-picking `points_per_segment`
+to instead cap the resulting `n_params = 3*k + 2*k*n_coeff` directly -- see
+[`points_per_segment_for_budget`](@ref), which this calls internally (after
+step 1 determines `k`) to override `points_per_segment` when `param_budget`
+is given. Useful because `ForwardDiff.gradient`+Adam (this function's own
+descent) becomes impractically slow well before `n_coeff` reaches the tens,
+per this docstring's own opening paragraph -- capping `n_params` up front is
+the practical way to keep this route usable on a densely-sampled real trace.
 """
 function fit_composite_pulse_from_samples(
     t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
     points_per_segment::Integer=22, degree::Integer=3, taper_frac::Real=0.1,
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
     cf_clip_mult::Real=20.0, num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
+    param_budget::Union{Nothing,Integer}=nothing,
 )
     A = sqrt.(I .^ 2 .+ Q .^ 2)
     phi, f = _instantaneous_frequency(t, I, Q)
@@ -889,6 +984,10 @@ function fit_composite_pulse_from_samples(
     k = length(segments)
 
     n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
+    if param_budget !== nothing
+        points_per_segment = points_per_segment_for_budget(maximum(n_samples_each), k; degree=degree, param_budget=param_budget)
+        println("fit_composite_pulse_from_samples: param_budget=$param_budget -> points_per_segment=$points_per_segment (k=$k)")
+    end
     n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
 
     pulse = CompositePulse(k, n_coeff, n_coeff, d; degree=degree, taper_frac=taper_frac)
@@ -1030,50 +1129,63 @@ coefficient that makes the very first physics ODE solve stiff or prone to
 failure -- clipped to `± cf_clip_mult * pulse.freq_scale`.
 
 Returns `(pulse, u_fit, fit_report, segments)` -- `fit_report =
-(rel_l2_A, rel_l2_f, phi_rms_rad, n_cA_floored, n_cf_clipped)`: `rel_l2_A`
-is the same scale-free `[0,1]`-ish residual `fit_composite_pulse`/`_af`
-report (`0` = perfect); `rel_l2_f` is now a DIAGNOSTIC-ONLY pointwise
-frequency-curve residual (`Basis*cf_seg` vs `f_seg`, evaluated at the
-`cf_seg` the PHASE fit produced) -- kept for comparison, no longer what
-`cf` is actually fit against; `phi_rms_rad` is the `A²`-weighted RMS phase
-residual in RADIANS (`Φ(t)` vs `phi`, the quantity `cf`'s solve DOES
-target) -- unlike `rel_l2_A`/`rel_l2_f` this has no natural `[0,1]` scale
-(it's an absolute angle), so judge it against how many radians of phase
-error would actually matter for your own physics (a fraction of a radian
-is generally fine; an O(1) value at high amplitude is not). `n_cA_floored`/
+(rel_l2_A, rel_l2_f, phi_rms_rad, rel_l2_complex, n_cA_floored,
+n_cf_clipped)`: `rel_l2_A` is the same scale-free `[0,1]`-ish residual
+`fit_composite_pulse`/`_af` report (`0` = perfect); `rel_l2_f` is now a
+DIAGNOSTIC-ONLY pointwise frequency-curve residual (`Basis*cf_seg` vs
+`f_seg`, evaluated at the `cf_seg` the PHASE fit produced) -- kept for
+comparison, no longer what `cf` is actually fit against; `phi_rms_rad` is
+the `A²`-weighted RMS phase residual in RADIANS (`Φ(t)` vs `phi`, the
+quantity `cf`'s solve DOES target) -- unlike `rel_l2_A`/`rel_l2_f` this
+has no natural `[0,1]` scale (it's an absolute angle), so judge it against
+how many radians of phase error would actually matter for your own physics
+(a fraction of a radian is generally fine; an O(1) value at high amplitude
+is not). `rel_l2_complex` is the full-trace COMPLEX reconstruction error
+(`build_E_of_t(pulse,u_fit)` resampled at `t`, compared against
+`complex.(I,Q)` directly, `0`=perfect) -- unlike the other three, which
+each check one decoupled piece, this is what a caller of the fitted pulse
+actually experiences; see the "RESOLVED" note below for why this can (and
+used to) disagree sharply with `phi_rms_rad` alone. `n_cA_floored`/
 `n_cf_clipped` are the total counts of amplitude/frequency coefficients
 (across all sub-pulses) that hit the non-negativity floor / clip bound
 above.
 
-KNOWN LIMITATION -- a near-perfect `phi_rms_rad` does NOT by itself
-guarantee a near-perfect reconstructed COMPLEX pulse: each sub-pulse's
-phase fit here includes a free additive constant (`phase_const` in the
-loop below) that absorbs `phi`'s own arbitrary reference point, and that
-constant is DISCARDED after the solve -- only `cf` (the SHAPE of `Φ(t)`)
-is kept. `build_E_of_t` (composite_pulse.jl) has no parameter to receive
-it back: it hardcodes sub-pulse 1's own phase to start at exactly `0`
-(`phase_offset[1] = 0`) and accumulates every later sub-pulse's own
-`phase_offset[i]` purely from the FITTED sub-pulses' own internal `∫f`,
+RESOLVED (previously a known limitation of this function) -- a
+near-perfect `phi_rms_rad` does NOT by itself guarantee a near-perfect
+reconstructed COMPLEX pulse: each sub-pulse's phase fit here includes a
+free additive constant (`phase_const` in the loop below) that absorbs
+`phi`'s own arbitrary reference point. An earlier version of this function
+discarded that constant after the solve, and `CompositePulse` itself had
+no parameter to receive it back -- `build_E_of_t` hardcoded sub-pulse 1's
+own phase to start at exactly `0` and accumulated every later sub-pulse's
+own `phase_offset[i]` purely from the FITTED sub-pulses' internal `∫f`,
 never from anything about the target's own true absolute phase reference.
-If the real recorded trace's own phase at a sub-pulse's start is NOT
-(numerically) `0` -- routine for anything with a real carrier/LO
-convention -- the reconstructed complex pulse will disagree with the
-original by a corresponding constant rotation, `2*sin(θ/2)` in relative
-`L2` terms for an offset of `θ` radians, even though `phi_rms_rad` (which
-only measures each segment's own SHAPE, up to that discarded constant)
-reports an excellent fit. Measured directly on this package's own 3-ARP
-reference: sub-pulse 1's own raw phase at its detected start was `0.4466`
-rad, predicting a `2*sin(0.4466/2) = 0.443` relative full-trace error --
-matching the smoke-test-measured `rel_l2 = 0.434` almost exactly, despite
-`phi_rms_rad ~ 1e-13`. Fixing this would mean giving `CompositePulse` an
-actual absolute-phase-offset parameter (currently it has none) -- left as
-a known, documented gap rather than done here.
+Measured directly on this package's own 3-ARP reference before the fix:
+sub-pulse 1's own raw phase at its detected start was `0.4466` rad,
+predicting a `2*sin(0.4466/2) = 0.443` relative full-trace error --
+matching the then-measured `rel_l2_complex = 0.434` almost exactly, despite
+`phi_rms_rad ~ 1e-13`. `CompositePulse` now has an explicit per-sub-pulse
+`raw_phi0` (see [`decode`](@ref)/[`build_E_of_t`](@ref)), and `phase_const`
+is recovered into it EXACTLY here (not re-fit, not approximated -- see
+`raw_phi0[idx] = phase_const - running_phase` in the loop below): on the
+same 3-ARP reference, `rel_l2_complex` now measures `0.0004`, matching
+`rel_l2_A` rather than sitting two orders of magnitude worse.
+
+Pass `param_budget` (e.g. `60`) instead of hand-picking `points_per_segment`
+to instead cap the resulting `n_params = 3*k + 2*k*n_coeff` directly -- see
+[`points_per_segment_for_budget`](@ref), which this calls internally (after
+step 1 determines `k`) to override `points_per_segment` when `param_budget`
+is given. Since this route is a closed-form linear solve (not iterative),
+raising `param_budget` costs only a bigger (still cheap) linear system, not
+a slower descent -- unlike [`fit_composite_pulse_from_samples`](@ref), where
+`param_budget` exists mainly to keep `ForwardDiff`/Adam tractable at all.
 """
 function fit_composite_pulse_from_samples_linear(
     t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
     points_per_segment::Integer=6, degree::Integer=3, taper_frac::Real=0.1,
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
     cA_floor_frac::Real=_GRAD_SAFE_FRAC, cf_clip_mult::Real=20.0,
+    param_budget::Union{Nothing,Integer}=nothing,
 )
     A = sqrt.(I .^ 2 .+ Q .^ 2)
     phi, f = _instantaneous_frequency(t, I, Q)
@@ -1088,6 +1200,10 @@ function fit_composite_pulse_from_samples_linear(
     k = length(segments)
 
     n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
+    if param_budget !== nothing
+        points_per_segment = points_per_segment_for_budget(maximum(n_samples_each), k; degree=degree, param_budget=param_budget)
+        println("fit_composite_pulse_from_samples_linear: param_budget=$param_budget -> points_per_segment=$points_per_segment (k=$k)")
+    end
     n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
 
     pulse = CompositePulse(k, n_coeff, n_coeff, d; degree=degree, taper_frac=taper_frac)
@@ -1206,9 +1322,25 @@ function fit_composite_pulse_from_samples_linear(
     rel_l2_f = sqrt(f_resid / (f_weight_sum + 1e-30)) / pulse.freq_scale
     phi_rms_rad = sqrt(phi_resid / (f_weight_sum + 1e-30))
 
+    # Full-trace COMPLEX reconstruction error -- the one number that
+    # actually reflects what a caller of build_E_of_t(pulse, u_fit) will
+    # see, as opposed to rel_l2_A/rel_l2_f/phi_rms_rad, each of which only
+    # checks one decoupled piece. Deliberately built from build_E_of_t
+    # itself (not from any of this loop's own per-segment intermediates,
+    # e.g. A_pred/Basis_p1/cf_seg, which are LOCAL to a single sub-pulse
+    # and don't include phi0/taper/silence) -- this is the same quantity
+    # smoke_test_fit_from_pulsemat's own diff_report.rel_l2 measures via a
+    # CSV round-trip; computing it here too means a direct caller of this
+    # function (no file I/O involved) gets it for free.
+    E_fit = build_E_of_t(pulse, u_fit)
+    E_pred = ComplexF64[E_fit(tt) for tt in t]
+    E_tar = complex.(I, Q)
+    complex_energy = sum(abs2, E_tar) + 1e-30
+    rel_l2_complex = sqrt(sum(abs2, E_pred .- E_tar) / complex_energy)
+
     fit_report = (
         rel_l2_A=rel_l2_A, rel_l2_f=rel_l2_f, phi_rms_rad=phi_rms_rad,
-        n_cA_floored=n_cA_floored, n_cf_clipped=n_cf_clipped,
+        rel_l2_complex=rel_l2_complex, n_cA_floored=n_cA_floored, n_cf_clipped=n_cf_clipped,
     )
     return pulse, u_fit, fit_report, segments
 end
