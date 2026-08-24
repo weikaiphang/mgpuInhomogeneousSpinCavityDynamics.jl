@@ -554,7 +554,7 @@ dphi/dt` from a sampled I/Q trace: central difference on the unwrapped
 including where `I=Q=0` (phase, and hence `f`, is numerically meaningless
 there) -- this function does not special-case or mask those points;
 callers (see [`fit_composite_pulse_af`](@ref)/
-[`fit_composite_pulse_from_samples_linear`](@ref)) are expected to
+[`fit_composite_pulse_from_samples`](@ref) with `fit_mode=:linear`) are expected to
 down-weight them via an amplitude-based weight instead, since the
 physically meaningful thing ("this region carries no drive") is already
 fully captured by `A~0` there, not by discarding samples.
@@ -570,7 +570,7 @@ match -- fitting `cf` against `f` alone (the OLDER approach) can leave
 `Φ`'s accumulated integral drifting even when the per-point frequency
 residual is tiny, since integration does not average away a small but
 STRUCTURED (not i.i.d.) residual the way an RMS frequency comparison
-would; see [`fit_composite_pulse_from_samples_linear`](@ref)'s own
+would; see [`_fit_composite_pulse_from_samples_linear`](@ref)'s own
 docstring for a real, measured case of exactly this (a `rel_l2_f~1e-13`
 per-point frequency fit still producing a ~43% full-complex-trace
 reconstruction error, traced to phase drift concentrated at the trace's
@@ -743,8 +743,8 @@ end
 
 Convenience wrapper over the `(n_samples_max, k)` method above: runs the
 SAME segment detection ([`_detect_subpulse_segments`](@ref)) that
-[`fit_composite_pulse_from_samples`](@ref)/
-[`fit_composite_pulse_from_samples_linear`](@ref) use internally, then sizes
+[`fit_composite_pulse_from_samples`](@ref)'s `fit_mode=:learned`/`:linear`
+implementations use internally, then sizes
 `points_per_segment` against the resulting `k` and longest-segment sample
 count. Returns `(pps, segments)` so a caller can pass `pps` straight into
 either fitter's own `points_per_segment` keyword -- or just pass
@@ -773,8 +773,9 @@ end
 """
     _resolve_points_per_segment(points_per_segment, param_budget, n_samples_each, k, degree, caller_name) -> Int
 
-Shared `param_budget` OVERRIDE step behind [`fit_composite_pulse_from_samples`](@ref)
-and [`fit_composite_pulse_from_samples_linear`](@ref): when `param_budget`
+Shared `param_budget` OVERRIDE step behind [`fit_composite_pulse_from_samples`](@ref)'s
+two `fit_mode` implementations ([`_fit_composite_pulse_from_samples_learned`](@ref)
+and [`_fit_composite_pulse_from_samples_linear`](@ref)): when `param_budget`
 is given, replaces the caller's own `points_per_segment` with
 [`points_per_segment_for_budget`](@ref)'s own sizing (against the ALREADY-
 DETECTED `k`/`n_samples_each`, never a caller guess), printing what it
@@ -883,8 +884,8 @@ end
 # `sigmoid(raw) ≈ y` (verified: `y=1e-6` -> `sigmoid(raw)≈1e-6`, `y=1e-30`
 # -> `sigmoid(raw)≈1e-30`). Encoding a fitted quantity at a tiny fraction
 # of its own scale -- this file previously did so via `max(peak_amp,
-# 1e-30)` for `cA` in `fit_composite_pulse_from_samples`'s seed, and
-# `cA_floor_frac=1e-6` in `fit_composite_pulse_from_samples_linear` --
+# 1e-30)` for `cA` in `fit_composite_pulse_from_samples`'s (`fit_mode=:learned`)
+# seed, and `cA_floor_frac=1e-6` in its `fit_mode=:linear` implementation --
 # therefore lands that raw parameter at a point where `decode`'s own
 # gradient is attenuated by that same tiny factor from the very first
 # optimisation epoch onward: `run_local_adam`'s Adam step can move such a
@@ -919,7 +920,7 @@ RAW space (no softplus, see [`decode`](@ref)), so it carries no vanishing-
 gradient tail -- but a weighted least-squares (or MSE) fit against a noisy
 instantaneous-frequency estimate can still occasionally return an outlier
 coefficient far beyond any physically sensible chirp rate (the `A²`
-weighting in [`fit_composite_pulse_af`](@ref)/[`fit_composite_pulse_from_samples_linear`](@ref)
+weighting in [`fit_composite_pulse_af`](@ref)/[`_fit_composite_pulse_from_samples_linear`](@ref)
 suppresses, but does not eliminate, noise from low-but-above-threshold-
 amplitude samples). An extreme `cf` makes the very first physics-cost ODE
 solve unnecessarily stiff or prone to outright failure -- and a failed
@@ -935,13 +936,15 @@ sub-pulses.
 _clip_cf_raw(cf_raw, cf_clip_mult::Real) = clamp.(cf_raw, -cf_clip_mult, cf_clip_mult)
 
 """
-    fit_composite_pulse_from_samples(t, I, Q, d;
+    _fit_composite_pulse_from_samples_learned(t, I, Q, d;
         points_per_segment=22, degree=3, taper_frac=0.1,
         rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
         cf_clip_mult=20.0, num_epochs=1000, learning_rate=0.002, seed=42)
         -> (pulse::CompositePulse, u_fit, fit_report, segments)
 
-Builds a [`CompositePulse`](@ref) seed DIRECTLY from a sampled I/Q trace,
+Private `fit_mode=:learned` implementation behind
+[`fit_composite_pulse_from_samples`](@ref) -- see that function for the
+public entry point. Builds a [`CompositePulse`](@ref) seed DIRECTLY from a sampled I/Q trace,
 with NO prior knowledge of how many sub-pulses it contains or where they
 are:
 
@@ -994,7 +997,7 @@ descent) becomes impractically slow well before `n_coeff` reaches the tens,
 per this docstring's own opening paragraph -- capping `n_params` up front is
 the practical way to keep this route usable on a densely-sampled real trace.
 """
-function fit_composite_pulse_from_samples(
+function _fit_composite_pulse_from_samples_learned(
     t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
     points_per_segment::Integer=22, degree::Integer=3, taper_frac::Real=0.1,
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
@@ -1015,7 +1018,7 @@ function fit_composite_pulse_from_samples(
 
     n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
     points_per_segment = _resolve_points_per_segment(
-        points_per_segment, param_budget, n_samples_each, k, degree, "fit_composite_pulse_from_samples",
+        points_per_segment, param_budget, n_samples_each, k, degree, "fit_composite_pulse_from_samples (fit_mode=:learned)",
     )
     n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
 
@@ -1064,14 +1067,17 @@ function fit_composite_pulse_from_samples(
 end
 
 """
-    fit_composite_pulse_from_samples_linear(t, I, Q, d;
+    _fit_composite_pulse_from_samples_linear(t, I, Q, d;
         points_per_segment=6, degree=3, taper_frac=0.1,
         rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
         cA_floor_frac=_GRAD_SAFE_FRAC, cf_clip_mult=20.0,
         param_budget=nothing, segments=nothing)
         -> (pulse::CompositePulse, u_fit, fit_report, segments)
 
-Closed-form alternative to [`fit_composite_pulse_from_samples`](@ref):
+Private `fit_mode=:linear` implementation behind
+[`fit_composite_pulse_from_samples`](@ref) -- see that function for the
+public entry point. Closed-form alternative to
+[`_fit_composite_pulse_from_samples_learned`](@ref) (`fit_mode=:learned`):
 same segment detection / `n_coeff` sizing (steps 1-3 of that function's own
 docstring), but NO `ForwardDiff`/Adam descent at all. This matters at the
 resolution the 20-25-points-per-segment rule implies for a real, densely
@@ -1124,8 +1130,8 @@ parameter:
     [`fit_composite_pulse_af`](@ref)'s `weight` default: phase/frequency
     are numerically meaningless wherever the target amplitude is near 0).
 
-`points_per_segment` defaults to `6` (not `fit_composite_pulse_from_samples`'s
-20-25 spec) -- verified on this package's own 3-ARP reference pulse to
+`points_per_segment` defaults to `6` (not the `fit_mode=:learned`
+implementation's 20-25 spec) -- verified on this package's own 3-ARP reference pulse to
 still improve `rel_l2_A` noticeably over the 20-25 range (0.0013 at 22
 points/segment down to 0.00055 at 6), with sharply diminishing returns
 below that (a further halving to 4 points/segment only reached 0.00046)
@@ -1152,7 +1158,7 @@ handful of coefficients, out of hundreds) right around `points_per_segment
 = 6`, so `fit_report.n_cA_floored` is worth checking at this default --
 a persistently nonzero count is a sign a true NNLS solve would do better
 than this clamp. `cf_clip_mult` guards the frequency side the same way
-[`_clip_cf_raw`](@ref) does for [`fit_composite_pulse_from_samples`](@ref):
+[`_clip_cf_raw`](@ref) does for [`_fit_composite_pulse_from_samples_learned`](@ref):
 the weighted per-segment linear solve for `cf` has no such floor issue
 (unconstrained, no softplus) but can still return a noise-driven outlier
 coefficient that makes the very first physics ODE solve stiff or prone to
@@ -1207,7 +1213,7 @@ to instead cap the resulting `n_params = 3*k + 2*k*n_coeff` directly -- see
 step 1 determines `k`) to override `points_per_segment` when `param_budget`
 is given. Since this route is a closed-form linear solve (not iterative),
 raising `param_budget` costs only a bigger (still cheap) linear system, not
-a slower descent -- unlike [`fit_composite_pulse_from_samples`](@ref), where
+a slower descent -- unlike [`_fit_composite_pulse_from_samples_learned`](@ref), where
 `param_budget` exists mainly to keep `ForwardDiff`/Adam tractable at all.
 
 Pass `segments` (the same `Vector{Tuple{Int,Int}}` [`_detect_subpulse_segments`](@ref)
@@ -1219,7 +1225,7 @@ second identical `O(N)` amplitude-threshold scan. `rel_thresh`/
 `min_active_samples`/`min_silence_samples` are ignored when `segments` is
 given (nothing left for them to control).
 """
-function fit_composite_pulse_from_samples_linear(
+function _fit_composite_pulse_from_samples_linear(
     t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
     points_per_segment::Integer=6, degree::Integer=3, taper_frac::Real=0.1,
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
@@ -1241,7 +1247,7 @@ function fit_composite_pulse_from_samples_linear(
 
     n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
     points_per_segment = _resolve_points_per_segment(
-        points_per_segment, param_budget, n_samples_each, k, degree, "fit_composite_pulse_from_samples_linear",
+        points_per_segment, param_budget, n_samples_each, k, degree, "fit_composite_pulse_from_samples (fit_mode=:linear)",
     )
     n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
 
@@ -1382,6 +1388,74 @@ function fit_composite_pulse_from_samples_linear(
         rel_l2_complex=rel_l2_complex, n_cA_floored=n_cA_floored, n_cf_clipped=n_cf_clipped,
     )
     return pulse, u_fit, fit_report, segments
+end
+
+"""
+    fit_composite_pulse_from_samples(t, I, Q, d;
+        fit_mode=:linear, points_per_segment=nothing, degree=3, taper_frac=0.1,
+        rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
+        cf_clip_mult=20.0, param_budget=nothing, kwargs...)
+        -> (pulse::CompositePulse, u_fit, fit_report, segments)
+
+Builds a [`CompositePulse`](@ref) seed DIRECTLY from a sampled I/Q trace,
+with NO prior knowledge of how many sub-pulses it contains or where they
+are (segment detection via [`_detect_subpulse_segments`](@ref) -- `k` is
+however many segments that finds, not a caller-supplied count). Dispatches
+to one of two implementations, selected by `fit_mode`:
+
+  - `fit_mode=:linear` (default): [`_fit_composite_pulse_from_samples_linear`](@ref)
+    -- a closed-form, per-segment weighted least-squares solve (`cA` from the
+    tapered amplitude trace, `cf` from the accumulated phase). No iterative
+    descent, so it stays cheap even at hundreds of coefficients; this is the
+    route this package's own optimisation pipeline
+    ([`optimise_control_pulse_from_jld2`](@ref)) uses exclusively. Accepts
+    `cA_floor_frac`/`segments` via `kwargs...`.
+  - `fit_mode=:learned`: [`_fit_composite_pulse_from_samples_learned`](@ref)
+    -- `ForwardDiff.gradient`+Adam descent (via [`fit_composite_pulse_af`](@ref)).
+    Verified impractically slow once `n_coeff` reaches the tens (see that
+    function's own docstring) -- kept for small/low-resolution fits or
+    comparison against the closed-form route, not for a densely sampled real
+    trace. Accepts `num_epochs`/`learning_rate`/`seed` via `kwargs...`.
+
+`points_per_segment=nothing` resolves to each mode's own prior default (`6`
+for `:linear`, `22` for `:learned`) -- pass an explicit value to override
+either. `degree`/`taper_frac`/`rel_thresh`/`min_active_samples`/
+`min_silence_samples`/`cf_clip_mult`/`param_budget` are shared by both modes
+and forwarded as-is; see either implementation's own docstring for the full
+mathematical detail and rationale (segment detection, spline construction,
+gradient-safety floors/clips, `param_budget` sizing) -- none of that changed
+by this dispatcher, which only selects which implementation runs.
+
+Returns `(pulse, u_fit, fit_report, segments)` in both modes, though
+`fit_report`'s own field set DIFFERS between them (see each implementation's
+docstring) since the two fits report genuinely different diagnostics.
+"""
+function fit_composite_pulse_from_samples(
+    t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
+    fit_mode::Symbol=:linear,
+    points_per_segment::Union{Nothing,Integer}=nothing,
+    degree::Integer=3, taper_frac::Real=0.1,
+    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
+    cf_clip_mult::Real=20.0,
+    param_budget::Union{Nothing,Integer}=nothing,
+    kwargs...,
+)
+    pps = points_per_segment === nothing ? (fit_mode === :linear ? 6 : 22) : points_per_segment
+    if fit_mode === :linear
+        return _fit_composite_pulse_from_samples_linear(
+            t, I, Q, d; points_per_segment=pps, degree=degree, taper_frac=taper_frac,
+            rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+            cf_clip_mult=cf_clip_mult, param_budget=param_budget, kwargs...,
+        )
+    elseif fit_mode === :learned
+        return _fit_composite_pulse_from_samples_learned(
+            t, I, Q, d; points_per_segment=pps, degree=degree, taper_frac=taper_frac,
+            rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+            cf_clip_mult=cf_clip_mult, param_budget=param_budget, kwargs...,
+        )
+    else
+        error("fit_mode must be :linear or :learned, got $(repr(fit_mode)).")
+    end
 end
 
 # ============================================================
