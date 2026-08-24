@@ -120,7 +120,7 @@ export multi_seed_optimise_pulse_rjmcmc
 
 # JLD2-driven signal/control pulse optimisation exports
 export load_jld2_run, split_signal_control, build_signal_E_of_t
-export run_sim_1st_order_trajectory, reconcile_against_jld2
+export run_sim_1st_order_trajectory, run_sim_1st_order_final, reconcile_against_jld2
 export optrunlog_paths, save_optimisation_run_log, save_optimised_pulse_parameters
 export optimise_control_pulse_from_jld2
 export optimise_control_pulse_from_jld2_over_k

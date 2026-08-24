@@ -223,6 +223,103 @@ function fit_composite_pulse_seed_auto_linear(control_cfg, d; N_samples::Integer
 end
 
 """
+    fit_composite_pulse_seed_linear_exact(control_cfg, d, k, n_coeff_A, n_coeff_f;
+        N_samples=5001, degree=3, taper_frac=0.1,
+        rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3, kwargs...)
+        -> (pulse::CompositePulse, u_fit, fit_report, segments)
+
+Like [`fit_composite_pulse_seed_auto_linear`](@ref) (closed-form linear
+least-squares, NEVER `ForwardDiff`/Adam -- see that function's own
+docstring for why), but for the EXACT `(k, n_coeff_A, n_coeff_f)` shape the
+caller already needs (e.g. because [`optimise_control_pulse_from_jld2`](@ref)
+is about to hand `u_fit` straight to `optimise_composite_pulse(k,
+n_coeff_A, n_coeff_f, d; warm_start_u=u_fit, ...)`, which requires an EXACT
+length match), rather than whatever `k`/`n_coeff` the trace's own segment
+detection happens to size things at.
+
+Requires `n_coeff_A == n_coeff_f` (`fit_composite_pulse_from_samples_linear`
+has no separate amplitude/frequency coefficient count -- one shared
+`n_coeff` sizes both). Samples `control_cfg` at `N_samples` points (same as
+[`fit_composite_pulse_seed_auto_linear`](@ref)), detects sub-pulse segments
+([`_detect_subpulse_segments`](@ref), `rel_thresh`/`min_active_samples`/
+`min_silence_samples` forwarded to it), and requires the detected count to
+equal `k` exactly -- errors clearly (not silently) if the trace's own
+structure doesn't match the requested `k`, since there is no way to force a
+DIFFERENT `k` onto segments that were never fit to being merged/split.
+Given that, `points_per_segment` is back-solved (inverting
+[`_spline_coeff_count`](@ref)'s own `n_pieces = ceil(n_samples/pps)`,
+`n_coeff = n_pieces + degree`) to the LARGEST value that still gives EXACTLY
+`n_coeff_A` from the longest detected segment's own sample count -- not
+`param_budget`-style "at most", since an exact `CompositePulse(k,
+n_coeff_A, n_coeff_f, d)` match is required here, not just a budget.
+`kwargs` are forwarded to [`fit_composite_pulse_from_samples_linear`](@ref)
+(`cA_floor_frac`, `cf_clip_mult`).
+
+`N_samples` must be dense enough, relative to `control_cfg`'s own fastest
+chirp/bandwidth, to avoid ALIASING the phase unwrap
+([`_instantaneous_frequency`](@ref)) that `cf`'s own linear solve fits
+against -- a WURST segment's instantaneous frequency can approach its own
+`bandwidth/2`, and Nyquist then requires `N_samples/T_max` comfortably above
+that. Undersampling does NOT show up as an error -- it silently produces a
+seemingly normal but badly WRONG fit (near-perfect `rel_l2_A`, since
+amplitude is untouched, but `rel_l2_f`/`phi_rms_rad` far from `0`, `rel_l2_complex`
+even above `1` in bad cases) -- if a fit like that comes back unexpectedly
+bad, raise `N_samples` (e.g. to the source run's own `SIM_SETTING.Nt_save`,
+which is guaranteed dense enough to have reproduced this exact pulse in the
+first place) before suspecting the fit itself.
+"""
+function fit_composite_pulse_seed_linear_exact(
+    control_cfg, d, k::Integer, n_coeff_A::Integer, n_coeff_f::Integer;
+    N_samples::Integer=20001, degree::Integer=3, taper_frac::Real=0.1,
+    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
+    kwargs...,
+)
+    n_coeff_A == n_coeff_f || error(
+        "fit_composite_pulse_seed_linear_exact requires n_coeff_A == n_coeff_f " *
+        "(got n_coeff_A=$n_coeff_A, n_coeff_f=$n_coeff_f) -- " *
+        "fit_composite_pulse_from_samples_linear sizes one shared n_coeff for both."
+    )
+
+    E_target = build_E_of_t(control_cfg)
+    T_max = d.timespan[2] - d.timespan[1]
+    Ex, Ep = sample_E_of_t(E_target, T_max, N_samples)
+    t = collect(range(0.0, T_max; length=N_samples))
+
+    A = sqrt.(Ex .^ 2 .+ Ep .^ 2)
+    segments = _detect_subpulse_segments(
+        t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+    )
+    length(segments) == k || error(
+        "Detected $(length(segments)) sub-pulse(s) in this trace (rel_thresh=$rel_thresh, " *
+        "min_active_samples=$min_active_samples, min_silence_samples=$min_silence_samples), " *
+        "but k=$k was requested -- pass a k matching the trace's own structure, or adjust the " *
+        "segment-detection kwargs so it does."
+    )
+
+    n_pieces_target = n_coeff_A - degree
+    n_pieces_target >= 1 || error(
+        "n_coeff_A=$n_coeff_A is too small for degree=$degree (need n_coeff_A >= degree+1 = " *
+        "$(degree+1))."
+    )
+    n_samples_max = maximum(i_end - i_start + 1 for (i_start, i_end) in segments)
+    points_per_segment = cld(n_samples_max, n_pieces_target)
+
+    pulse, u_fit, fit_report, segments = fit_composite_pulse_from_samples_linear(
+        t, Ex, Ep, d; points_per_segment=points_per_segment, degree=degree, taper_frac=taper_frac,
+        rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+        kwargs...,
+    )
+    (pulse.k == k && pulse.n_coeff_A == n_coeff_A && pulse.n_coeff_f == n_coeff_f) || error(
+        "internal inconsistency: fit_composite_pulse_seed_linear_exact computed " *
+        "points_per_segment=$points_per_segment expecting (k=$k, n_coeff_A=$n_coeff_A, " *
+        "n_coeff_f=$n_coeff_f), but the fit actually produced (k=$(pulse.k), " *
+        "n_coeff_A=$(pulse.n_coeff_A), n_coeff_f=$(pulse.n_coeff_f))."
+    )
+
+    return pulse, u_fit, fit_report, segments
+end
+
+"""
     smoke_test_fit_from_pulsemat(pulsemat_path;
         linear=true, out_dir=nothing, points_per_segment=nothing, param_budget=nothing,
         degree=3, taper_frac=0.1, rel_thresh=1e-3, min_active_samples=5,
@@ -439,40 +536,18 @@ function _compare_against_saved_trajectory(a_check, Sp_check, Sz_check, data; at
 end
 
 """
-    _inversion_report(t, Sz, N_total) -> (peak_inv, peak_time, final_inv)
+    _final_inversion(Sigma_z, N_total) -> Float64
 
-Collective inversion fraction `(Re[Sz] + N_total/2) / N_total` over a saved
-trajectory -- `0` for the fully-ground ensemble, `1` for fully inverted,
-matching `Sz`'s own `[-N_total/2, N_total/2]` physical range (`Sz = Σ_j
-Sz_j`, each bin's own `Sz_j` ranging over `[-Nj/2, Nj/2]`). Returns the PEAK
-value and the TIME it occurs at (`t[argmax]`), plus the value at the FINAL
-saved time -- the three summary numbers
-[`optimise_control_pulse_from_jld2`](@ref)'s own seed-quality gate compares
-between a freshly-simulated seed fit and a `.jld2` run's recorded
-trajectory (see [`_compare_inversion_reports`](@ref)).
+Collective inversion fraction `(Re[Sigma_z] + N_total/2) / N_total` at a
+SINGLE (final) state -- `0` for the fully-ground ensemble, `1` for fully
+inverted, matching `Sigma_z = Σ_j Sz_j`'s own `[-N_total/2, N_total/2]`
+physical range (each bin's own `Sz_j` ranges over `[-Nj/2, Nj/2]`).
+Deliberately final-state-only, not a trajectory summary -- see
+[`run_sim_1st_order_final`](@ref)/[`reconcile_against_jld2`](@ref)'s own
+docstrings for why this package's `.jld2` reconciliation checks avoid a
+full-trajectory CPU solve wherever the endpoint alone answers the question.
 """
-function _inversion_report(t::AbstractVector, Sz::AbstractVector, N_total::Real)
-    inv = (real.(Sz) .+ N_total / 2) ./ N_total
-    peak_inv, idx = findmax(inv)
-    return (peak_inv=peak_inv, peak_time=t[idx], final_inv=inv[end])
-end
-
-"""
-    _compare_inversion_reports(check, ref; atol=0.0) -> (rel_peak_inv, rel_peak_time, rel_final_inv)
-
-Relative differences between two [`_inversion_report`](@ref) NamedTuples
-(`check` -- e.g. a freshly-simulated `CompositePulse` seed fit -- against
-`ref` -- e.g. a `.jld2` run's own recorded trajectory), each scaled by
-`ref`'s own magnitude (`+ atol`, an absolute floor guarding against
-division by a near-zero reference value -- e.g. `ref.peak_time` if the
-recorded pulse's peak inversion happens to land very close to `t=0`).
-"""
-function _compare_inversion_reports(check::NamedTuple, ref::NamedTuple; atol::Real=0.0)
-    rel_peak_inv = abs(check.peak_inv - ref.peak_inv) / (abs(ref.peak_inv) + atol)
-    rel_peak_time = abs(check.peak_time - ref.peak_time) / (abs(ref.peak_time) + atol)
-    rel_final_inv = abs(check.final_inv - ref.final_inv) / (abs(ref.final_inv) + atol)
-    return (rel_peak_inv=rel_peak_inv, rel_peak_time=rel_peak_time, rel_final_inv=rel_final_inv)
-end
+_final_inversion(Sigma_z, N_total::Real) = (real(Sigma_z) + N_total / 2) / N_total
 
 """
     run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:ground, alg=Tsit5(), reltol=1e-8, abstol=1e-8, tstops=Float64[]) -> (t, a, Sp, Sz)
@@ -512,30 +587,77 @@ function run_sim_1st_order_trajectory(
 end
 
 """
+    run_sim_1st_order_final(E_of_t, d; initial_condition=:ground, alg=Tsit5(), reltol=1e-8, abstol=1e-8, tstops=Float64[]) -> (a, Sp, Sz)
+
+Forward-only (not `ForwardDiff`-differentiated) CPU analogue of
+`run_sim_1st_order` returning ONLY the FINAL state at `d.timespan[2]`, unlike
+[`run_sim_1st_order_trajectory`](@ref) which saves every point in
+`d.t_save` -- reuses the SAME `rhs_1st_order!`/ensemble machinery, just with
+`save_everystep=false, save_start=false` so the solver keeps only the last
+step. `Sp`/`Sz` are the per-bin, length-`M` state AT THE FINAL TIME (same
+shape [`run_sim_1st_order_pure`](@ref) returns for a `CompositePulse`, here
+for an arbitrary `E_of_t` closure instead). Cheaper than
+[`run_sim_1st_order_trajectory`](@ref) whenever only the ENDPOINT is
+needed -- e.g. [`reconcile_against_jld2`](@ref)'s own sanity check against
+a saved run's final `a_sol[end]`/`Σp_sol[end]`/`Σz_sol[end]`, which does not
+need every intermediate saved timepoint the way a peak-inversion-timing
+check does.
+"""
+function run_sim_1st_order_final(
+    E_of_t, d;
+    initial_condition::Symbol=:ground, alg=Tsit5(),
+    reltol=1e-8, abstol=1e-8, tstops=Float64[],
+)
+    M = d.M
+    u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
+    p = (d.delta0, d.kappa_e, d.kappa_i, d.delta_b, d.g_b, M, E_of_t)
+    prob = ODEProblem(rhs_1st_order!, u0, d.timespan, p)
+    sol = solve(
+        prob, alg; reltol=reltol, abstol=abstol, tstops=tstops,
+        save_everystep=false, save_start=false,
+    )
+    return unpack_state_1st_order_u(sol.u[end], M)
+end
+
+"""
     reconcile_against_jld2(path; n_signal=1, rtol=1e-3, atol=0.0, reltol=nothing, abstol=nothing, verbose=true) -> (ok, report, data, d)
 
 Loads `path`, reconstructs the run's own ORIGINAL signal+control drive
 EXACTLY as recorded in `data.PULSE_CONFIG` (signal always included here,
 regardless of what `use_signal` a subsequent optimisation run will use --
 this function's whole job is to validate against what the file actually
-recorded, which was produced WITH the signal pulse present), re-solves
-with [`run_sim_1st_order_trajectory`](@ref) (this package's own CPU
-1st-order physics -- the SAME equations `run_sim_1st_order` used to
-produce `path` in the first place, just without the GPU/callback/file-I/O
-machinery), and checks the result against `data`'s own saved
-`a_sol`/`Σp_sol`/`Σz_sol` to relative tolerance `rtol` (`atol` is an
-absolute floor added to each comparison's scale, guarding against
-division by a near-zero saved value). `reltol`/`abstol` default to
+recorded, which was produced WITH the signal pulse present), re-solves with
+[`run_sim_1st_order_final`](@ref) (this package's own CPU 1st-order physics
+-- the SAME equations `run_sim_1st_order` used to produce `path` in the
+first place, just without the GPU/callback/file-I/O machinery) for ONLY the
+FINAL state, and checks that against `data`'s own saved
+`a_sol[end]`/`Σp_sol[end]`/`Σz_sol[end]` to relative tolerance `rtol`
+(`atol` is an absolute floor added to each comparison's scale, guarding
+against division by a near-zero saved value). `reltol`/`abstol` default to
 `data.SIM_SETTING`'s own values (the tolerances the file was originally
 produced with), so the comparison is as apples-to-apples as reasonably
 possible; `tstops` is deliberately left empty here too, matching
 `run_sim_1st_order`'s own solve call (no `tstops`), so the adaptive
-stepper behaves the same way it would have during the original
-production run.
+stepper behaves the same way it would have during the original production
+run.
+
+Deliberately checks only the ENDPOINT, not the full trajectory (unlike an
+earlier version of this function, which used
+[`run_sim_1st_order_trajectory`](@ref) and compared every saved timepoint)
+-- a full-trajectory CPU solve over a large ensemble has no GPU
+acceleration and can take far longer than the original GPU-produced run
+itself for no real gain here: this check exists to catch a
+parsing/ensemble/physics MISMATCH between this port and the file's own
+provenance (wrong config, wrong RHS, wrong drive), which an endpoint
+mismatch already reveals just as reliably as a pointwise one would, at a
+fraction of the cost. [`optimise_control_pulse_from_jld2`](@ref)'s own
+seed-quality gate follows the same final-state-only philosophy (see
+[`run_sim_1st_order_final`](@ref)/[`_final_inversion`](@ref)), rather than
+comparing a fitted seed's full trajectory against the recorded one.
 
 Returns `(ok::Bool, report::NamedTuple, data, d)` -- `report` holds
-`rel_a`/`rel_p`/`rel_z` (and their absolute counterparts) for inspection
-regardless of `ok`. This is a REQUIRED gate before
+`rel_a`/`rel_p`/`rel_z` (and their absolute counterparts, all scalars now)
+for inspection regardless of `ok`. This is a REQUIRED gate before
 [`optimise_control_pulse_from_jld2`](@ref) proceeds to optimisation --
 any parsing/ensemble/physics mismatch between this port and the file's
 own provenance is caught here before it can silently corrupt an
@@ -545,7 +667,7 @@ function reconcile_against_jld2(
     path::AbstractString;
     n_signal::Integer=1,
     rtol::Real=1e-3,
-    atol::Real=0.0,
+    atol=nothing,
     reltol=nothing,
     abstol=nothing,
     verbose::Bool=true,
@@ -561,30 +683,38 @@ function reconcile_against_jld2(
 
     reltol_solve = reltol === nothing ? data.SIM_SETTING.reltol : reltol
     abstol_solve = abstol === nothing ? data.SIM_SETTING.abstol : abstol
+    # An endpoint that happens to be near-zero (e.g. the cavity field after
+    # a completed pi-pulse) makes a PURELY relative comparison hypersensitive
+    # to ordinary solver-noise-level absolute error -- defaulting atol to
+    # 100x the solve's own abstol (rather than 0) gives a comparison floor
+    # tied to what the ODE solver itself already considers "converged",
+    # instead of an arbitrary hardcoded constant that wouldn't generalise
+    # across runs with very different tolerances/state scales.
+    atol_use = atol === nothing ? 100 * abstol_solve : atol
 
-    _, a_check, Sp_check, Sz_check = run_sim_1st_order_trajectory(
+    a_check, Sp_check, Sz_check = run_sim_1st_order_final(
         E_of_t, d; reltol=reltol_solve, abstol=abstol_solve,
     )
-    Sigma_p_check = vec(sum(Sp_check, dims=2))
-    Sigma_z_check = vec(sum(Sz_check, dims=2))
+    Sigma_p_check = sum(Sp_check)
+    Sigma_z_check = sum(Sz_check)
 
-    err_a = maximum(abs.(a_check .- data.a_sol))
-    err_p = maximum(abs.(Sigma_p_check .- data.Σp_sol))
-    err_z = maximum(abs.(Sigma_z_check .- data.Σz_sol))
+    err_a = abs(a_check - data.a_sol[end])
+    err_p = abs(Sigma_p_check - data.Σp_sol[end])
+    err_z = abs(Sigma_z_check - data.Σz_sol[end])
 
-    scale_a = maximum(abs.(data.a_sol)) + atol
-    scale_p = maximum(abs.(data.Σp_sol)) + atol
-    scale_z = maximum(abs.(data.Σz_sol)) + atol
+    scale_a = abs(data.a_sol[end]) + atol_use
+    scale_p = abs(data.Σp_sol[end]) + atol_use
+    scale_z = abs(data.Σz_sol[end]) + atol_use
 
     rel_a, rel_p, rel_z = err_a / scale_a, err_p / scale_p, err_z / scale_z
     ok = rel_a < rtol && rel_p < rtol && rel_z < rtol
 
     if verbose
         status = ok ? "PASS" : "FAIL"
-        println("Reconciliation against $path: $status (rtol=$rtol)")
-        println("  a:  max_abs_err=$err_a  rel_err=$rel_a")
-        println("  Σp: max_abs_err=$err_p  rel_err=$rel_p")
-        println("  Σz: max_abs_err=$err_z  rel_err=$rel_z")
+        println("Reconciliation against $path (final state only): $status (rtol=$rtol, atol=$atol_use)")
+        println("  a:  abs_err=$err_a  rel_err=$rel_a")
+        println("  Σp: abs_err=$err_p  rel_err=$rel_p")
+        println("  Σz: abs_err=$err_z  rel_err=$rel_z")
     end
 
     report = (rel_a=rel_a, rel_p=rel_p, rel_z=rel_z, err_a=err_a, err_p=err_p, err_z=err_z)
@@ -787,9 +917,9 @@ end
 
 """
     optimise_control_pulse_from_jld2(path, k, n_coeff_A, n_coeff_f;
-        n_signal=1, use_signal=true, reconcile=true, rtol_check=1e-3, atol_check=0.0,
+        n_signal=1, use_signal=true, reconcile=true, rtol_check=1e-3, atol_check=nothing,
         check_reltol=nothing, check_abstol=nothing,
-        fit_seed_from_file=true, fit_N=4000, fit_num_epochs=1000, fit_learning_rate=0.002,
+        fit_seed_from_file=true, fit_N=nothing,
         reconcile_seed=true, inversion_rtol=0.01, inversion_atol=0.0,
         save_log=true, log_out_dir=nothing,
         pulsemat_N=nothing, optimizer_kwargs...)
@@ -810,10 +940,13 @@ End-to-end workflow tying [`load_jld2_run`](@ref),
   3. Unless `reconcile=false`, runs [`reconcile_against_jld2`](@ref) --
      reconstructs signal+ORIGINAL-control exactly as recorded and
      re-solves with this package's own CPU 1st-order physics, comparing
-     against the file's saved trajectory. Throws an error and refuses to
-     proceed if this does not match within `rtol_check`/`atol_check`:
-     optimisation MUST NOT run against physics this port hasn't first
-     verified it can reproduce.
+     against the file's saved FINAL state only (`a_sol[end]`/`Σp_sol[end]`/
+     `Σz_sol[end]` -- cheap, since it needs no full-trajectory solve; see
+     that function's own docstring for why an endpoint check already
+     catches a parsing/ensemble/physics mismatch just as reliably here).
+     Throws an error and refuses to proceed if this does not match within
+     `rtol_check`/`atol_check`: optimisation MUST NOT run against physics
+     this port hasn't first verified it can reproduce.
   4. Builds the FIXED signal drive ([`build_signal_E_of_t`](@ref)) --
      `use_signal=true` (default) uses the file's own recorded signal
      pulse exactly; `use_signal=false` (the `USE_SIGNAL` mode flag) zeroes
@@ -824,35 +957,42 @@ End-to-end workflow tying [`load_jld2_run`](@ref),
      entirely) or `fit_seed_from_file=false`: interprets `path`'s own
      recorded CONTROL pulse (step 2's `control_cfg`, e.g. an analytic
      WURST/ARP pulse -- NOT a `CompositePulse`) via
-     [`fit_composite_pulse_seed`](@ref) -- a ForwardDiff/Adam SHAPE fit
-     (`fit_N`/`fit_num_epochs`/`fit_learning_rate` forwarded to it), no ODE
-     solve involved -- into a `CompositePulse(k, n_coeff_A, n_coeff_f, d)`
-     raw parameter vector `u_fit`. Unless `reconcile_seed=false`,
-     `u_fit`'s ACTUAL physics (signal, always on here -- same as step 3 --
-     plus `build_E_of_t(pulse, u_fit)`) is then simulated
-     ([`run_sim_1st_order_trajectory`](@ref)) and its own collective
-     inversion trajectory ([`_inversion_report`](@ref): peak inversion
-     value, the TIME it peaks at, and the FINAL inversion value, all from
-     `Σz`) is compared against the file's own recorded trajectory's SAME
-     three numbers ([`_compare_inversion_reports`](@ref)). Proceeds to step
-     6 ONLY if all three relative differences are `< inversion_rtol`
-     (default `0.01`, i.e. 1%) -- deliberately not the same full-array
-     `rel_a`/`rel_p`/`rel_z` criterion step 3 uses (still computed and
-     printed here too, for context): `fit_composite_pulse_seed`'s B-spline
-     family cannot exactly reproduce an arbitrary recorded pulse shape, only
-     approximate it, so some residual full-trajectory mismatch is expected
-     and inherent (unlike step 3's near-exact reconciliation) -- what
-     actually matters for whether this seed is a reasonable OPTIMISATION
-     starting point is whether it reproduces the pulse's own physical
-     function (how much of the ensemble it inverts, and roughly when),
-     not a pointwise match to the original pulse SHAPE. Throws an error and
-     refuses to proceed if this does not match within `inversion_rtol`
-     (`inversion_atol` is an absolute floor added to each comparison's
-     scale, guarding against division by a near-zero reference value --
-     e.g. if the recorded pulse's peak inversion happens to land very close
-     to `t=0`) -- raise `fit_N`/`fit_num_epochs`, adjust `k`/`n_coeff_A`/
-     `n_coeff_f`, loosen `inversion_rtol`, or pass `reconcile_seed=false` to
-     override at your own risk. If `warm_start_u` was explicitly given, or
+     [`fit_composite_pulse_seed_linear_exact`](@ref) -- CLOSED-FORM LINEAR
+     LEAST-SQUARES ONLY (`fit_N` forwarded to it as `N_samples`, defaulting
+     to `data.SIM_SETTING.Nt_save` -- the SOURCE run's own sampling density,
+     dense enough to avoid the phase-unwrap aliasing that function's own
+     docstring warns a too-sparse `N_samples` silently causes; never
+     `ForwardDiff`/Adam, i.e. never [`fit_composite_pulse`](@ref) -- see
+     that function's own docstring for why it becomes impractically slow
+     even at modest `n_coeff`), no ODE solve involved -- into a
+     `CompositePulse(k, n_coeff_A, n_coeff_f, d)` raw parameter vector
+     `u_fit` at EXACTLY the requested `(k, n_coeff_A, n_coeff_f)` (errors if
+     the trace's own detected sub-pulse count doesn't equal `k`, or if
+     `n_coeff_A != n_coeff_f` -- see that function's own docstring).
+     Unless `reconcile_seed=false`, `u_fit`'s ACTUAL physics (signal, always
+     on here -- same as step 3 -- plus `build_E_of_t(pulse, u_fit)`) is then
+     simulated -- FINAL STATE ONLY, via [`run_sim_1st_order_final`](@ref),
+     no full-trajectory CPU solve (same reasoning as step 3) -- and its own
+     collective FINAL inversion fraction ([`_final_inversion`](@ref), from
+     `Σz` at the end of the pulse) is compared against the file's own
+     recorded final inversion. Proceeds to step 6 ONLY if that relative
+     difference is `< inversion_rtol` (default `0.01`, i.e. 1%) --
+     deliberately not the same full-array `rel_a`/`rel_p`/`rel_z` criterion
+     step 3 uses (still computed and printed here too, for context): a
+     closed-form linear fit against a different functional family (e.g.
+     WURST's `tanh` gate + `sin^n` envelope + quadratic-phase chirp) cannot
+     exactly reproduce an arbitrary recorded pulse shape, only approximate
+     it, so some residual mismatch is expected and inherent (unlike step
+     3's near-exact reconciliation) -- what actually matters for whether
+     this seed is a reasonable OPTIMISATION starting point is whether it
+     reproduces the pulse's own physical function (how much of the ensemble
+     it ends up inverting), not a pointwise match to the original pulse
+     SHAPE. Throws an error and refuses to proceed if this does not match
+     within `inversion_rtol` (`inversion_atol` is an absolute floor added
+     to the comparison's scale, guarding against division by a near-zero
+     reference value) -- raise `fit_N`, adjust `k`/`n_coeff_A`/`n_coeff_f`,
+     loosen `inversion_rtol`, or pass `reconcile_seed=false` to override at
+     your own risk. If `warm_start_u` was explicitly given, or
      `fit_seed_from_file=false`, this whole step is skipped and
      [`optimise_composite_pulse`](@ref) falls back to its own default
      (`warm_start_u` if given, else a fresh random `initial_guess`).
@@ -874,8 +1014,7 @@ End-to-end workflow tying [`load_jld2_run`](@ref),
      this function's own
      (`n_signal`, `USE_SIGNAL`, `reconcile`, `rtol_check`, `atol_check`,
      `check_reltol`, `check_abstol`, `fit_seed_from_file`, `fit_N`,
-     `fit_num_epochs`, `fit_learning_rate`, `reconcile_seed`,
-     `inversion_rtol`, `inversion_atol`) -- so a
+     `reconcile_seed`, `inversion_rtol`, `inversion_atol`) -- so a
      saved run can be replicated exactly later just by reading its own
      log.
 
@@ -886,13 +1025,13 @@ parameters, its cost, the `CompositePulse` they decode against, the fixed
 and `seed_fit_report` -- `nothing` if step 5 was skipped, else
 `(u_fit, fit_report, seed_reconcile_ok, seed_reconcile_report)` from that
 step. `seed_reconcile_report` is `nothing` if `reconcile_seed=false`,
-else `(rel_a, rel_p, rel_z, err_a, err_p, err_z, check_inversion, ref_inversion,
-rel_peak_inv, rel_peak_time, rel_final_inv)` -- the full-array diagnostics
-([`_compare_against_saved_trajectory`](@ref)) alongside the
-[`_inversion_report`](@ref) pair and their
-[`_compare_inversion_reports`](@ref) differences, i.e. the actual numbers
-`seed_ok`/step 5's gate above was decided from
-(`fit_report` as documented in [`fit_composite_pulse_seed`](@ref)).
+else `(rel_a, rel_p, rel_z, err_a, err_p, err_z, check_final_inv,
+ref_final_inv, rel_final_inv)` -- the final-state diagnostics (`a`/`Σp`/`Σz`)
+alongside [`_final_inversion`](@ref)'s fit-vs-recorded values and their
+relative difference, i.e. the actual numbers `seed_ok`/step 5's gate above
+was decided from (`fit_report` as documented in
+[`fit_composite_pulse_seed_linear_exact`](@ref)/
+[`fit_composite_pulse_from_samples_linear`](@ref)).
 """
 function optimise_control_pulse_from_jld2(
     path::AbstractString,
@@ -901,13 +1040,11 @@ function optimise_control_pulse_from_jld2(
     use_signal::Bool=true,
     reconcile::Bool=true,
     rtol_check::Real=1e-3,
-    atol_check::Real=0.0,
+    atol_check=nothing,
     check_reltol=nothing,
     check_abstol=nothing,
     fit_seed_from_file::Bool=true,
-    fit_N::Integer=4000,
-    fit_num_epochs::Integer=1000,
-    fit_learning_rate::Real=0.002,
+    fit_N::Union{Nothing,Integer}=nothing,
     reconcile_seed::Bool=true,
     inversion_rtol::Real=0.01,
     inversion_atol::Real=0.0,
@@ -941,16 +1078,30 @@ function optimise_control_pulse_from_jld2(
     if fit_seed_from_file && !(:warm_start_u in keys(optimizer_kwargs))
         degree = get(optimizer_kwargs, :degree, 3)
         taper_frac = get(optimizer_kwargs, :taper_frac, 0.1)
-        seed_pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
-        fit_seed = get(optimizer_kwargs, :seed, 42)
 
-        u_fit, fit_report = fit_composite_pulse_seed(
-            control_cfg, seed_pulse;
-            N_fit=fit_N, num_epochs=fit_num_epochs, learning_rate=fit_learning_rate, seed=fit_seed,
+        # Closed-form linear least-squares ONLY -- never ForwardDiff/Adam
+        # (fit_composite_pulse) here, which is impractically slow even at
+        # modest n_coeff (see fit_composite_pulse_from_samples's own
+        # docstring). seed_pulse is built BY this call, at the EXACT
+        # (k, n_coeff_A, n_coeff_f) requested, so u_fit's length always
+        # matches what optimise_composite_pulse below expects.
+        #
+        # fit_N defaults to the SOURCE run's own SIM_SETTING.Nt_save rather
+        # than a fixed literal: fit_composite_pulse_seed_linear_exact's own
+        # docstring flags that undersampling a fast chirp (e.g. a WURST
+        # segment's instantaneous frequency approaching bandwidth/2) aliases
+        # the phase unwrap it fits against, silently producing a badly wrong
+        # fit with no error -- Nt_save is guaranteed dense enough, since
+        # it's what reproduced this exact pulse in the first place.
+        fit_N_use = fit_N === nothing ? data.SIM_SETTING.Nt_save : fit_N
+        seed_pulse, u_fit, fit_report, _ = fit_composite_pulse_seed_linear_exact(
+            control_cfg, d, k, n_coeff_A, n_coeff_f;
+            N_samples=fit_N_use, degree=degree, taper_frac=taper_frac,
         )
         println(
-            "Fitted a k=$k CompositePulse seed from $path's own recorded control pulse: " *
-            "mse=$(round(fit_report.mse, sigdigits=4)) rel_l2=$(round(fit_report.rel_l2, sigdigits=4))"
+            "Fitted a k=$k CompositePulse seed from $path's own recorded control pulse " *
+            "(linear least-squares): rel_l2_complex=$(round(fit_report.rel_l2_complex, sigdigits=4)) " *
+            "rel_l2_A=$(round(fit_report.rel_l2_A, sigdigits=4))"
         )
 
         seed_ok = true
@@ -961,57 +1112,57 @@ function optimise_control_pulse_from_jld2(
             E_seed_check(t) = signal_E_always(t) + control_E_fit(t)
             reltol_solve = check_reltol === nothing ? data.SIM_SETTING.reltol : check_reltol
             abstol_solve = check_abstol === nothing ? data.SIM_SETTING.abstol : check_abstol
-            t_check, a_check, Sp_check, Sz_check = run_sim_1st_order_trajectory(
+
+            # FINAL STATE ONLY -- no full-trajectory CPU solve here (see
+            # run_sim_1st_order_final/reconcile_against_jld2's own
+            # docstrings for why): the seed only needs to be checked against
+            # where the ensemble ends up, not against every intermediate
+            # saved timepoint.
+            a_check, Sp_check, Sz_check = run_sim_1st_order_final(
                 E_seed_check, d; reltol=reltol_solve, abstol=abstol_solve,
             )
-            Sigma_z_check = vec(sum(Sz_check, dims=2))
+            Sigma_p_check = sum(Sp_check)
+            Sigma_z_check = sum(Sz_check)
+            atol_use = 100 * abstol_solve
 
-            # Full-array diagnostics (pointwise a/Σp/Σz match) -- printed
-            # for context, but no longer what gates whether optimisation
-            # proceeds; see the inversion-based gate below for why.
-            rel_a, rel_p, rel_z, err_a, err_p, err_z = _compare_against_saved_trajectory(
-                a_check, Sp_check, Sz_check, data; atol=inversion_atol,
-            )
+            err_a = abs(a_check - data.a_sol[end])
+            err_p = abs(Sigma_p_check - data.Σp_sol[end])
+            err_z = abs(Sigma_z_check - data.Σz_sol[end])
+            rel_a = err_a / (abs(data.a_sol[end]) + atol_use)
+            rel_p = err_p / (abs(data.Σp_sol[end]) + atol_use)
+            rel_z = err_z / (abs(data.Σz_sol[end]) + atol_use)
             println(
-                "Seed reconciliation against $path (full-trajectory, diagnostic only): " *
+                "Seed reconciliation against $path (final state, diagnostic only): " *
                 "rel_a=$(round(rel_a, sigdigits=4)) rel_p=$(round(rel_p, sigdigits=4)) rel_z=$(round(rel_z, sigdigits=4))"
             )
 
             # Inversion-based gate: does this seed reproduce the pulse's own
-            # PHYSICAL FUNCTION (how much of the ensemble it inverts, and
-            # roughly when) closely enough to be worth optimising further --
-            # not a pointwise match to the original pulse SHAPE, which a
-            # different-functional-family B-spline fit cannot be expected
-            # to achieve (see this function's own docstring).
-            check_inversion = _inversion_report(t_check, Sigma_z_check, d.N_total)
-            ref_inversion = _inversion_report(data.t_saved, data.Σz_sol, d.N_total)
-            rel_peak_inv, rel_peak_time, rel_final_inv = _compare_inversion_reports(
-                check_inversion, ref_inversion; atol=inversion_atol,
-            )
-            seed_ok = rel_peak_inv < inversion_rtol && rel_peak_time < inversion_rtol && rel_final_inv < inversion_rtol
+            # PHYSICAL FUNCTION -- how much of the ensemble it inverts by
+            # the END of the pulse -- closely enough to be worth optimising
+            # further, not a pointwise match to the original pulse SHAPE
+            # (which a different-functional-family B-spline fit cannot be
+            # expected to achieve; see this function's own docstring).
+            check_final_inv = _final_inversion(Sigma_z_check, d.N_total)
+            ref_final_inv = _final_inversion(data.Σz_sol[end], d.N_total)
+            rel_final_inv = abs(check_final_inv - ref_final_inv) / (abs(ref_final_inv) + inversion_atol)
+            seed_ok = rel_final_inv < inversion_rtol
             seed_report = (
                 rel_a=rel_a, rel_p=rel_p, rel_z=rel_z, err_a=err_a, err_p=err_p, err_z=err_z,
-                check_inversion=check_inversion, ref_inversion=ref_inversion,
-                rel_peak_inv=rel_peak_inv, rel_peak_time=rel_peak_time, rel_final_inv=rel_final_inv,
+                check_final_inv=check_final_inv, ref_final_inv=ref_final_inv, rel_final_inv=rel_final_inv,
             )
             status = seed_ok ? "PASS" : "FAIL"
             println(
                 "Seed inversion check against $path: $status (inversion_rtol=$inversion_rtol)  " *
-                "rel_peak_inv=$(round(rel_peak_inv, sigdigits=4)) " *
-                "rel_peak_time=$(round(rel_peak_time, sigdigits=4)) " *
                 "rel_final_inv=$(round(rel_final_inv, sigdigits=4))  " *
-                "(peak_inv: fit=$(round(check_inversion.peak_inv, sigdigits=6)) vs ref=$(round(ref_inversion.peak_inv, sigdigits=6)); " *
-                "peak_time: fit=$(round(check_inversion.peak_time*1e6, sigdigits=6))us vs ref=$(round(ref_inversion.peak_time*1e6, sigdigits=6))us; " *
-                "final_inv: fit=$(round(check_inversion.final_inv, sigdigits=6)) vs ref=$(round(ref_inversion.final_inv, sigdigits=6)))"
+                "(final_inv: fit=$(round(check_final_inv, sigdigits=6)) vs ref=$(round(ref_final_inv, sigdigits=6)))"
             )
             seed_ok || error(
-                "Fitted seed's own simulated inversion trajectory does not reconcile against " *
-                "$path (rel_peak_inv=$rel_peak_inv, rel_peak_time=$rel_peak_time, " *
-                "rel_final_inv=$rel_final_inv, tolerance inversion_rtol=$inversion_rtol, " *
-                "shape-fit rel_l2=$(fit_report.rel_l2)) -- refusing to optimise from a seed whose " *
-                "physics doesn't match the source file closely enough. Raise fit_N/fit_num_epochs, " *
-                "adjust k/n_coeff_A/n_coeff_f, loosen inversion_rtol, or pass reconcile_seed=false " *
-                "to override at your own risk."
+                "Fitted seed's own simulated final-state inversion does not reconcile against " *
+                "$path (rel_final_inv=$rel_final_inv, tolerance inversion_rtol=$inversion_rtol, " *
+                "shape-fit rel_l2_complex=$(fit_report.rel_l2_complex)) -- refusing to optimise " *
+                "from a seed whose physics doesn't match the source file closely enough. Raise " *
+                "fit_N, adjust k/n_coeff_A/n_coeff_f, loosen inversion_rtol, or pass " *
+                "reconcile_seed=false to override at your own risk."
             )
         end
 
@@ -1027,8 +1178,7 @@ function optimise_control_pulse_from_jld2(
         full_settings = merge(
             (reconcile=reconcile, rtol_check=rtol_check, atol_check=atol_check,
              check_reltol=check_reltol, check_abstol=check_abstol,
-             fit_seed_from_file=fit_seed_from_file, fit_N=fit_N, fit_num_epochs=fit_num_epochs,
-             fit_learning_rate=fit_learning_rate, reconcile_seed=reconcile_seed,
+             fit_seed_from_file=fit_seed_from_file, fit_N=fit_N, reconcile_seed=reconcile_seed,
              inversion_rtol=inversion_rtol, inversion_atol=inversion_atol),
             optimizer_settings,
         )
@@ -1065,7 +1215,7 @@ function optimise_control_pulse_from_jld2_over_k(
     use_signal::Bool=true,
     reconcile::Bool=true,
     rtol_check::Real=1e-3,
-    atol_check::Real=0.0,
+    atol_check=nothing,
     check_reltol=nothing,
     check_abstol=nothing,
     save_log::Bool=true,
