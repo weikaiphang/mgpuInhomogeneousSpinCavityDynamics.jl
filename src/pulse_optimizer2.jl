@@ -399,6 +399,580 @@ function adam_step!(u::AbstractVector, grad::AbstractVector, state::AdamState;
 end
 
 # ============================================================
+# SHAPE FITTING: warm-starting a CompositePulse from a FIXED target drive
+#
+# Separate from pulse_cost/run_local_adam below (which fit against this
+# package's own PHYSICS via a full ODE solve): this fits purely against a
+# target WAVEFORM, no ODE solve at all -- minimising mean squared error
+# between build_E_of_t(pulse, u) and a target t -> Complex drive at many
+# sample points, via the same ForwardDiff.gradient + hand-rolled Adam this
+# file already uses elsewhere. Orders of magnitude cheaper than a physics
+# fit (no ODE solve per epoch), which is the point: it turns an arbitrary
+# recorded pulse (e.g. a jld2 run's own analytic control pulse -- see
+# jld2_pulse_loader.jl's fit_composite_pulse_seed) into a REASONED
+# CompositePulse seed for the physics optimisation below, rather than a
+# shape-blind random/canonical guess.
+# ============================================================
+
+"""
+    fit_composite_pulse(pulse::CompositePulse, E_target; N_fit=4000, num_epochs=1000,
+                         learning_rate=0.002, seed=42, u_init=nothing) -> (u_fit, fit_report)
+
+Fits `pulse`'s raw parameters `u` so that `build_E_of_t(pulse, u)`
+approximates a target drive `E_target(t)` (any `t -> Complex` callable --
+e.g. `pulses.jl`'s `build_E_of_t(PULSE_CONFIG)` applied to an existing
+recorded pulse) over `[0, pulse.T_max]`, by minimising mean squared error
+at `N_fit` evenly spaced sample points -- sampled via `pulses.jl`'s own
+[`sample_E_of_t`](@ref)`(E_target, pulse.T_max, N_fit)`, the SAME sampling
+function every other reconstructed-curve consumer in this package uses
+(`plot_E_of_t`, `save_run_data`'s `_pulsemat.csv`), rather than a second,
+independent sampling loop. Purely a SHAPE fit -- it says nothing about the
+resulting physics (inversion/silencing); follow up with a real 1st-order
+solve (e.g. [`run_sim_1st_order_trajectory`](@ref)) to check that
+separately.
+
+`learning_rate` defaults to `0.002`, NOT `run_local_adam`/`pulse_cost`'s
+own `0.05` -- that value is tuned for `pulse_cost`'s dimensionless,
+already-normalised cost gradient, whereas `mse_only` here is raw squared
+error in `E_target`'s own physical units (order `amp_scale^2 ~ 1e14` for
+this package's typical cavity-input-flux scale), and Adam's per-parameter
+step size, while adaptive to gradient MAGNITUDE, is still set in absolute
+raw-parameter units by `lr` itself. Verified on this package's own 3-ARP
+reference pulse (k=3): `learning_rate=0.05` (and even `0.005`) overshoots
+on the very first step and never recovers within hundreds of epochs
+(`rel_l2` stays pinned near its EPOCH-1 value or worse), while `0.002`
+converges steadily to `rel_l2~0.09-0.12` over ~1000 epochs -- if fitting a
+very differently-scaled target/ensemble, re-check this the same way (watch
+`fit_report.history` for a non-monotonic first few epochs, a sign `lr` is
+too large for that target's own scale).
+
+`u_init` defaults to [`initial_guess`](@ref)`(pulse; seed=seed)` (same
+random-but-physically-sensible starting point the physics optimiser
+itself uses) rather than all-zeros, since an all-zero `raw_gap`/`raw_dur`
+still decodes to a valid (if arbitrary) placement via `decode`'s
+softplus + cumulative-sum reparameterisation, but starting from a point
+already spread out over `[0, T_max]` gives every sub-pulse's gradient a
+chance to find its own share of the target from the first epoch, rather
+than all `k` sub-pulses initially overlapping near `t=0`. This is still a
+GENERIC, timing-blind default -- verified (again on the 3-ARP reference)
+to plateau at `rel_l2~0.998` (no better than an all-zero pulse) after 200
+epochs, because its amplitude scale and sub-pulse timings have no relation
+to the target's own; [`fit_composite_pulse_seed`](@ref) in
+jld2_pulse_loader.jl passes a much better `u_init`
+([`_segment_matched_seed_init`](@ref)) whenever the target's own segment
+count matches `pulse.k`.
+
+Returns `(u_fit, fit_report)`: `u_fit` is the LOWEST-mse `u` seen across
+all epochs (not necessarily the last, same "track the best, don't just
+return wherever descent stopped" pattern [`run_local_adam`](@ref) uses).
+`fit_report = (mse, rel_l2, history)`: `rel_l2 = sqrt(mse*N_fit /
+sum(abs2, target))` is a scale-free fit-quality number (`0` = perfect,
+`~1` = no better than an all-zero pulse) that stays meaningful across
+different targets/ensembles, unlike raw `mse` (whose scale depends on
+`E_target`'s own amplitude). `history` is a `Vector{<:NamedTuple}` with
+one `(epoch, mse)` row per epoch actually run.
+"""
+function fit_composite_pulse(
+    pulse::CompositePulse, E_target;
+    N_fit::Integer=4000, num_epochs::Integer=1000,
+    learning_rate::Real=0.002, seed::Integer=42,
+    u_init::Union{AbstractVector,Nothing}=nothing,
+)
+    t_grid = range(0.0, pulse.T_max; length=N_fit)
+    Ex, Ep = sample_E_of_t(E_target, pulse.T_max, N_fit)
+    target = complex.(Ex, Ep)
+    target_energy = sum(abs2, target) + 1e-30
+
+    u = u_init === nothing ? initial_guess(pulse; seed=seed) : collect(Float64, u_init)
+    length(u) == n_params(pulse) || error(
+        "u_init has length $(length(u)), but this CompositePulse (k=$(pulse.k), " *
+        "n_coeff_A=$(pulse.n_coeff_A), n_coeff_f=$(pulse.n_coeff_f)) needs $(n_params(pulse))."
+    )
+    n = length(u)
+    adam = AdamState(n)
+    history = NamedTuple[]
+
+    function mse_only(uu)
+        E_of_t = build_E_of_t(pulse, uu)
+        s = zero(eltype(uu))
+        @inbounds for i in eachindex(t_grid)
+            s += abs2(E_of_t(t_grid[i]) - target[i])
+        end
+        return s / N_fit
+    end
+
+    best_u, best_mse = copy(u), Inf
+    for epoch in 1:num_epochs
+        grad = ForwardDiff.gradient(mse_only, u)
+        mse = Float64(mse_only(u))
+        if mse < best_mse
+            best_mse, best_u = mse, copy(u)
+        end
+        push!(history, (epoch=epoch, mse=mse))
+        adam_step!(u, grad, adam; lr=learning_rate)
+    end
+
+    rel_l2 = sqrt(best_mse * N_fit / target_energy)
+    return best_u, (mse=best_mse, rel_l2=rel_l2, history=history)
+end
+
+# ============================================================
+# AMPLITUDE/FREQUENCY-SPACE FITTING FROM A RAW SAMPLED (t, I, Q) TRACE
+#
+# A second, more general route to a CompositePulse seed than
+# fit_composite_pulse above: given ONLY a sampled I/Q waveform (no
+# PULSE_CONFIG, no known sub-pulse count), discover how many sub-pulses it
+# contains (silence-thresholding), extract its own amplitude/frequency
+# decomposition, size ONE shared n_coeff_A/n_coeff_f from how many raw
+# samples the densest detected sub-pulse actually has (~20-25 raw points
+# per cubic B-spline piece), and fit build_A_f_of_t's amplitude/frequency
+# curves against that decomposition directly -- rather than
+# fit_composite_pulse's complex-valued MSE, which entangles amplitude and
+# phase error in a way that is especially unstable exactly where the
+# target is near-silent (phase becomes numerically meaningless as
+# amplitude -> 0).
+# ============================================================
+
+"""
+    _instantaneous_frequency(t, I, Q) -> Vector{Float64}
+
+Instantaneous angular frequency `f(t_j) = dphi/dt` from a sampled I/Q
+trace: unwrapped `atan(Q, I)` phase, then a central difference (one-sided
+at the two endpoints). `f` is returned at EVERY sample, including where
+`I=Q=0` (phase, and hence `f`, is numerically meaningless there) -- this
+function does not special-case or mask those points; callers (see
+[`fit_composite_pulse_af`](@ref)) are expected to down-weight them via an
+amplitude-based weight instead, since the physically meaningful thing
+("this region carries no drive") is already fully captured by `A~0`
+there, not by discarding samples.
+"""
+function _instantaneous_frequency(t::AbstractVector, I::AbstractVector, Q::AbstractVector)
+    n = length(t)
+    n == length(I) == length(Q) || error(
+        "t/I/Q must have the same length, got $(n)/$(length(I))/$(length(Q))."
+    )
+    phi = atan.(Q, I)
+    @inbounds for j in 2:n
+        d = phi[j] - phi[j-1]
+        while d > pi
+            phi[j] -= 2 * pi
+            d = phi[j] - phi[j-1]
+        end
+        while d < -pi
+            phi[j] += 2 * pi
+            d = phi[j] - phi[j-1]
+        end
+    end
+    f = Vector{Float64}(undef, n)
+    f[1] = (phi[2] - phi[1]) / (t[2] - t[1])
+    f[n] = (phi[n] - phi[n-1]) / (t[n] - t[n-1])
+    @inbounds for j in 2:n-1
+        f[j] = (phi[j+1] - phi[j-1]) / (t[j+1] - t[j-1])
+    end
+    return f
+end
+
+"""
+    _detect_subpulse_segments(t, A; rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3)
+        -> Vector{Tuple{Int,Int}}
+
+Detects contiguous "active" (non-silent) runs in a sampled amplitude trace
+`A(t_j)`, returning `(i_start, i_end)` SAMPLE-INDEX ranges (inclusive
+`t` indices), one per detected sub-pulse -- found purely from the sampled
+waveform, with no assumed segment count or `PULSE_CONFIG` structure.
+
+A sample counts as silent when `A[j] < rel_thresh * maximum(A)`. Two
+robustness guards against noise: a candidate active run shorter than
+`min_active_samples` is discarded (not a real sub-pulse, just a blip
+poking above threshold in what's otherwise silence); a silent gap shorter
+than `min_silence_samples` is merged back into "active" rather than
+splitting one true sub-pulse into two (guards against a single noisy dip
+near a target's own smooth near-zero region being mistaken for a genuine
+separator).
+"""
+function _detect_subpulse_segments(
+    t::AbstractVector, A::AbstractVector;
+    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
+)
+    n = length(A)
+    thresh = rel_thresh * maximum(A)
+    active = A .>= thresh
+
+    j = 1
+    while j <= n
+        if !active[j]
+            j0 = j
+            while j <= n && !active[j]
+                j += 1
+            end
+            gap_len = j - j0
+            if gap_len < min_silence_samples && j0 > 1 && j <= n
+                active[j0:j-1] .= true
+            end
+        else
+            j += 1
+        end
+    end
+
+    segments = Tuple{Int,Int}[]
+    j = 1
+    while j <= n
+        if active[j]
+            j0 = j
+            while j <= n && active[j]
+                j += 1
+            end
+            if j - j0 >= min_active_samples
+                push!(segments, (j0, j - 1))
+            end
+        else
+            j += 1
+        end
+    end
+    return segments
+end
+
+"""
+    _spline_coeff_count(n_samples; points_per_segment=22, degree=3) -> Int
+
+Number of B-spline coefficients so each piecewise-cubic segment spans
+roughly `points_per_segment` raw sample points: `n_pieces =
+ceil(n_samples/points_per_segment)`, and (since a degree-`degree` clamped
+B-spline with `n_coeff` coefficients has `n_coeff-degree` pieces --
+[`make_clamped_knots`](@ref)) `n_coeff = n_pieces + degree`, floored at
+`degree+1` (the minimum [`CompositePulse`](@ref) accepts).
+"""
+function _spline_coeff_count(n_samples::Integer; points_per_segment::Integer=22, degree::Integer=3)
+    n_pieces = max(cld(n_samples, points_per_segment), 1)
+    return max(n_pieces + degree, degree + 1)
+end
+
+"""
+    fit_composite_pulse_af(pulse::CompositePulse, t_samples, A_target, f_target;
+                            weight=A_target.^2, num_epochs=1000, learning_rate=0.002,
+                            seed=42, u_init=nothing) -> (u_fit, fit_report)
+
+Fits `pulse`'s raw parameters so its OWN amplitude/frequency curves
+([`build_A_f_of_t`](@ref)) match `A_target`/`f_target` at `t_samples`,
+instead of [`fit_composite_pulse`](@ref)'s complex-valued MSE. Minimises
+
+    mean((A_of_t(t_j) - A_target[j])^2) +
+    mean(weight[j] * (f_of_t(t_j) - f_target[j])^2) / mean(weight)
+
+`weight` defaults to `A_target.^2`: instantaneous frequency extracted from
+a sampled I/Q trace ([`_instantaneous_frequency`](@ref)) is numerically
+meaningless wherever the amplitude is near 0 (phase is undefined at the
+origin), so the frequency term is amplitude-weighted rather than given
+equal weight everywhere; the amplitude term needs no such weighting since
+`A_target` stays well-defined, and physically meaningful, all the way
+down to 0. Dividing the frequency term by `mean(weight)` keeps the two
+terms on comparable absolute scale regardless of `A_target`'s own units,
+rather than letting whichever term happens to have larger raw magnitude
+dominate the gradient purely because of a units mismatch.
+
+Returns `(u_fit, fit_report)`: `u_fit` is the LOWEST-loss `u` seen across
+all epochs. `fit_report = (loss, rel_l2_A, history)`: `rel_l2_A` is the
+amplitude term's OWN scale-free residual (`0`=perfect), reported
+separately from the combined `loss` since that's the more interpretable
+single number for comparing fits (frequency error has no natural `[0,1]`
+scale the way `fit_composite_pulse`'s `rel_l2` does).
+"""
+function fit_composite_pulse_af(
+    pulse::CompositePulse, t_samples::AbstractVector, A_target::AbstractVector, f_target::AbstractVector;
+    weight::AbstractVector=A_target .^ 2,
+    num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
+    u_init::Union{AbstractVector,Nothing}=nothing,
+)
+    N = length(t_samples)
+    (length(A_target) == N && length(f_target) == N && length(weight) == N) || error(
+        "t_samples/A_target/f_target/weight must all have the same length, got " *
+        "$(N)/$(length(A_target))/$(length(f_target))/$(length(weight))."
+    )
+    weight_mean = sum(weight) / N + 1e-30
+    A_energy = sum(abs2, A_target) + 1e-30
+
+    u = u_init === nothing ? initial_guess(pulse; seed=seed) : collect(Float64, u_init)
+    length(u) == n_params(pulse) || error(
+        "u_init has length $(length(u)), but this CompositePulse (k=$(pulse.k), " *
+        "n_coeff_A=$(pulse.n_coeff_A), n_coeff_f=$(pulse.n_coeff_f)) needs $(n_params(pulse))."
+    )
+    n = length(u)
+    adam = AdamState(n)
+    history = NamedTuple[]
+
+    function loss_only(uu)
+        A_of_t, f_of_t = build_A_f_of_t(pulse, uu)
+        sA = zero(eltype(uu))
+        sf = zero(eltype(uu))
+        @inbounds for j in 1:N
+            sA += abs2(A_of_t(t_samples[j]) - A_target[j])
+            sf += weight[j] * abs2(f_of_t(t_samples[j]) - f_target[j])
+        end
+        return sA / N + (sf / N) / weight_mean
+    end
+
+    best_u, best_loss = copy(u), Inf
+    for epoch in 1:num_epochs
+        grad = ForwardDiff.gradient(loss_only, u)
+        loss = Float64(loss_only(u))
+        if loss < best_loss
+            best_loss, best_u = loss, copy(u)
+        end
+        push!(history, (epoch=epoch, loss=loss))
+        adam_step!(u, grad, adam; lr=learning_rate)
+    end
+
+    A_of_t_best, _ = build_A_f_of_t(pulse, best_u)
+    A_resid = sum(j -> abs2(A_of_t_best(t_samples[j]) - A_target[j]), 1:N)
+    rel_l2_A = sqrt(A_resid / A_energy)
+
+    return best_u, (loss=best_loss, rel_l2_A=rel_l2_A, history=history)
+end
+
+"""
+    fit_composite_pulse_from_samples(t, I, Q, d;
+        points_per_segment=22, degree=3, taper_frac=0.1,
+        rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
+        num_epochs=1000, learning_rate=0.002, seed=42)
+        -> (pulse::CompositePulse, u_fit, fit_report, segments)
+
+Builds a [`CompositePulse`](@ref) seed DIRECTLY from a sampled I/Q trace,
+with NO prior knowledge of how many sub-pulses it contains or where they
+are:
+
+  1. Detects sub-pulses via [`_detect_subpulse_segments`](@ref) (silence
+     thresholding on `A=sqrt(I^2+Q^2)`) -- `k` is however many segments
+     that finds, not a caller-supplied count.
+  2. Extracts the target amplitude/frequency decomposition for the WHOLE
+     trace ([`_instantaneous_frequency`](@ref)).
+  3. Sizes ONE shared `n_coeff_A`/`n_coeff_f` (used for every sub-pulse --
+     `CompositePulse` has no per-sub-pulse coefficient count) via
+     [`_spline_coeff_count`](@ref), from whichever detected segment has
+     the MOST samples -- every segment gets AT LEAST ~`points_per_segment`
+     raw points per cubic piece this way, though a shorter segment ends up
+     with more spline resolution than its own sample count would strictly
+     need.
+  4. Builds a segment-matched `u_init`: each sub-pulse placed at its
+     detected segment's own `t`-span, amplitude flat at that segment's own
+     peak `A`, frequency ramped linearly across that segment's own
+     `extrema(f)` -- the same idea as
+     [`_segment_matched_seed_init`](@ref) (jld2_pulse_loader.jl), but
+     derived from the DETECTED segments' own sample data rather than a
+     labelled `PULSE_CONFIG`.
+  5. Fits via [`fit_composite_pulse_af`](@ref) (amplitude/frequency-space).
+
+`d` is `prepare_derived(CONFIG)`'s own return value (only used for
+`CompositePulse`'s own `T_max`/scale fields -- `t`'s own span need not
+equal `d.timespan`, though for a physically meaningful seed it should).
+
+Returns `(pulse, u_fit, fit_report, segments)` -- `segments` is the raw
+`(i_start, i_end)` sample-index list from step 1, for inspection/plotting.
+"""
+function fit_composite_pulse_from_samples(
+    t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
+    points_per_segment::Integer=22, degree::Integer=3, taper_frac::Real=0.1,
+    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
+    num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
+)
+    A = sqrt.(I .^ 2 .+ Q .^ 2)
+    f = _instantaneous_frequency(t, I, Q)
+
+    segments = _detect_subpulse_segments(
+        t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+    )
+    isempty(segments) && error(
+        "No active sub-pulses detected (rel_thresh=$rel_thresh too high relative to the " *
+        "trace's own peak, or the trace really is all silence)."
+    )
+    k = length(segments)
+
+    n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
+    n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
+
+    pulse = CompositePulse(k, n_coeff, n_coeff, d; degree=degree, taper_frac=taper_frac)
+
+    raw_gap = Vector{Float64}(undef, k)
+    raw_dur = Vector{Float64}(undef, k)
+    raw_cA = Matrix{Float64}(undef, n_coeff, k)
+    raw_cf = Matrix{Float64}(undef, n_coeff, k)
+    t_prev_end = 0.0
+    for (idx, (i_start, i_end)) in enumerate(segments)
+        t_s, t_e = t[i_start], t[i_end]
+        duration = t_e - t_s
+        gap = max(t_s - t_prev_end, pulse.gap_scale * 1e-3)
+        dur_arg = max(duration - pulse.dur_floor, pulse.dur_scale * 1e-3)
+        raw_gap[idx] = _softplus_inv(gap / pulse.gap_scale)
+        raw_dur[idx] = _softplus_inv(dur_arg / pulse.dur_scale)
+
+        peak_amp = maximum(view(A, i_start:i_end))
+        raw_cA[:, idx] .= _softplus_inv(max(peak_amp, 1e-30) / pulse.amp_scale)
+
+        f_lo, f_hi = extrema(view(f, i_start:i_end))
+        raw_cf[:, idx] .= range(f_lo, f_hi; length=n_coeff) ./ pulse.freq_scale
+
+        t_prev_end = t_e
+    end
+    u_init = pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+
+    u_fit, fit_report = fit_composite_pulse_af(
+        pulse, t, A, f; num_epochs=num_epochs, learning_rate=learning_rate, seed=seed, u_init=u_init,
+    )
+    return pulse, u_fit, fit_report, segments
+end
+
+"""
+    fit_composite_pulse_from_samples_linear(t, I, Q, d;
+        points_per_segment=6, degree=3, taper_frac=0.1,
+        rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
+        cA_floor_frac=1e-6)
+        -> (pulse::CompositePulse, u_fit, fit_report, segments)
+
+Closed-form alternative to [`fit_composite_pulse_from_samples`](@ref):
+same segment detection / `n_coeff` sizing (steps 1-3 of that function's own
+docstring), but NO `ForwardDiff`/Adam descent at all. This matters at the
+resolution the 20-25-points-per-segment rule implies for a real, densely
+sampled trace: a single ~200us sub-pulse sampled at ~5000 points over
+~600us needs `n_coeff~80`, and for `k=3` that is `n_params~480` --
+verified impractical for `ForwardDiff.gradient`+Adam as currently
+implemented (`bspline_basis` allocates fresh temporaries on every call,
+with no caching; a real attempt at this scale did not finish a single
+epoch in 10 minutes, ~9x10^8 allocations in). This function instead
+exploits that MOST of what's being fit is actually linear, given the
+segmentation this file already computes independently of any pulse
+parameter:
+
+  - `t_start`/`t_end` per sub-pulse are taken DIRECTLY from the detected
+    segment's own sample boundaries -- no fitting needed, since
+    segmentation already locates them exactly (to sample resolution).
+  - Given those (hence given the B-spline's knot vector), `A_spline(t) =
+    Σ cA_i B_i(t)` and `f_spline(t) = Σ cf_i B_i(t)` are both LINEAR in
+    their own coefficients -- so `cA`/`cf` are each the exact solution of
+    an ordinary (`cf`) or taper-weighted (`cA`, folding the KNOWN, FIXED
+    `_taper_window` multiplier into the design matrix so the amplitude
+    term being solved for is `pulse`'s own actual physical envelope, not
+    the bare untapered spline) linear least-squares problem -- one
+    `n_samples x n_coeff` solve per sub-pulse per curve, via `\\`, exact
+    for that sub-problem and typically sub-second even at `n_coeff~80`,
+    instead of thousands of epochs approximating the same optimum.
+    `cf`'s solve is WEIGHTED by `A_target.^2` (same rationale as
+    [`fit_composite_pulse_af`](@ref)'s `weight` default: instantaneous
+    frequency is numerically meaningless wherever the target amplitude is
+    near 0).
+
+`points_per_segment` defaults to `6` (not `fit_composite_pulse_from_samples`'s
+20-25 spec) -- verified on this package's own 3-ARP reference pulse to
+still improve `rel_l2_A` noticeably over the 20-25 range (0.0013 at 22
+points/segment down to 0.00055 at 6), with sharply diminishing returns
+below that (a further halving to 4 points/segment only reached 0.00046)
+and negligible runtime cost either way (all of 22/12/8/6/4 fit in under
+1.5s combined on that reference case, since this is a handful of small
+linear solves, not an iterative descent).
+
+`cA_floor_frac`: ordinary least squares has no non-negativity constraint,
+but `CompositePulse`'s own parameterisation requires `cA >= 0`
+(`decode`'s `cA = amp_scale*softplus(raw_cA)`, always non-negative, so
+`_softplus_inv` needs a positive argument) -- any solved coefficient below
+`cA_floor_frac * pulse.amp_scale` is clamped up to that floor before
+encoding. This is a pragmatic guard against small negative
+undershoots near sharp features, NOT a proper non-negative least-squares
+solve; on the same reference case this floor starts triggering (a small
+handful of coefficients, out of hundreds) right around `points_per_segment
+= 6`, so `fit_report.n_cA_floored` is worth checking at this default --
+a persistently nonzero count is a sign a true NNLS solve would do better
+than this clamp.
+
+Returns `(pulse, u_fit, fit_report, segments)` -- `fit_report =
+(rel_l2_A, rel_l2_f, n_cA_floored)`: `rel_l2_A`/`rel_l2_f` are the same
+scale-free `[0,1]`-ish residual `fit_composite_pulse`/`_af` report (`0` =
+perfect); `n_cA_floored` is the total count of amplitude coefficients
+(across all sub-pulses) that hit the non-negativity floor above.
+"""
+function fit_composite_pulse_from_samples_linear(
+    t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
+    points_per_segment::Integer=6, degree::Integer=3, taper_frac::Real=0.1,
+    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
+    cA_floor_frac::Real=1e-6,
+)
+    A = sqrt.(I .^ 2 .+ Q .^ 2)
+    f = _instantaneous_frequency(t, I, Q)
+
+    segments = _detect_subpulse_segments(
+        t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
+    )
+    isempty(segments) && error(
+        "No active sub-pulses detected (rel_thresh=$rel_thresh too high relative to the " *
+        "trace's own peak, or the trace really is all silence)."
+    )
+    k = length(segments)
+
+    n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
+    n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
+
+    pulse = CompositePulse(k, n_coeff, n_coeff, d; degree=degree, taper_frac=taper_frac)
+    cA_floor = cA_floor_frac * pulse.amp_scale
+
+    raw_gap = Vector{Float64}(undef, k)
+    raw_dur = Vector{Float64}(undef, k)
+    raw_cA = Matrix{Float64}(undef, n_coeff, k)
+    raw_cf = Matrix{Float64}(undef, n_coeff, k)
+    n_cA_floored = 0
+    A_resid = 0.0
+    f_resid = 0.0
+    f_weight_sum = 0.0
+    t_prev_end = 0.0
+
+    for (idx, (i_start, i_end)) in enumerate(segments)
+        t_s, t_e = t[i_start], t[i_end]
+        duration = t_e - t_s
+        gap = max(t_s - t_prev_end, pulse.gap_scale * 1e-3)
+        dur_arg = max(duration - pulse.dur_floor, pulse.dur_scale * 1e-3)
+        raw_gap[idx] = _softplus_inv(gap / pulse.gap_scale)
+        raw_dur[idx] = _softplus_inv(dur_arg / pulse.dur_scale)
+
+        t_seg = view(t, i_start:i_end)
+        A_seg = view(A, i_start:i_end)
+        f_seg = view(f, i_start:i_end)
+        n_seg = length(t_seg)
+
+        knots = make_clamped_knots(n_coeff, t_s, t_e, degree)
+        Basis = Matrix{Float64}(undef, n_seg, n_coeff)
+        @inbounds for j in 1:n_seg
+            Basis[j, :] .= bspline_basis(t_seg[j], knots, degree)
+        end
+
+        taper_w = [_taper_window(t_seg[j], t_s, t_e, taper_frac) for j in 1:n_seg]
+        M_A = Basis .* taper_w
+        cA_seg = M_A \ collect(A_seg)
+        n_cA_floored += count(<(cA_floor), cA_seg)
+        cA_seg = max.(cA_seg, cA_floor)
+        raw_cA[:, idx] .= _softplus_inv.(cA_seg ./ pulse.amp_scale)
+
+        f_weight = A_seg .^ 2 .+ 1e-30
+        sw = sqrt.(f_weight)
+        M_f = Basis .* sw
+        cf_seg = M_f \ (collect(f_seg) .* sw)
+        raw_cf[:, idx] .= cf_seg ./ pulse.freq_scale
+
+        A_pred = M_A * cA_seg
+        f_pred = Basis * cf_seg
+        A_resid += sum(abs2, A_pred .- A_seg)
+        f_resid += sum(f_weight .* abs2.(f_pred .- f_seg))
+        f_weight_sum += sum(f_weight)
+
+        t_prev_end = t_e
+    end
+
+    u_fit = pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+
+    A_energy = sum(abs2, A) + 1e-30
+    rel_l2_A = sqrt(A_resid / A_energy)
+    rel_l2_f = sqrt(f_resid / (f_weight_sum + 1e-30)) / pulse.freq_scale
+
+    fit_report = (rel_l2_A=rel_l2_A, rel_l2_f=rel_l2_f, n_cA_floored=n_cA_floored)
+    return pulse, u_fit, fit_report, segments
+end
+
+# ============================================================
 # LOCAL DESCENT WITH EARLY STOPPING + BASIN-HOPPING OUTER LOOP
 #
 # Same two-level structure as the Python port's _run_local_adam/

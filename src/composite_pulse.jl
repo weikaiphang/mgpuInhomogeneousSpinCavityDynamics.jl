@@ -406,6 +406,66 @@ function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
 end
 
 """
+    build_A_f_of_t(pulse::CompositePulse, u::AbstractVector) -> (A_of_t, f_of_t)
+
+Like [`build_E_of_t`](@ref), but returns the (tapered) AMPLITUDE and
+INSTANTANEOUS-FREQUENCY curves as two separate `t -> Real` closures instead
+of the combined complex drive: `A_of_t(t) = A_spline(t) *
+_taper_window(t, t_start[i], t_end[i], taper_frac)` -- exactly the
+envelope `build_E_of_t` multiplies into its own drive -- and `f_of_t(t) =
+bspline_eval(t, cf[:,i], knots_f_i, degree)`, the frequency spline ITSELF
+(not its antiderivative): `build_E_of_t`'s own `phi(t) = ∫f dt'` is built
+from `bspline_antiderivative(cf, ...)`, so `f_of_t` here is exactly that
+integral's derivative, by construction. Both return `0` outside every
+sub-pulse's own active span (matching `build_E_of_t`'s silent-elsewhere
+behaviour) -- `f_of_t`'s `0` there carries no physical meaning (the drive
+itself is silent, so "frequency" is undefined), it's just a harmless
+placeholder value.
+
+Used by [`fit_composite_pulse_af`](@ref) to fit `pulse` directly against a
+target's own amplitude/frequency decomposition (e.g. extracted from a
+sampled I/Q trace via [`_instantaneous_frequency`](@ref)) rather than its
+raw complex value -- decoupling amplitude-shape error from phase-shape
+error, which matters because a target's instantaneous frequency is
+numerically unreliable wherever its amplitude is near zero (phase is
+undefined at the origin), a regime `build_E_of_t`'s combined complex value
+does not let a caller isolate.
+"""
+function build_A_f_of_t(pulse::CompositePulse, u::AbstractVector)
+    t_start, t_end, cA, cf = decode(pulse, u)
+    k = pulse.k
+    degree = pulse.degree
+    T = eltype(t_start)
+
+    knots_A_list = Vector{Vector{T}}(undef, k)
+    knots_f_list = Vector{Vector{T}}(undef, k)
+    @inbounds for i in 1:k
+        knots_A_list[i] = make_clamped_knots(pulse.n_coeff_A, t_start[i], t_end[i], degree)
+        knots_f_list[i] = make_clamped_knots(pulse.n_coeff_f, t_start[i], t_end[i], degree)
+    end
+
+    taper_frac = pulse.taper_frac
+    A_of_t = function (t)
+        @inbounds for i in 1:k
+            if t >= t_start[i] && t <= t_end[i]
+                A_spline = bspline_eval(t, view(cA, :, i), knots_A_list[i], degree)
+                return A_spline * _taper_window(t, t_start[i], t_end[i], taper_frac)
+            end
+        end
+        return zero(T)
+    end
+    f_of_t = function (t)
+        @inbounds for i in 1:k
+            if t >= t_start[i] && t <= t_end[i]
+                return bspline_eval(t, view(cf, :, i), knots_f_list[i], degree)
+            end
+        end
+        return zero(T)
+    end
+    return A_of_t, f_of_t
+end
+
+"""
     total_area(pulse, u)
 
 Exact area of the whole composite pulse's underlying B-splines,

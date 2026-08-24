@@ -64,6 +64,189 @@ function build_signal_E_of_t(signal_cfg, use_signal::Bool)
 end
 
 """
+    _segment_matched_seed_init(control_cfg, pulse::CompositePulse) -> Union{Vector{Float64},Nothing}
+
+Builds a raw parameter vector for `pulse` by matching each of its `k`
+sub-pulses 1:1 against `control_cfg[i]` -- ONLY when `length(control_cfg)
+== pulse.k` (returns `nothing` otherwise, so the caller falls back to
+[`fit_composite_pulse`](@ref)'s own generic, timing-blind
+[`initial_guess`](@ref)). Sub-pulse `i` is placed at the SAME
+`t_start`/`t_end` as `control_cfg[i]` (from its own `t_center`/`duration`
+fields, encoded back through the same `gap_scale`/`dur_scale`/`dur_floor`
+softplus reparameterisation [`decode`](@ref) uses), its amplitude B-spline
+started FLAT at `control_cfg[i]`'s own peak `amp` (falling back to
+`pulse.amp_scale` if that field is absent), and -- when `control_cfg[i]`
+has a `bandwidth` field (i.e. looks like a `:wurst` spec) -- its frequency
+B-spline control points started as a LINEAR ramp from `-bandwidth/2` to
+`+bandwidth/2` (times `control_cfg[i].chirp_sign`, defaulting to `+1.0`),
+a reasonable starting approximation of a linear chirp sweep (`0` chirp
+otherwise).
+
+This exists because the generic random `initial_guess` turned out to be a
+poor starting point for fitting a MULTI-segment target: verified on this
+package's own 3-ARP reference pulse (k=3, 3 WURST segments) that 200
+epochs of Adam from `initial_guess` plateaus at `rel_l2~0.998` (i.e.
+essentially no better than an all-zero pulse) -- the random init's own
+amplitude scale sits ~3x below the target's actual peak, and its sub-pulse
+timings have no relation to where the target's segments actually are, so
+early gradients are largely uninformative (a sub-pulse that doesn't
+overlap the target in time gets no useful amplitude/shape signal from it).
+Starting from each segment's own known timing/amplitude/chirp instead
+begins descent already in roughly the right basin; [`fit_composite_pulse`](@ref)'s
+own Adam descent still does all the actual curve shaping from there.
+"""
+function _segment_matched_seed_init(control_cfg, pulse::CompositePulse)
+    length(control_cfg) == pulse.k || return nothing
+    k = pulse.k
+
+    raw_gap = Vector{Float64}(undef, k)
+    raw_dur = Vector{Float64}(undef, k)
+    raw_cA = Matrix{Float64}(undef, pulse.n_coeff_A, k)
+    raw_cf = Matrix{Float64}(undef, pulse.n_coeff_f, k)
+
+    t_prev_end = 0.0
+    for i in 1:k
+        cfg = control_cfg[i]
+        duration = Float64(cfg.duration)
+        t_start = Float64(cfg.t_center) - duration / 2
+        gap = max(t_start - t_prev_end, pulse.gap_scale * 1e-3)
+        dur_arg = max(duration - pulse.dur_floor, pulse.dur_scale * 1e-3)
+
+        raw_gap[i] = _softplus_inv(gap / pulse.gap_scale)
+        raw_dur[i] = _softplus_inv(dur_arg / pulse.dur_scale)
+
+        amp = hasproperty(cfg, :amp) ? Float64(cfg.amp) : pulse.amp_scale
+        raw_cA[:, i] .= _softplus_inv(max(amp, 1e-30) / pulse.amp_scale)
+
+        if hasproperty(cfg, :bandwidth)
+            bw = Float64(cfg.bandwidth)
+            chirp_sign = hasproperty(cfg, :chirp_sign) ? Float64(cfg.chirp_sign) : 1.0
+            raw_cf[:, i] .= chirp_sign .* range(-bw / 2, bw / 2; length=pulse.n_coeff_f) ./ pulse.freq_scale
+        else
+            raw_cf[:, i] .= 0.0
+        end
+
+        t_prev_end = t_start + duration
+    end
+
+    return pack(pulse, raw_gap, raw_dur, raw_cA, raw_cf)
+end
+
+"""
+    fit_composite_pulse_seed(control_cfg, pulse::CompositePulse; kwargs...) -> (u_fit, fit_report)
+
+Interprets a recorded `PULSE_CONFIG`'s control segments `control_cfg`
+(e.g. [`split_signal_control`](@ref)'s second return value -- this file's
+own original, non-B-spline control pulse, however it was built, e.g. the
+`:wurst` segments [`generate_3arp_pi_pulse`](@ref) produces) as a target
+drive (`build_E_of_t(control_cfg)`, `pulses.jl`'s tuple-of-specs method)
+and fits `pulse`'s own B-spline raw parameters to approximate it (see
+[`fit_composite_pulse`](@ref) in pulse_optimizer2.jl for the actual
+ForwardDiff/Adam shape fit -- `kwargs` are forwarded there unchanged, EXCEPT
+`u_init`: unless the caller passes one explicitly, this defaults to
+[`_segment_matched_seed_init`](@ref)`(control_cfg, pulse)` rather than
+`fit_composite_pulse`'s own generic random `initial_guess`, when
+`length(control_cfg) == pulse.k` makes a 1:1 segment match possible -- see
+that function's own docstring for why this matters in practice). This is
+how [`optimise_control_pulse_from_jld2`](@ref) builds its default
+optimisation seed FROM the source file's own recorded pulse, rather than a
+shape-blind random/canonical guess -- a fit, not an exact reconstruction:
+`control_cfg`'s own pulse kind (e.g. WURST's `tanh` gate + `sin^n`
+envelope + quadratic-phase chirp) is a different functional family from
+`pulse`'s clamped-B-spline-times-Gevrey-taper envelope, so some residual
+mismatch is inherent and expected -- see `fit_report.rel_l2` for a
+scale-free measure of how much, and confirm the physics separately (this
+function makes NO ODE solve at all -- see
+[`optimise_control_pulse_from_jld2`](@ref)'s own seed-reconciliation step,
+which does).
+"""
+function fit_composite_pulse_seed(control_cfg, pulse::CompositePulse; kwargs...)
+    E_target = build_E_of_t(control_cfg)
+    kwargs_nt = NamedTuple(kwargs)
+    if !(:u_init in keys(kwargs_nt))
+        smart_init = _segment_matched_seed_init(control_cfg, pulse)
+        if smart_init !== nothing
+            kwargs_nt = merge(kwargs_nt, (u_init=smart_init,))
+        end
+    end
+    return fit_composite_pulse(pulse, E_target; kwargs_nt...)
+end
+
+"""
+    fit_composite_pulse_seed_auto(control_cfg, d; N_samples=5001, kwargs...)
+        -> (pulse::CompositePulse, u_fit, fit_report, segments)
+
+Thin convenience wrapper around
+[`fit_composite_pulse_from_samples`](@ref) for a recorded `PULSE_CONFIG`'s
+control segments: samples `control_cfg` (via `pulses.jl`'s
+[`build_E_of_t`](@ref)/[`sample_E_of_t`](@ref)) at `N_samples` evenly
+spaced points over `[0, d.timespan[2]-d.timespan[1]]`, then discovers `k`
+and sizes `n_coeff_A`/`n_coeff_f` from that sampled trace ITSELF rather
+than from `control_cfg`'s own labelled entry count -- unlike
+[`fit_composite_pulse_seed`](@ref) (which assumes `k == length(control_cfg)`
+and takes a caller-built `pulse` with caller-chosen coefficient counts),
+this makes no such assumption: it would work identically on a raw sampled
+trace with no `PULSE_CONFIG` behind it at all. `kwargs` are forwarded to
+[`fit_composite_pulse_from_samples`](@ref) (`points_per_segment`,
+`degree`, `taper_frac`, `rel_thresh`, `min_active_samples`,
+`min_silence_samples`, `num_epochs`, `learning_rate`, `seed`).
+"""
+function fit_composite_pulse_seed_auto(control_cfg, d; N_samples::Integer=5001, kwargs...)
+    E_target = build_E_of_t(control_cfg)
+    T_max = d.timespan[2] - d.timespan[1]
+    Ex, Ep = sample_E_of_t(E_target, T_max, N_samples)
+    t = collect(range(0.0, T_max; length=N_samples))
+    return fit_composite_pulse_from_samples(t, Ex, Ep, d; kwargs...)
+end
+
+"""
+    fit_composite_pulse_seed_auto_linear(control_cfg, d; N_samples=5001, kwargs...)
+        -> (pulse::CompositePulse, u_fit, fit_report, segments)
+
+Same as [`fit_composite_pulse_seed_auto`](@ref), but delegates to
+[`fit_composite_pulse_from_samples_linear`](@ref) (closed-form linear
+least-squares) instead of the `ForwardDiff`/Adam route -- see that
+function's own docstring for why this is the practical choice once
+`n_coeff` gets large (a dense, real sampled trace at the
+20-25-points-per-segment resolution routinely needs `n_coeff` in the
+tens to ~80, at which point `ForwardDiff.gradient`+Adam over `n_params =
+2k + 2*k*n_coeff` raw parameters becomes impractically slow with this
+package's current, non-preallocating `bspline_basis`).
+"""
+function fit_composite_pulse_seed_auto_linear(control_cfg, d; N_samples::Integer=5001, kwargs...)
+    E_target = build_E_of_t(control_cfg)
+    T_max = d.timespan[2] - d.timespan[1]
+    Ex, Ep = sample_E_of_t(E_target, T_max, N_samples)
+    t = collect(range(0.0, T_max; length=N_samples))
+    return fit_composite_pulse_from_samples_linear(t, Ex, Ep, d; kwargs...)
+end
+
+"""
+    _compare_against_saved_trajectory(a_check, Sp_check, Sz_check, data; atol=0.0) -> (rel_a, rel_p, rel_z, err_a, err_p, err_z)
+
+Shared comparison core behind [`reconcile_against_jld2`](@ref) and
+[`optimise_control_pulse_from_jld2`](@ref)'s own seed-reconciliation check:
+maximum absolute error of `a_check`/`sum(Sp_check,dims=2)`/
+`sum(Sz_check,dims=2)` against `data.a_sol`/`data.Σp_sol`/`data.Σz_sol`,
+each scaled by that saved trajectory's own peak magnitude (`+ atol`, an
+absolute floor guarding against division by a near-zero saved value).
+"""
+function _compare_against_saved_trajectory(a_check, Sp_check, Sz_check, data; atol::Real=0.0)
+    Sigma_p_check = vec(sum(Sp_check, dims=2))
+    Sigma_z_check = vec(sum(Sz_check, dims=2))
+
+    err_a = maximum(abs.(a_check .- data.a_sol))
+    err_p = maximum(abs.(Sigma_p_check .- data.Σp_sol))
+    err_z = maximum(abs.(Sigma_z_check .- data.Σz_sol))
+
+    scale_a = maximum(abs.(data.a_sol)) + atol
+    scale_p = maximum(abs.(data.Σp_sol)) + atol
+    scale_z = maximum(abs.(data.Σz_sol)) + atol
+
+    return err_a / scale_a, err_p / scale_p, err_z / scale_z, err_a, err_p, err_z
+end
+
+"""
     run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:ground, alg=Tsit5(), reltol=1e-8, abstol=1e-8, tstops=Float64[]) -> (t, a, Sp, Sz)
 
 Forward-only (not `ForwardDiff`-differentiated) CPU analogue of
@@ -376,12 +559,16 @@ end
 """
     optimise_control_pulse_from_jld2(path, k, n_coeff_A, n_coeff_f;
         n_signal=1, use_signal=true, reconcile=true, rtol_check=1e-3, atol_check=0.0,
-        check_reltol=nothing, check_abstol=nothing, save_log=true, log_out_dir=nothing,
+        check_reltol=nothing, check_abstol=nothing,
+        fit_seed_from_file=true, fit_N=4000, fit_num_epochs=1000, fit_learning_rate=0.002,
+        reconcile_seed=true, rtol_seed_check=0.1, atol_seed_check=0.0,
+        save_log=true, log_out_dir=nothing,
         pulsemat_N=nothing, optimizer_kwargs...)
-        -> (best_u, best_cost, pulse::CompositePulse, signal_E_of_t, d, data)
+        -> (best_u, best_cost, pulse::CompositePulse, signal_E_of_t, d, data, seed_fit_report)
 
 End-to-end workflow tying [`load_jld2_run`](@ref),
-[`reconcile_against_jld2`](@ref), [`optimise_composite_pulse`](@ref), and
+[`reconcile_against_jld2`](@ref), [`fit_composite_pulse_seed`](@ref),
+[`optimise_composite_pulse`](@ref), and
 [`save_optimisation_run_log`](@ref) together:
 
   1. Loads `path` (a `.jld2` run written by `run_sim_1st_order`/
@@ -402,16 +589,41 @@ End-to-end workflow tying [`load_jld2_run`](@ref),
      `use_signal=true` (default) uses the file's own recorded signal
      pulse exactly; `use_signal=false` (the `USE_SIGNAL` mode flag) zeroes
      it out completely, identically zero at every `t`, so it has no
-     effect whatsoever on the ensemble -- then runs
-     [`optimise_composite_pulse`](@ref)-style Adam + basin-hopping
-     optimisation on a NEW `CompositePulse` (`k` B-spline sub-pulses)
-     CONTROL pulse, with the signal passed through as
+     effect whatsoever on the ensemble.
+  5. Builds the optimiser's SEED. Unless an explicit `warm_start_u` is
+     passed in `optimizer_kwargs` (which always wins, skipping this step
+     entirely) or `fit_seed_from_file=false`: interprets `path`'s own
+     recorded CONTROL pulse (step 2's `control_cfg`, e.g. an analytic
+     WURST/ARP pulse -- NOT a `CompositePulse`) via
+     [`fit_composite_pulse_seed`](@ref) -- a ForwardDiff/Adam SHAPE fit
+     (`fit_N`/`fit_num_epochs`/`fit_learning_rate` forwarded to it), no ODE
+     solve involved -- into a `CompositePulse(k, n_coeff_A, n_coeff_f, d)`
+     raw parameter vector `u_fit`. Unless `reconcile_seed=false`,
+     `u_fit`'s ACTUAL physics (signal, always on here -- same as step 3 --
+     plus `build_E_of_t(pulse, u_fit)`) is then simulated
+     ([`run_sim_1st_order_trajectory`](@ref)) and compared against the
+     file's own saved trajectory to `rtol_seed_check` (looser than
+     `rtol_check` by default: `fit_composite_pulse_seed`'s B-spline family
+     cannot exactly reproduce an arbitrary recorded pulse shape, only
+     approximate it, so SOME residual mismatch here is expected and
+     inherent, unlike step 3's near-exact reconciliation). Throws an error
+     and refuses to proceed if this does not match within
+     `rtol_seed_check`/`atol_seed_check` -- raise `fit_N`/`fit_num_epochs`,
+     adjust `k`/`n_coeff_A`/`n_coeff_f`, loosen `rtol_seed_check`, or pass
+     `reconcile_seed=false` to override at your own risk. If `warm_start_u`
+     was explicitly given, or `fit_seed_from_file=false`, this whole step
+     is skipped and [`optimise_composite_pulse`](@ref) falls back to its
+     own default (`warm_start_u` if given, else a fresh random
+     `initial_guess`).
+  6. Runs [`optimise_composite_pulse`](@ref)-style Adam + basin-hopping
+     optimisation on the `CompositePulse` (`k` B-spline sub-pulses)
+     CONTROL pulse from that seed, with the signal passed through as
      `signal_E_of_t`. The signal pulse is NEVER part of the optimised
      parameter vector `u` -- see [`run_sim_1st_order_pure`](@ref)'s own
      docstring for why this is structural (a plain captured closure, not
      a differentiated quantity), not merely a convention: the optimiser
      is physically incapable of touching the signal pulse.
-  5. Unless `save_log=false`, writes the full run record via
+  7. Unless `save_log=false`, writes the full run record via
      [`save_optimisation_run_log`](@ref) (`log_out_dir`/`pulsemat_N`
      forwarded to it as `out_dir`/`pulsemat_N`), including a complete
      `optimizer_settings` record -- everything [`optimise_composite_pulse`](@ref)
@@ -420,14 +632,20 @@ End-to-end workflow tying [`load_jld2_run`](@ref),
      `taper_frac`, `seed`, any numeric `solve_kwargs` override) merged with
      this function's own
      (`n_signal`, `USE_SIGNAL`, `reconcile`, `rtol_check`, `atol_check`,
-     `check_reltol`, `check_abstol`) -- so a
+     `check_reltol`, `check_abstol`, `fit_seed_from_file`, `fit_N`,
+     `fit_num_epochs`, `fit_learning_rate`, `reconcile_seed`,
+     `rtol_seed_check`, `atol_seed_check`) -- so a
      saved run can be replicated exactly later just by reading its own
      log.
 
 Returns everything a caller would need afterwards: the optimised raw
 parameters, its cost, the `CompositePulse` they decode against, the fixed
-`signal_E_of_t` actually used, the derived ensemble `d`, and the loaded
-`data` (e.g. for further comparison/plotting against the original run).
+`signal_E_of_t` actually used, the derived ensemble `d`, the loaded
+`data` (e.g. for further comparison/plotting against the original run),
+and `seed_fit_report` -- `nothing` if step 5 was skipped, else
+`(u_fit, fit_report, seed_reconcile_ok, seed_reconcile_report)` from that
+step (`fit_report`/`seed_reconcile_report` as documented in
+[`fit_composite_pulse_seed`](@ref)/[`_compare_against_saved_trajectory`](@ref)).
 """
 function optimise_control_pulse_from_jld2(
     path::AbstractString,
@@ -439,6 +657,13 @@ function optimise_control_pulse_from_jld2(
     atol_check::Real=0.0,
     check_reltol=nothing,
     check_abstol=nothing,
+    fit_seed_from_file::Bool=true,
+    fit_N::Integer=4000,
+    fit_num_epochs::Integer=1000,
+    fit_learning_rate::Real=0.002,
+    reconcile_seed::Bool=true,
+    rtol_seed_check::Real=0.1,
+    atol_seed_check::Real=0.0,
     save_log::Bool=true,
     log_out_dir=nothing,
     pulsemat_N=nothing,
@@ -447,7 +672,7 @@ function optimise_control_pulse_from_jld2(
     data = load_jld2_run(path)
     CONFIG = build_full_config(data.SIM_SETTING, data.SYSTEM_CONFIG)
     d = prepare_derived(CONFIG)
-    signal_cfg, _ = split_signal_control(data.PULSE_CONFIG; n_signal=n_signal)
+    signal_cfg, control_cfg = split_signal_control(data.PULSE_CONFIG; n_signal=n_signal)
 
     if reconcile
         ok, report, _, _ = reconcile_against_jld2(
@@ -465,6 +690,57 @@ function optimise_control_pulse_from_jld2(
 
     signal_E_of_t = build_signal_E_of_t(signal_cfg, use_signal)
 
+    seed_fit_report = nothing
+    if fit_seed_from_file && !(:warm_start_u in keys(optimizer_kwargs))
+        degree = get(optimizer_kwargs, :degree, 3)
+        taper_frac = get(optimizer_kwargs, :taper_frac, 0.1)
+        seed_pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
+        fit_seed = get(optimizer_kwargs, :seed, 42)
+
+        u_fit, fit_report = fit_composite_pulse_seed(
+            control_cfg, seed_pulse;
+            N_fit=fit_N, num_epochs=fit_num_epochs, learning_rate=fit_learning_rate, seed=fit_seed,
+        )
+        println(
+            "Fitted a k=$k CompositePulse seed from $path's own recorded control pulse: " *
+            "mse=$(round(fit_report.mse, sigdigits=4)) rel_l2=$(round(fit_report.rel_l2, sigdigits=4))"
+        )
+
+        seed_ok = true
+        seed_report = nothing
+        if reconcile_seed
+            signal_E_always = build_E_of_t(signal_cfg)
+            control_E_fit = build_E_of_t(seed_pulse, u_fit)
+            E_seed_check(t) = signal_E_always(t) + control_E_fit(t)
+            reltol_solve = check_reltol === nothing ? data.SIM_SETTING.reltol : check_reltol
+            abstol_solve = check_abstol === nothing ? data.SIM_SETTING.abstol : check_abstol
+            _, a_check, Sp_check, Sz_check = run_sim_1st_order_trajectory(
+                E_seed_check, d; reltol=reltol_solve, abstol=abstol_solve,
+            )
+            rel_a, rel_p, rel_z, err_a, err_p, err_z = _compare_against_saved_trajectory(
+                a_check, Sp_check, Sz_check, data; atol=atol_seed_check,
+            )
+            seed_ok = rel_a < rtol_seed_check && rel_p < rtol_seed_check && rel_z < rtol_seed_check
+            seed_report = (rel_a=rel_a, rel_p=rel_p, rel_z=rel_z, err_a=err_a, err_p=err_p, err_z=err_z)
+            status = seed_ok ? "PASS" : "FAIL"
+            println(
+                "Seed reconciliation against $path: $status (rtol=$rtol_seed_check)  " *
+                "rel_a=$(round(rel_a, sigdigits=4)) rel_p=$(round(rel_p, sigdigits=4)) rel_z=$(round(rel_z, sigdigits=4))"
+            )
+            seed_ok || error(
+                "Fitted seed's own simulated trajectory does not reconcile against $path " *
+                "(rel_a=$rel_a, rel_p=$rel_p, rel_z=$rel_z, tolerance rtol=$rtol_seed_check, " *
+                "shape-fit rel_l2=$(fit_report.rel_l2)) -- refusing to optimise from a seed whose " *
+                "physics doesn't match the source file. Raise fit_N/fit_num_epochs, adjust " *
+                "k/n_coeff_A/n_coeff_f, loosen rtol_seed_check, or pass reconcile_seed=false " *
+                "to override at your own risk."
+            )
+        end
+
+        optimizer_kwargs = merge(NamedTuple(optimizer_kwargs), (warm_start_u=u_fit,))
+        seed_fit_report = (u_fit=u_fit, fit_report=fit_report, seed_reconcile_ok=seed_ok, seed_reconcile_report=seed_report)
+    end
+
     best_u, best_cost, pulse, u0, initial_metrics, history, final_metrics, optimizer_settings = optimise_composite_pulse(
         k, n_coeff_A, n_coeff_f, d; signal_E_of_t=signal_E_of_t, optimizer_kwargs...,
     )
@@ -472,7 +748,10 @@ function optimise_control_pulse_from_jld2(
     if save_log
         full_settings = merge(
             (reconcile=reconcile, rtol_check=rtol_check, atol_check=atol_check,
-             check_reltol=check_reltol, check_abstol=check_abstol),
+             check_reltol=check_reltol, check_abstol=check_abstol,
+             fit_seed_from_file=fit_seed_from_file, fit_N=fit_N, fit_num_epochs=fit_num_epochs,
+             fit_learning_rate=fit_learning_rate, reconcile_seed=reconcile_seed,
+             rtol_seed_check=rtol_seed_check, atol_seed_check=atol_seed_check),
             optimizer_settings,
         )
         save_optimisation_run_log(
@@ -482,7 +761,7 @@ function optimise_control_pulse_from_jld2(
         )
     end
 
-    return best_u, best_cost, pulse, signal_E_of_t, d, data
+    return best_u, best_cost, pulse, signal_E_of_t, d, data, seed_fit_report
 end
 
 """
