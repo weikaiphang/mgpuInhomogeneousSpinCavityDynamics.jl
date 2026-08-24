@@ -707,8 +707,16 @@ function points_per_segment_for_budget(n_samples_max::Integer, k::Integer; degre
     k >= 1 || error("k must be a positive integer, got $k.")
     n_samples_max >= 1 || error("n_samples_max must be a positive integer, got $n_samples_max.")
 
+    # n_params_for MUST match CompositePulse's own n_params(pulse) =
+    # 3*pulse.k + pulse.k*pulse.n_coeff_A + pulse.k*pulse.n_coeff_f
+    # (composite_pulse.jl) for the case n_coeff_A=n_coeff_f=n_coeff this
+    # function always builds -- kept as ONE local closure (rather than
+    # re-typed at each use below) specifically so there is only one place
+    # to update if that formula ever changes again.
+    n_params_for(n_coeff) = 3 * k + 2 * k * n_coeff
+
     n_coeff_floor = degree + 1
-    min_budget = 3 * k + 2 * k * n_coeff_floor
+    min_budget = n_params_for(n_coeff_floor)
     param_budget >= min_budget || error(
         "param_budget=$param_budget cannot be met for k=$k sub-pulses at degree=$degree: " *
         "even the minimum coefficient count per sub-pulse ($n_coeff_floor) already needs " *
@@ -720,7 +728,7 @@ function points_per_segment_for_budget(n_samples_max::Integer, k::Integer; degre
     pps = cld(n_samples_max, n_pieces_max)
 
     n_coeff_actual = _spline_coeff_count(n_samples_max; points_per_segment=pps, degree=degree)
-    n_params_actual = 3 * k + 2 * k * n_coeff_actual
+    n_params_actual = n_params_for(n_coeff_actual)
     n_params_actual <= param_budget || error(
         "internal inconsistency: computed points_per_segment=$pps still gives " *
         "n_params=$n_params_actual > param_budget=$param_budget (n_coeff=$n_coeff_actual)."
@@ -760,6 +768,28 @@ function points_per_segment_for_budget(
     n_samples_max = maximum(i_end - i_start + 1 for (i_start, i_end) in segments)
     pps = points_per_segment_for_budget(n_samples_max, k; degree=degree, param_budget=param_budget)
     return pps, segments
+end
+
+"""
+    _resolve_points_per_segment(points_per_segment, param_budget, n_samples_each, k, degree, caller_name) -> Int
+
+Shared `param_budget` OVERRIDE step behind [`fit_composite_pulse_from_samples`](@ref)
+and [`fit_composite_pulse_from_samples_linear`](@ref): when `param_budget`
+is given, replaces the caller's own `points_per_segment` with
+[`points_per_segment_for_budget`](@ref)'s own sizing (against the ALREADY-
+DETECTED `k`/`n_samples_each`, never a caller guess), printing what it
+picked (`caller_name` names which of the two callers is logging, so the
+message stays traceable back to its own call site); otherwise returns
+`points_per_segment` unchanged.
+"""
+function _resolve_points_per_segment(
+    points_per_segment::Integer, param_budget::Union{Nothing,Integer},
+    n_samples_each, k::Integer, degree::Integer, caller_name::AbstractString,
+)
+    param_budget === nothing && return points_per_segment
+    pps = points_per_segment_for_budget(maximum(n_samples_each), k; degree=degree, param_budget=param_budget)
+    println("$caller_name: param_budget=$param_budget -> points_per_segment=$pps (k=$k)")
+    return pps
 end
 
 """
@@ -984,10 +1014,9 @@ function fit_composite_pulse_from_samples(
     k = length(segments)
 
     n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
-    if param_budget !== nothing
-        points_per_segment = points_per_segment_for_budget(maximum(n_samples_each), k; degree=degree, param_budget=param_budget)
-        println("fit_composite_pulse_from_samples: param_budget=$param_budget -> points_per_segment=$points_per_segment (k=$k)")
-    end
+    points_per_segment = _resolve_points_per_segment(
+        points_per_segment, param_budget, n_samples_each, k, degree, "fit_composite_pulse_from_samples",
+    )
     n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
 
     pulse = CompositePulse(k, n_coeff, n_coeff, d; degree=degree, taper_frac=taper_frac)
@@ -1038,7 +1067,8 @@ end
     fit_composite_pulse_from_samples_linear(t, I, Q, d;
         points_per_segment=6, degree=3, taper_frac=0.1,
         rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3,
-        cA_floor_frac=_GRAD_SAFE_FRAC, cf_clip_mult=20.0)
+        cA_floor_frac=_GRAD_SAFE_FRAC, cf_clip_mult=20.0,
+        param_budget=nothing, segments=nothing)
         -> (pulse::CompositePulse, u_fit, fit_report, segments)
 
 Closed-form alternative to [`fit_composite_pulse_from_samples`](@ref):
@@ -1179,6 +1209,15 @@ is given. Since this route is a closed-form linear solve (not iterative),
 raising `param_budget` costs only a bigger (still cheap) linear system, not
 a slower descent -- unlike [`fit_composite_pulse_from_samples`](@ref), where
 `param_budget` exists mainly to keep `ForwardDiff`/Adam tractable at all.
+
+Pass `segments` (the same `Vector{Tuple{Int,Int}}` [`_detect_subpulse_segments`](@ref)
+itself returns) to SKIP step 1's own detection and use the given segments
+directly -- for a caller (e.g. [`fit_composite_pulse_seed_linear_exact`](@ref))
+that already ran detection itself against this SAME `(t, A)` to validate
+`k`/size `points_per_segment` before calling this function, avoiding a
+second identical `O(N)` amplitude-threshold scan. `rel_thresh`/
+`min_active_samples`/`min_silence_samples` are ignored when `segments` is
+given (nothing left for them to control).
 """
 function fit_composite_pulse_from_samples_linear(
     t::AbstractVector, I::AbstractVector, Q::AbstractVector, d;
@@ -1186,13 +1225,14 @@ function fit_composite_pulse_from_samples_linear(
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
     cA_floor_frac::Real=_GRAD_SAFE_FRAC, cf_clip_mult::Real=20.0,
     param_budget::Union{Nothing,Integer}=nothing,
+    segments::Union{Nothing,Vector{Tuple{Int,Int}}}=nothing,
 )
     A = sqrt.(I .^ 2 .+ Q .^ 2)
     phi, f = _instantaneous_frequency(t, I, Q)
 
-    segments = _detect_subpulse_segments(
+    segments = segments === nothing ? _detect_subpulse_segments(
         t, A; rel_thresh=rel_thresh, min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
-    )
+    ) : segments
     isempty(segments) && error(
         "No active sub-pulses detected (rel_thresh=$rel_thresh too high relative to the " *
         "trace's own peak, or the trace really is all silence)."
@@ -1200,10 +1240,9 @@ function fit_composite_pulse_from_samples_linear(
     k = length(segments)
 
     n_samples_each = [i_end - i_start + 1 for (i_start, i_end) in segments]
-    if param_budget !== nothing
-        points_per_segment = points_per_segment_for_budget(maximum(n_samples_each), k; degree=degree, param_budget=param_budget)
-        println("fit_composite_pulse_from_samples_linear: param_budget=$param_budget -> points_per_segment=$points_per_segment (k=$k)")
-    end
+    points_per_segment = _resolve_points_per_segment(
+        points_per_segment, param_budget, n_samples_each, k, degree, "fit_composite_pulse_from_samples_linear",
+    )
     n_coeff = _spline_coeff_count(maximum(n_samples_each); points_per_segment=points_per_segment, degree=degree)
 
     pulse = CompositePulse(k, n_coeff, n_coeff, d; degree=degree, taper_frac=taper_frac)
@@ -1413,8 +1452,10 @@ collective `|F|` actually being optimised, never part of `cost` itself.
 
 `cf_lr_scale` (default `1.0`, i.e. no change from the original uniform-`lr`
 behaviour) multiplies the effective step size for the CHIRP/frequency
-coefficients (`raw_cf`) only -- `gap`/`duration`/`cA` always step at the
-full `learning_rate`. Motivation: `raw_cf` enters the physical drive
+coefficients (`raw_cf`) only -- `gap`/`duration`/`phi0`/`cA` always step at
+the full `learning_rate` (`phi0` is a one-shot discrete phase jump, not an
+integrated periodic quantity like `cf`, so the periodic-runaway motivation
+below doesn't apply to it either). Motivation: `raw_cf` enters the physical drive
 through an EXACT phase integral (`build_E_of_t`'s `Φ(t) = ∫f dτ`, via
 `bspline_antiderivative`), and the cost depends on that phase only through
 `exp(iΦ(t))` -- a periodic, non-convex function of `raw_cf`. `adam_step!`'s
@@ -1441,7 +1482,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     n = length(u)
     adam = AdamState(n)
     lr_scale = cf_lr_scale == 1.0 ? nothing : pack(
-        pulse, ones(pulse.k), ones(pulse.k), ones(pulse.n_coeff_A, pulse.k),
+        pulse, ones(pulse.k), ones(pulse.k), ones(pulse.k), ones(pulse.n_coeff_A, pulse.k),
         fill(cf_lr_scale, pulse.n_coeff_f, pulse.k),
     )
     aux = Ref{NTuple{5,Float64}}((NaN, NaN, NaN, NaN, NaN))

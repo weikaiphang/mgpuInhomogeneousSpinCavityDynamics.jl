@@ -67,7 +67,7 @@ end
     # Large positive raw duration/gap so t_end can exceed T_max.
     u = initial_guess(pulse; seed=1)
     u[1:2] .= 20.0
-    _, t_end, _, _ = decode(pulse, u)
+    _, t_end, _, _, _ = decode(pulse, u)
     excess = max(t_end[end] - pulse.T_max, 0.0)
     @test excess > 0
     penalty0 = 0.0 * (excess / pulse.T_max)^2
@@ -75,7 +75,7 @@ end
     @test penalty0 == 0.0
     @test penalty1 > 0.0
     g = ForwardDiff.gradient(uu -> begin
-        _, te, _, _ = decode(pulse, uu)
+        _, te, _, _, _ = decode(pulse, uu)
         ex = max(te[end] - pulse.T_max, zero(eltype(uu)))
         0.0 * (ex / pulse.T_max)^2
     end, u)
@@ -85,7 +85,7 @@ end
 @testset "raw_gap Dual vs finite difference on windowed |E|" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D)
     u = initial_guess(pulse; seed=1)
-    t_start, t_end, _, _ = decode(pulse, u)
+    t_start, t_end, _, _, _ = decode(pulse, u)
     tmid = (t_start[1] + t_end[1]) / 2
     f(uu) = abs(build_E_of_t(pulse, uu)(tmid))
     g = ForwardDiff.gradient(f, u)
@@ -106,14 +106,14 @@ end
     p1 = CompositePulse(1, 4, 4, FAKE_D)
     u_hs1 = seed_canonical(p1, :hs1)
     @test length(u_hs1) == n_params(p1)
-    t_start, t_end, cA, cf = decode(p1, u_hs1)
+    t_start, t_end, _, cA, cf = decode(p1, u_hs1)
     @test all(cA .> 0)
     @test t_end[1] > t_start[1]
 
     p5 = CompositePulse(5, 4, 4, FAKE_D)
     u_c = seed_corpse(p5, p5.amp_scale)
     @test length(u_c) == n_params(p5)
-    _, _, cA5, cf5 = decode(p5, u_c)
+    _, _, _, cA5, cf5 = decode(p5, u_c)
     @test all(cA5[:, 2] .< cA5[:, 1])  # ghost amplitude << active
     @test all(cA5[:, 4] .< cA5[:, 3])
     @test cf5[1, 2] != 0  # ghost chirp for π jump
