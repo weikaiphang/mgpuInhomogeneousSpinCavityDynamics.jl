@@ -672,7 +672,7 @@ function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; compute::Sym
 end
 
 """
-    pulse_cost(u, pulse, d; w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
+    pulse_cost(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
         -> (cost, inversion, silencing, duration, coherence)
 
 Scalar cost to be minimised. Inversion and silencing are scored on
@@ -681,12 +681,23 @@ Scalar cost to be minimised. Inversion and silencing are scored on
 silencing factor `|F|`. `target_F` picks which cavity-QED protocol this
 pulse is being optimised for: `target_F=1.0` (default) rewards
 preserving collective coherence (RASE-style revival); `target_F=0.0`
-rewards destroying it (ROSE-style echo silencing). Do not set `w_inv`/
-`w_sil` to 0 unless you want only one of the two objectives.
+rewards destroying it (ROSE-style echo silencing).
 
-    J = -w_inv*inversion + w_sil*(silencing - target_F)²
-        + w_time*(duration/T_max) + w_tmax*max(t_end[end]-T_max, 0)²/T_max²
+    silencing_success = 1 - (silencing - target_F)²
+    fidelity_phys = inversion * silencing_success
+    physics_cost = (1 - fidelity_phys)²
+
+    J = physics_cost + w_time*(duration/T_max) + w_tmax*max(t_end[end]-T_max, 0)²/T_max²
         + w_power*mean(|cA/amp_scale|²)
+
+`fidelity_phys` is the MULTIPLICATIVE combination of the two tracks (not
+the additive `-w_inv*inversion + w_sil*(...)²` an earlier version of this
+cost used): both a well-inverted `:ground` track AND a well-silenced/
+well-revived `:equator` track are required for `physics_cost` to reach
+its minimum of 0 -- either track alone, however good, cannot drive the
+cost down on its own, since `fidelity_phys` is their PRODUCT, not their
+weighted sum. There is accordingly no `w_inv`/`w_sil` knob any more: both
+tracks are always solved, unconditionally.
 
 `w_power` is an L2 penalty on the decoded, scale-normalised amplitude
 coefficients (i.e. `softplus.(raw_cA)`). Failed solves return `Inf`.
@@ -694,14 +705,12 @@ Do not pass `initial_condition`.
 
 `coherence` is the OLDER, simpler per-bin `Nj`-weighted mean of
 `|Sp|/(Nj/2)` (see [`_weighted_coherence`](@ref)/[`pulse_metrics`](@ref)),
-computed from the SAME `:equator` solve as `silencing` whenever
-`w_sil > 0` (no extra ODE solve); it stays `zero(T)` when `w_sil <= 0`
-disables that solve, exactly mirroring `silencing`'s own on/off behaviour
-in that regime. It is DIAGNOSTIC ONLY -- recorded for comparison, never
-part of `cost`, which depends only on `inversion` and `silencing`.
+computed from the SAME `:equator` solve as `silencing` (no extra ODE
+solve). It is DIAGNOSTIC ONLY -- recorded for comparison, never part of
+`cost`, which depends only on `inversion` and `silencing`.
 """
 function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
-                     w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
+                     target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                      compute::Symbol=:auto, kwargs...)
     _forbid_initial_condition(kwargs)
     T = eltype(u)
@@ -722,17 +731,13 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
     coherence = zero(T)
 
     try
-        if w_inv > 0.0
-            _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
-            inversion = _weighted_inversion(Sz, Nj, T)
-        end
-        if w_sil > 0.0
-            _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:equator)
-            silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
-            # Diagnostic only -- reuses the equator solve already run above
-            # for `silencing`, so this costs nothing extra; NOT part of `cost`.
-            coherence = _weighted_coherence(Sp, Nj_eq, T)
-        end
+        # Both tracks must be simulated to compute the multiplicative physical fidelity
+        _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
+        inversion = _weighted_inversion(Sz, Nj, T)
+
+        _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:equator)
+        silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
+        coherence = _weighted_coherence(Sp, Nj_eq, T)
     catch e
         e isa PulseSolveFailed || rethrow()
         infT = convert(T, Inf)
@@ -740,8 +745,11 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
         return infT, nanT, nanT, duration, nanT
     end
 
-    silencing_penalty = w_sil * (silencing - convert(T, target_F))^2
-    cost = -w_inv * inversion + silencing_penalty + w_time * (duration / pulse.T_max) + tmax_penalty + power_penalty
+    silencing_success = one(T) - (silencing - convert(T, target_F))^2
+    fidelity_phys = inversion * silencing_success
+    physics_cost = (one(T) - fidelity_phys)^2
+
+    cost = physics_cost + w_time * (duration / pulse.T_max) + tmax_penalty + power_penalty
     return cost, inversion, silencing, duration, coherence
 end
 
@@ -1899,38 +1907,51 @@ function _gradient_on_indices_val(f, u::AbstractVector, idxs::Vector{Int}, ::Val
 end
 
 """
-    _pulse_cost_grad_threaded(u, pulse, d; w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, compute=:auto, kwargs...)
+    _pulse_cost_grad_threaded(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, compute=:auto, kwargs...)
         -> (grad::Vector{Float64}, cost, inversion, silencing, duration, coherence)
 
 Task-parallel drop-in for `ForwardDiff.gradient(uu -> pulse_cost(uu, pulse,
 d; kwargs...)[1], u)` plus `pulse_cost`'s own aux outputs -- mathematically
 EXACT on the host (not an approximation), and never touches `ForwardDiff`'s
-own internal seeding/extraction machinery. Exploits that [`pulse_cost`](@ref)'s
-scalar `cost` is LITERALLY additively separable into three pieces that
-never share any ODE-solve state:
+own internal seeding/extraction machinery.
 
-    cost(u) = [-w_inv*inversion(u)]                             (the :ground-track solve, ALONE)
-            + [w_sil*(silencing(u)-target_F)^2]                 (the :equator-track solve, ALONE)
-            + [w_time*(duration(u)/T_max) + tmax_penalty(u) + power_penalty(u)]  (no ODE solve at all)
+Unlike an earlier, additive version of this cost, [`pulse_cost`](@ref)'s
+`physics_cost = (1 - inversion*silencing_success)^2` is NOT separable into
+independent per-track pieces -- it couples `inversion` and `silencing`
+multiplicatively. What IS still independent is the underlying ODE-solve
+Jacobians `∇inversion(u)` and `∇silencing(u)` themselves (one per track,
+each from its own `run_sim_1st_order_pure` solve with no shared state), so
+this function still dispatches those two `ForwardDiff.gradient` calls
+task-parallel exactly as before, then applies the closed-form chain rule
+for `physics_cost` ANALYTICALLY afterward, on the host, to combine
+`grad_I = ∇inversion` and `grad_F = ∇silencing` into `∇physics_cost`:
 
-so `∇cost = ∇[ground term] + ∇[equator term] + ∇[direct term]` EXACTLY, by
-linearity of differentiation -- each piece is handed to its own,
-completely ordinary `ForwardDiff.gradient` call, using ForwardDiff's own
-PUBLIC `GradientConfig`/`Chunk` API to force a single chunk of width
+    silencing_success = 1 - (silencing - target_F)^2
+    fidelity_phys     = inversion * silencing_success
+    grad_Ssucc        = -2*(silencing - target_F) * grad_F
+    ∇physics_cost     = -2*(1 - fidelity_phys) * (silencing_success*grad_I + inversion*grad_Ssucc)
+
+`∇cost = ∇physics_cost + ∇[direct term]` (the `w_time`/`tmax`/`power`
+pieces, which never touch either ODE solve and are still handed to their
+own ordinary `ForwardDiff.gradient` call). Uses ForwardDiff's own PUBLIC
+`GradientConfig`/`Chunk` API to force a single chunk of width
 `min(60, length(u))` instead of `ForwardDiff.pickchunksize`'s own default
 (capped at 12 regardless of `n`). With 1-8 functional CUDA devices the
 two ODE terms are pinned onto those devices (at most one Dual ODE in
 flight per GPU); extra devices beyond the two ICs split the parameter
-indices into disjoint blocks whose gradients sum to the full gradient.
-Host-only runs keep the original 2-way `Threads.@threads` schedule and
-are the path `test/runtests.jl` checks against serial ForwardDiff.
+indices into disjoint blocks whose gradients sum to the full per-track
+gradient. Host-only runs keep the original 2-way `Threads.@threads`
+schedule and are the path `test/runtests.jl` checks against serial
+ForwardDiff.
 
-`w_inv<=0`/`w_sil<=0` skip that track's ODE solve entirely (matching
-[`pulse_cost`](@ref)). A `PulseSolveFailed` on EITHER track reproduces
-`pulse_cost`'s failure contract: `(fill(NaN, n), Inf, NaN, NaN, duration, NaN)`.
+Both tracks are always solved -- there is no `w_inv`/`w_sil` skip any
+more (the multiplicative cost has no well-defined single-track reduction:
+dropping either track collapses `fidelity_phys` to 0 regardless of the
+other). A `PulseSolveFailed` on EITHER track reproduces `pulse_cost`'s
+failure contract: `(fill(NaN, n), Inf, NaN, NaN, duration, NaN)`.
 """
 function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
-                                    w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
+                                    target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                                     compute::Symbol=:auto, kwargs...)
     _forbid_initial_condition(kwargs)
     sk = _solver_kwargs(kwargs)
@@ -1966,8 +1987,8 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
     grad_direct = ForwardDiff.gradient(direct_only, u, ForwardDiff.GradientConfig(direct_only, u, chunk))
     direct_val = direct_only(u)
 
-    aux_ground = Ref{NTuple{2,Float64}}((0.0, 0.0))
-    aux_equator = Ref{NTuple{3,Float64}}((0.0, 0.0, 0.0))
+    aux_ground = Ref{Float64}(0.0)
+    aux_equator = Ref{NTuple{2,Float64}}((0.0, 0.0))
 
     if !use_gpu_pool
         grads = Vector{Vector{Float64}}(undef, 2)
@@ -1975,37 +1996,29 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
         Threads.@threads for i in 1:2
             try
                 if i == 1
-                    if w_inv > 0.0
-                        function ground_only(uu)
-                            _, _, Sz, Nj = run_sim_1st_order_pure(
-                                uu, pulse, d; compute=compute, sk..., initial_condition=:ground,
-                            )
-                            inv_ = _weighted_inversion(Sz, Nj, eltype(uu))
-                            val = -w_inv * inv_
-                            aux_ground[] = (Float64(ForwardDiff.value(val)), Float64(ForwardDiff.value(inv_)))
-                            return val
-                        end
-                        grads[1] = ForwardDiff.gradient(ground_only, u, ForwardDiff.GradientConfig(ground_only, u, chunk))
-                    else
-                        grads[1] = zeros(n)
+                    # Extract ∇inversion independently
+                    function ground_only(uu)
+                        _, _, Sz, Nj = run_sim_1st_order_pure(
+                            uu, pulse, d; compute=compute, sk..., initial_condition=:ground,
+                        )
+                        inv_ = _weighted_inversion(Sz, Nj, eltype(uu))
+                        aux_ground[] = Float64(ForwardDiff.value(inv_))
+                        return inv_
                     end
+                    grads[1] = ForwardDiff.gradient(ground_only, u, ForwardDiff.GradientConfig(ground_only, u, chunk))
                 else
-                    if w_sil > 0.0
-                        function equator_only(uu)
-                            _, Sp, _, Nj_eq = run_sim_1st_order_pure(
-                                uu, pulse, d; compute=compute, sk..., initial_condition=:equator,
-                            )
-                            Tu = eltype(uu)
-                            sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
-                            coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
-                            val = w_sil * (sil_ - convert(Tu, target_F))^2
-                            aux_equator[] = (Float64(ForwardDiff.value(val)), Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)))
-                            return val
-                        end
-                        grads[2] = ForwardDiff.gradient(equator_only, u, ForwardDiff.GradientConfig(equator_only, u, chunk))
-                    else
-                        grads[2] = zeros(n)
+                    # Extract ∇|F| independently
+                    function equator_only(uu)
+                        _, Sp, _, Nj_eq = run_sim_1st_order_pure(
+                            uu, pulse, d; compute=compute, sk..., initial_condition=:equator,
+                        )
+                        Tu = eltype(uu)
+                        sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
+                        coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
+                        aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)))
+                        return sil_
                     end
+                    grads[2] = ForwardDiff.gradient(equator_only, u, ForwardDiff.GradientConfig(equator_only, u, chunk))
                 end
             catch e
                 e isa PulseSolveFailed || rethrow()
@@ -2013,95 +2026,97 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
             end
         end
         any(failed) && return fill(NaN, n), Inf, NaN, NaN, duration, NaN
-        ground_val, inversion = aux_ground[]
-        equator_val, silencing, coherence = aux_equator[]
-        grad = grads[1] .+ grads[2] .+ grad_direct
-        cost = ground_val + equator_val + direct_val
-        return grad, cost, inversion, silencing, duration, coherence
-    end
 
-    n_ic = (w_inv > 0.0 ? 1 : 0) + (w_sil > 0.0 ? 1 : 0)
-    n_gpu = pulse_gpu_count()
-    n_chunks = n_ic == 0 ? 1 : max(1, n_gpu ÷ n_ic)
-    ranges = _split_index_ranges(n, n_chunks)
-    _log_pulse_compute_once(
-        "pulse gradient: $n_gpu GPU(s), $(n_ic) IC track(s) × $(length(ranges)) param-chunk(s) " *
-        "(M=$M, n_params=$n; start Julia with -t $n_gpu or more so device jobs overlap)"
-    )
+        inversion = aux_ground[]
+        silencing, coherence = aux_equator[]
+        grad_I = grads[1]
+        grad_F = grads[2]
 
-    jobs = NamedTuple[]
-    if w_inv > 0.0
+    else
+        n_ic = 2
+        n_gpu = pulse_gpu_count()
+        n_chunks = max(1, n_gpu ÷ n_ic)
+        ranges = _split_index_ranges(n, n_chunks)
+        _log_pulse_compute_once(
+            "pulse gradient: $n_gpu GPU(s), $(n_ic) IC track(s) × $(length(ranges)) param-chunk(s) " *
+            "(M=$M, n_params=$n; start Julia with -t $n_gpu or more so device jobs overlap)"
+        )
+
+        jobs = NamedTuple[]
         for r in ranges
             push!(jobs, (kind=:ground, idxs=collect(r)))
-        end
-    end
-    if w_sil > 0.0
-        for r in ranges
             push!(jobs, (kind=:equator, idxs=collect(r)))
         end
+
+        grad_I = zeros(n)
+        grad_F = zeros(n)
+        failed = Threads.Atomic{Bool}(false)
+        ground_lock = ReentrantLock()
+        equator_lock = ReentrantLock()
+
+        _run_pulse_jobs!(jobs, (job, _dev) -> begin
+            failed[] && return nothing
+            try
+                if job.kind === :ground
+                    function ground_gpu(uu)
+                        _, _, Sz, Nj = run_sim_1st_order_pure(
+                            uu, pulse, d; compute=:gpu, sk..., initial_condition=:ground,
+                        )
+                        inv_ = _weighted_inversion(Sz, Nj, eltype(uu))
+                        if first(job.idxs) == 1
+                            aux_ground[] = Float64(ForwardDiff.value(inv_))
+                        end
+                        return inv_
+                    end
+                    g = length(job.idxs) == n ?
+                        ForwardDiff.gradient(ground_gpu, u, ForwardDiff.GradientConfig(ground_gpu, u, chunk)) :
+                        _gradient_on_indices(ground_gpu, u, job.idxs)
+                    lock(ground_lock) do
+                        grad_I .+= g
+                    end
+                else
+                    function equator_gpu(uu)
+                        _, Sp, _, Nj_eq = run_sim_1st_order_pure(
+                            uu, pulse, d; compute=:gpu, sk..., initial_condition=:equator,
+                        )
+                        Tu = eltype(uu)
+                        sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
+                        coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
+                        if first(job.idxs) == 1
+                            aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)))
+                        end
+                        return sil_
+                    end
+                    g = length(job.idxs) == n ?
+                        ForwardDiff.gradient(equator_gpu, u, ForwardDiff.GradientConfig(equator_gpu, u, chunk)) :
+                        _gradient_on_indices(equator_gpu, u, job.idxs)
+                    lock(equator_lock) do
+                        grad_F .+= g
+                    end
+                end
+            catch e
+                e isa PulseSolveFailed || rethrow()
+                failed[] = true
+            end
+            return nothing
+        end)
+        _reclaim_gpu_memory()
+
+        failed[] && return fill(NaN, n), Inf, NaN, NaN, duration, NaN
+        inversion = aux_ground[]
+        silencing, coherence = aux_equator[]
     end
 
-    grad_ground = zeros(n)
-    grad_equator = zeros(n)
-    failed = Threads.Atomic{Bool}(false)
-    ground_lock = ReentrantLock()
-    equator_lock = ReentrantLock()
+    # Explicit analytical application of the non-linear chain rule coupling the two tracks
+    silencing_success = 1.0 - (silencing - target_F)^2
+    fidelity_phys = inversion * silencing_success
+    physics_cost = (1.0 - fidelity_phys)^2
 
-    _run_pulse_jobs!(jobs, (job, _dev) -> begin
-        failed[] && return nothing
-        try
-            if job.kind === :ground
-                function ground_only(uu)
-                    _, _, Sz, Nj = run_sim_1st_order_pure(
-                        uu, pulse, d; compute=:gpu, sk..., initial_condition=:ground,
-                    )
-                    inv_ = _weighted_inversion(Sz, Nj, eltype(uu))
-                    val = -w_inv * inv_
-                    if first(job.idxs) == 1
-                        aux_ground[] = (Float64(ForwardDiff.value(val)), Float64(ForwardDiff.value(inv_)))
-                    end
-                    return val
-                end
-                g = length(job.idxs) == n ?
-                    ForwardDiff.gradient(ground_only, u, ForwardDiff.GradientConfig(ground_only, u, chunk)) :
-                    _gradient_on_indices(ground_only, u, job.idxs)
-                lock(ground_lock) do
-                    grad_ground .+= g
-                end
-            else
-                function equator_only(uu)
-                    _, Sp, _, Nj_eq = run_sim_1st_order_pure(
-                        uu, pulse, d; compute=:gpu, sk..., initial_condition=:equator,
-                    )
-                    Tu = eltype(uu)
-                    sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
-                    coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
-                    val = w_sil * (sil_ - convert(Tu, target_F))^2
-                    if first(job.idxs) == 1
-                        aux_equator[] = (Float64(ForwardDiff.value(val)), Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)))
-                    end
-                    return val
-                end
-                g = length(job.idxs) == n ?
-                    ForwardDiff.gradient(equator_only, u, ForwardDiff.GradientConfig(equator_only, u, chunk)) :
-                    _gradient_on_indices(equator_only, u, job.idxs)
-                lock(equator_lock) do
-                    grad_equator .+= g
-                end
-            end
-        catch e
-            e isa PulseSolveFailed || rethrow()
-            failed[] = true
-        end
-        return nothing
-    end)
-    _reclaim_gpu_memory()
+    grad_S = -2.0 * (silencing - target_F) .* grad_F
+    grad_physics = -2.0 * (1.0 - fidelity_phys) .* (silencing_success .* grad_I .+ inversion .* grad_S)
 
-    failed[] && return fill(NaN, n), Inf, NaN, NaN, duration, NaN
-    ground_val, inversion = aux_ground[]
-    equator_val, silencing, coherence = aux_equator[]
-    grad = grad_ground .+ grad_equator .+ grad_direct
-    cost = ground_val + equator_val + direct_val
+    grad = grad_physics .+ grad_direct
+    cost = physics_cost + direct_val
     return grad, cost, inversion, silencing, duration, coherence
 end
 
@@ -2347,7 +2362,7 @@ end
         num_epochs=30, learning_rate=0.05, patience=5, tol=1e-3,
         n_hops=3, hop_patience=2, hop_step_size=0.5, temperature=1.0,
         degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
-        w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, seed=42,
+        target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, label_prefix="", threaded_grad=true, compute=:auto,
         grad_mode=:forwarddiff, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
@@ -2390,9 +2405,10 @@ budgets, not a converged global optimum.
 
 `degree` / `taper_frac` are forwarded to [`CompositePulse`](@ref) (defaults
 3 and 0.1, same as constructing the pulse by hand). `w_tmax`, `w_power`,
-`w_inv`, `w_sil`, `target_F`, and `w_time` are forwarded to
-[`pulse_cost`](@ref). Defaults keep both dual-trajectory weights on
-(`w_inv=1`, `w_sil=0.7`) targeting `target_F=1.0` (RASE-style revival;
+`target_F`, and `w_time` are forwarded to [`pulse_cost`](@ref); both
+dual-trajectory tracks are always solved (there is no `w_inv`/`w_sil`
+weight any more -- `pulse_cost`'s multiplicative `fidelity_phys` has no
+single-track reduction), targeting `target_F=1.0` (RASE-style revival;
 pass `target_F=0.0` for ROSE-style silencing instead). These are explicit
 keywords so they are NOT passed through to the ODE solver. Do not pass
 `initial_condition` — the cost fixes `:ground` and `:equator` itself.
@@ -2412,9 +2428,9 @@ that actually affected this run: `k`/`n_coeff_A`/`n_coeff_f`/`degree`/
 `taper_frac` plus every one of this function's own explicit keyword
 arguments (`num_epochs`, `learning_rate`, `patience`, `tol`, `n_hops`,
 `hop_patience`, `hop_step_size`, `temperature`, `w_tmax`, `w_power`,
-`w_inv`, `w_sil`, `target_F`, `w_time`, `seed`), plus
+`target_F`, `w_time`, `seed`), plus
 any of `solve_kwargs` whose value isn't a `Function` (so e.g. a numeric
-`reltol`/`abstol`/`w_inv`/`w_sil`/`w_time` override is captured, while a
+`reltol`/`abstol`/`target_F`/`w_time` override is captured, while a
 non-serialisable closure like `signal_E_of_t` is deliberately excluded --
 that one is captured separately, as `use_signal`/`n_signal`, by
 [`optimise_control_pulse_from_jld2`](@ref), since those two scalars are
@@ -2441,7 +2457,7 @@ function optimise_composite_pulse(
     num_epochs::Integer=30, learning_rate::Real=0.05, cf_lr_scale::Real=1.0, patience::Integer=5, tol::Real=1e-3,
     n_hops::Integer=3, hop_patience::Integer=2, hop_step_size::Real=0.5, temperature::Real=1.0,
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
-    w_inv::Real=1.0, w_sil::Real=0.7, target_F::Real=1.0, w_time::Real=0.15,
+    target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff, solve_kwargs...,
 )
@@ -2450,7 +2466,7 @@ function optimise_composite_pulse(
         "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
     )
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
-    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time)
+    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time)
     rng = Random.Xoshiro(seed)
 
     # threaded_grad/compute are deliberately kept OUT of solve_kwargs
@@ -2462,7 +2478,7 @@ function optimise_composite_pulse(
         (k=k, n_coeff_A=n_coeff_A, n_coeff_f=n_coeff_f, degree=degree, taper_frac=taper_frac,
          num_epochs=num_epochs, learning_rate=learning_rate, cf_lr_scale=cf_lr_scale, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
-         w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed,
+         w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
          threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count()),
         solve_settings,
     )

@@ -88,26 +88,28 @@ end
     Sz = randn(rng, ComplexF64, M)
     Sp = randn(rng, ComplexF64, M)
     nR = real_state_length_1st_order(M)
-    w_inv, w_sil, target_F = 1.3, 0.7, 0.4
 
+    # Pullbacks now seed the RAW ∂inversion/∂x, ∂silencing/∂x gradients
+    # (no w_inv/w_sil/target_F baked in -- pulse_cost's multiplicative
+    # fidelity couples the two tracks outside the pullback, see
+    # pulse_cost_grad_adjoint).
     λI = zeros(nR)
-    inversion_pullback!(λI, Sz, d.Nj, w_inv)
+    inversion_pullback!(λI, Sz, d.Nj)
     zr0 = real.(Sz)
     gI = ForwardDiff.gradient(zr -> begin
         SzD = complex.(zr, imag.(Sz))
-        -w_inv * _weighted_inversion(SzD, d.Nj, eltype(zr))
+        _weighted_inversion(SzD, d.Nj, eltype(zr))
     end, zr0)
     @test [λI[_real_idx_zr(j, M)] for j in 1:M] ≈ gI atol=1e-10
     @test all(λI[_real_idx_zi(j, M)] == 0 for j in 1:M)
     @test λI[1] == 0 && λI[2] == 0
 
     λS = zeros(nR)
-    silencing_pullback!(λS, Sp, d.g_b, d.Nj, w_sil, target_F)
+    silencing_pullback!(λS, Sp, d.g_b, d.Nj)
     spr = vcat(real.(Sp), imag.(Sp))
     gS = ForwardDiff.gradient(q -> begin
         SpD = complex.(q[1:M], q[M+1:2M])
-        sil = _weighted_silencing_factor(SpD, d.g_b, d.Nj, eltype(q))
-        w_sil * (sil - target_F)^2
+        _weighted_silencing_factor(SpD, d.g_b, d.Nj, eltype(q))
     end, spr)
     @test [λS[_real_idx_pr(j, M)] for j in 1:M] ≈ gS[1:M] atol=1e-10
     @test [λS[_real_idx_pi(j, M)] for j in 1:M] ≈ gS[M+1:2M] atol=1e-10
@@ -145,7 +147,7 @@ end
     u1 = tsit5_forced_step(u0, p, t, dt)
     _, _, Sz = unpack_state_1st_order_u(u1, M)
     λx = zeros(real_state_length_1st_order(M))
-    inversion_pullback!(λx, Sz, d.Nj, 1.0)
+    inversion_pullback!(λx, Sz, d.Nj)
     gθ = zeros(length(θ))
     ws = Tsit5DiscAdjWorkspace(M)
     tsit5_step_vjp!(copy(λx), gθ, λx, u0, t, dt, p, pulse, θ, ws)
@@ -155,7 +157,7 @@ end
         u0d = build_u0_1st_order_cpu(M, d.Nj, eltype(θθ), :ground)
         u1d = tsit5_forced_step(u0d, pd, t, dt)
         _, _, Szd = unpack_state_1st_order_u(u1d, M)
-        -_weighted_inversion(Szd, d.Nj, eltype(θθ))
+        _weighted_inversion(Szd, d.Nj, eltype(θθ))
     end, θ)
     @test all(isfinite, gθ)
     @test all(isfinite, g_dual)
@@ -183,7 +185,7 @@ end
     d = FAKE_D_ODE
     pulse = CompositePulse(1, 4, 4, d)
     θ = seed_canonical(pulse, :hs1)
-    cost_kw = (w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0)
+    cost_kw = (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0)
     g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw...)
     @test all(isfinite, g_adj)
     @test isfinite(cost_adj)
@@ -228,30 +230,16 @@ end
     d = FAKE_D_ODE
     pulse = CompositePulse(1, 4, 4, d)
     θ = seed_canonical(pulse, :hs1)
-    cost_kw = (w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0)
+    cost_kw = (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0)
     g_full, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., checkpoint_stride=typemax(Int))
     g_win, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., checkpoint_stride=2, use_checkpoints=true)
     @test g_win ≈ g_full atol=1e-10 rtol=1e-10
 end
 
-@testset "w_inv=0 / w_sil=0 skip tracks" begin
-    d = FAKE_D_ODE
-    pulse = CompositePulse(1, 4, 4, d)
-    θ = seed_canonical(pulse, :hs1)
-    skip_kw = (w_tmax=1.0, w_power=0.05, w_inv=0.0, w_sil=0.0, target_F=1.0, w_time=0.15)
-    g_adj, cost_a, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, d; skip_kw...)
-    g_fd = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, d; skip_kw...)[1], θ)
-    @test g_adj ≈ g_fd atol=1e-10 rtol=1e-10
-    @test inv_a == 0.0
-    @test sil_a == 0.0
-    @test coh_a == 0.0
-    @test cost_a ≈ pulse_cost(θ, pulse, d; skip_kw...)[1] atol=1e-12
-end
-
 @testset "run_local_adam grad_mode=:adjoint smoke" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
-    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_inv=1.0, w_sil=0.7, w_time=0.15)
+    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
     best_u, best_cost, _, _, _, history = run_local_adam(
         u0, pulse, FAKE_D_ODE, cost_kwargs;
         num_epochs=3, patience=3, learning_rate=0.05, label="[adj]",

@@ -928,8 +928,8 @@ convention [`load_jld2_run`](@ref) already reads):
     `learning_rate`, `patience`, `tol`, `n_hops`, `hop_patience`,
     `hop_step_size`, `temperature`, `w_tmax`, `seed`, `degree`,
     `taper_frac`, and any numeric
-    `solve_kwargs` override such as `reltol`/`abstol`/`w_inv`/`w_sil`/
-    `target_F`/`w_time`) -- see [`optimise_composite_pulse`](@ref)'s own
+    `solve_kwargs` override such as `reltol`/`abstol`/`target_F`/`w_time`)
+    -- see [`optimise_composite_pulse`](@ref)'s own
     docstring for exactly what it captures and why (and what it
     deliberately excludes, e.g. non-serialisable closures)
   - `benchmark_metrics` -- `(inversion, duration, silencing, coherence)` of

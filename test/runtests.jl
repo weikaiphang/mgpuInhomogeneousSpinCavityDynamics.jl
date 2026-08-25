@@ -225,7 +225,7 @@ end
 
 @testset "threaded gradient matches serial" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
-    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15)
+    cost_kwargs = (w_tmax=1.0, w_power=0.05, target_F=1.0, w_time=0.15)
 
     u0 = seed_canonical(pulse, :hs1)
     for seed in 1:3
@@ -240,19 +240,6 @@ end
         @test dur_t == dur_s
         @test coh_t == coh_s
     end
-
-    # w_inv<=0/w_sil<=0 skip that track's ODE solve entirely, matching
-    # pulse_cost's own exact behaviour -- verify the threaded path skips
-    # the same way and still matches serially.
-    skip_kwargs = (w_tmax=1.0, w_power=0.05, w_inv=0.0, w_sil=0.0, target_F=1.0, w_time=0.15)
-    g_serial0 = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; skip_kwargs...)[1], u0)
-    cost_s0, inv_s0, sil_s0, dur_s0, coh_s0 = pulse_cost(u0, pulse, FAKE_D_ODE; skip_kwargs...)
-    g_thr0, cost_t0, inv_t0, sil_t0, dur_t0, coh_t0 = _pulse_cost_grad_threaded(u0, pulse, FAKE_D_ODE; skip_kwargs...)
-    @test g_thr0 ≈ g_serial0 atol=1e-10 rtol=1e-10
-    @test cost_t0 ≈ cost_s0 atol=1e-12
-    @test inv_t0 == inv_s0 == 0.0
-    @test sil_t0 == sil_s0 == 0.0
-    @test coh_t0 == coh_s0 == 0.0
 
     # run_local_adam(threaded_grad=true) end-to-end smoke test -- must
     # behave like a normal run (finite cost, non-empty history), on the
@@ -270,7 +257,7 @@ end
 @testset "run_local_adam smoke (tiny budget, real ODE solves)" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
-    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_inv=1.0, w_sil=0.7, w_time=0.15)
+    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
     best_u, best_cost, best_inv, best_sil, best_dur, history = run_local_adam(
         u0, pulse, FAKE_D_ODE, cost_kwargs;
         num_epochs=3, patience=3, learning_rate=0.05, label="[test]",

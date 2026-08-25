@@ -359,8 +359,10 @@ end
     _extract_physics_cost(cost, u, pulse, w_power) -> Float64
 
 Strips [`pulse_cost`](@ref)'s L2 power penalty back out of an already-
-computed `cost`, returning `-w_inv*inversion + w_sil*(silencing-target_F)^2
-+ w_time*(duration/T_max) + tmax_penalty` alone. `power_penalty =
+computed `cost`, returning `physics_cost + w_time*(duration/T_max) +
+tmax_penalty` alone, where `physics_cost = (1 -
+inversion*silencing_success)^2` is `pulse_cost`'s multiplicative
+fidelity term. `power_penalty =
 w_power*sum(abs2, cA/amp_scale)/length(cA/amp_scale)` is a MEAN over
 `k*n_coeff_A` coefficients, so it is NOT k-invariant: splicing in a
 near-zero-amplitude sub-pulse dilutes that mean and lowers `power_penalty`
@@ -400,7 +402,7 @@ end
         num_epochs=30, learning_rate=0.05, patience=5, tol=1e-3,
         n_hops=3, hop_patience=2, hop_step_size=0.5, temperature=1.0,
         degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
-        w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, seed=42,
+        target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, label_prefix="", solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
@@ -464,12 +466,13 @@ budgets, not a converged global optimum.
 
 `degree` / `taper_frac` are forwarded to [`CompositePulse`](@ref) (defaults
 3 and 0.1, same as constructing the pulse by hand). `w_tmax`, `w_power`,
-`w_inv`, `w_sil`, `target_F`, and `w_time` are forwarded to
-[`pulse_cost`](@ref). Defaults keep both dual-trajectory weights on
-(`w_inv=1`, `w_sil=0.7`) targeting `target_F=1.0` (RASE-style revival;
-pass `target_F=0.0` for ROSE-style silencing instead). These are explicit
-keywords so they are NOT passed through to the ODE solver. Do not pass
-`initial_condition` — the cost fixes `:ground` and `:equator` itself.
+`target_F`, and `w_time` are forwarded to [`pulse_cost`](@ref); both
+dual-trajectory tracks are always solved (`pulse_cost`'s multiplicative
+`fidelity_phys` has no `w_inv`/`w_sil` weight any more), targeting
+`target_F=1.0` (RASE-style revival; pass `target_F=0.0` for ROSE-style
+silencing instead). These are explicit keywords so they are NOT passed
+through to the ODE solver. Do not pass `initial_condition` — the cost
+fixes `:ground` and `:equator` itself.
 
 Besides the optimised `(best_u, best_cost, pulse)` -- `pulse` here is the
 `CompositePulse` matching `best_u`'s OWN `k`, which (unlike the fixed-k
@@ -495,9 +498,9 @@ that actually affected this run: `k`/`n_coeff_A`/`n_coeff_f`/`degree`/
 `taper_frac` plus every one of this function's own explicit keyword
 arguments (`num_epochs`, `learning_rate`, `patience`, `tol`, `n_hops`,
 `hop_patience`, `hop_step_size`, `temperature`, `w_tmax`, `w_power`,
-`w_inv`, `w_sil`, `target_F`, `w_time`, `seed`), plus
+`target_F`, `w_time`, `seed`), plus
 any of `solve_kwargs` whose value isn't a `Function` (so e.g. a numeric
-`reltol`/`abstol`/`w_inv`/`w_sil`/`w_time` override is captured, while a
+`reltol`/`abstol`/`target_F`/`w_time` override is captured, while a
 non-serialisable closure like `signal_E_of_t` is deliberately excluded --
 that one is captured separately, as `use_signal`/`n_signal`, by
 [`optimise_control_pulse_from_jld2`](@ref), since those two scalars are
@@ -520,12 +523,12 @@ function optimise_composite_pulse_rjmcmc(
     num_epochs::Integer=30, learning_rate::Real=0.05, patience::Integer=5, tol::Real=1e-3,
     n_hops::Integer=3, hop_patience::Integer=2, hop_step_size::Real=0.5, temperature::Real=1.0,
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
-    w_inv::Real=1.0, w_sil::Real=0.7, target_F::Real=1.0, w_time::Real=0.15,
+    target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="", solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
-    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time)
+    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time)
     rng = Random.Xoshiro(seed)
 
     solve_settings = NamedTuple(kv for kv in pairs(solve_kwargs) if !(kv[2] isa Function))
@@ -533,7 +536,7 @@ function optimise_composite_pulse_rjmcmc(
         (k=k, n_coeff_A=n_coeff_A, n_coeff_f=n_coeff_f, degree=degree, taper_frac=taper_frac,
          num_epochs=num_epochs, learning_rate=learning_rate, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
-         w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed),
+         w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed),
         solve_settings,
     )
 

@@ -6,14 +6,27 @@
 # signal_E_of_t is not differentiated (same contract as Dual).
 # ============================================================
 
-function inversion_pullback!(λx::AbstractVector, Sz::AbstractVector, Nj::AbstractVector, w_inv::Real)
+"""
+    inversion_pullback!(λx, Sz, Nj)
+
+Seeds `λx` with the RAW `∂inversion/∂Re(Sz_j)` gradient (i.e. the pullback
+of [`_weighted_inversion`](@ref) alone, coefficient `+1` -- NOT weighted by
+any `w_inv`, and not the pullback of a `cost` that also depends on
+`silencing`). [`pulse_cost`](@ref)'s `physics_cost = (1 -
+inversion*silencing_success)^2` couples the two dual-trajectory tracks
+multiplicatively, so it has no well-defined single-track cost gradient any
+more; [`pulse_cost_grad_adjoint`](@ref) combines this RAW `∇inversion`
+with [`silencing_pullback!`](@ref)'s RAW `∇silencing` via the same
+analytical chain rule [`_pulse_cost_grad_threaded`](@ref) uses, only AFTER
+both tracks' adjoint sweeps have produced their own independent Jacobian.
+"""
+function inversion_pullback!(λx::AbstractVector, Sz::AbstractVector, Nj::AbstractVector)
     M = length(Nj)
     length(Sz) == M || error("inversion_pullback!: Sz length $(length(Sz)) != Nj length $M.")
     length(λx) == real_state_length_1st_order(M) || error(
         "inversion_pullback!: λx length $(length(λx)) != $(real_state_length_1st_order(M))."
     )
     fill!(λx, 0)
-    w_inv == 0 && return λx
     wsum = sum(Nj)
     @inbounds for j in 1:M
         den = Nj[j] / 2 + 1e-30
@@ -22,14 +35,24 @@ function inversion_pullback!(λx::AbstractVector, Sz::AbstractVector, Nj::Abstra
         # clamp(s,0,1) Dual derivative: 1 on [0,1], 0 strictly outside.
         ds = (0 <= s <= 1) ? 1.0 : 0.0
         wj = Nj[j] / wsum
-        # cost = -w_inv * I,  dI/dRe(Sz_j) = wj * ds * (1/2) / den
-        λx[_real_idx_zr(j, M)] = -Float64(w_inv) * wj * ds * (0.5 / den)
+        # I = sum(wj * s),  dI/dRe(Sz_j) = wj * ds * (1/2) / den
+        λx[_real_idx_zr(j, M)] = wj * ds * (0.5 / den)
     end
     return λx
 end
 
+"""
+    silencing_pullback!(λx, Sp, g_b, Nj)
+
+Seeds `λx` with the RAW `∂silencing/∂Re(Sp_j)`/`∂silencing/∂Im(Sp_j)`
+gradient (the pullback of [`_weighted_silencing_factor`](@ref) alone,
+`|F|` itself -- NOT a `w_sil*(silencing-target_F)^2` cost term). See
+[`inversion_pullback!`](@ref)'s docstring for why the combining weight/
+`target_F` chain-rule factor now lives in [`pulse_cost_grad_adjoint`](@ref)
+instead of here.
+"""
 function silencing_pullback!(λx::AbstractVector, Sp::AbstractVector, g_b::AbstractVector,
-                             Nj::AbstractVector, w_sil::Real, target_F::Real)
+                             Nj::AbstractVector)
     M = length(Nj)
     length(Sp) == length(g_b) == M || error(
         "silencing_pullback!: Sp/g_b/Nj lengths $(length(Sp))/$(length(g_b))/$(length(Nj)) must match."
@@ -38,7 +61,6 @@ function silencing_pullback!(λx::AbstractVector, Sp::AbstractVector, g_b::Abstr
         "silencing_pullback!: λx length $(length(λx)) != $(real_state_length_1st_order(M))."
     )
     fill!(λx, 0)
-    w_sil == 0 && return λx
     weight = Nj .* abs2.(g_b)
     den = sum(weight .* Nj) / 2 + 1e-30
     Fr = 0.0
@@ -50,10 +72,9 @@ function silencing_pullback!(λx::AbstractVector, Sp::AbstractVector, g_b::Abstr
     Fr /= den
     Fi /= den
     abs_F = sqrt(Fr * Fr + Fi * Fi + 1e-30)
-    sil = abs_F < 0 ? 0.0 : (abs_F > 1 ? 1.0 : abs_F)
     dsil = (0 <= abs_F <= 1) ? 1.0 : 0.0
-    dcost_dsil = 2 * Float64(w_sil) * (sil - Float64(target_F))
-    scale = dcost_dsil * dsil / abs_F
+    # silencing = clamp(abs_F, 0, 1), dsilencing/dRe(Sp_j) = dsil * (Fr/abs_F) * weight[j]/den
+    scale = dsil / abs_F
     @inbounds for j in 1:M
         wj_den = weight[j] / den
         λx[_real_idx_pr(j, M)] = scale * Fr * wj_den
@@ -173,7 +194,9 @@ end
 
 Test-facing primal: replay each track's frozen `dt` sequence with Φ
 (`tsit5_forced_step`) and score the same scalar as [`pulse_cost`](@ref).
-`mesh_*` may be `nothing` when that weight is zero.
+Both `mesh_ground` and `mesh_equator` are always required now: the
+multiplicative `fidelity_phys = inversion*silencing_success` has no
+well-defined value with either track missing.
 """
 function pulse_cost_on_frozen_mesh(
     u::AbstractVector,
@@ -181,8 +204,6 @@ function pulse_cost_on_frozen_mesh(
     d,
     mesh_ground,
     mesh_equator;
-    w_inv=1.0,
-    w_sil=0.7,
     target_F=1.0,
     w_time=0.15,
     w_power=0.05,
@@ -193,26 +214,25 @@ function pulse_cost_on_frozen_mesh(
     E_of_t = _control_plus_signal_E(pulse, u, signal_E_of_t)
     p = _host_ode_p(d, E_of_t)
     duration = pulse_duration(pulse, u)
-    inversion = zero(T)
-    silencing = zero(T)
-    coherence = zero(T)
-    if w_inv > 0.0
-        mesh_ground === nothing && error("pulse_cost_on_frozen_mesh: ground mesh required when w_inv>0.")
-        u0 = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :ground)
-        us = replay_tsit5_window(u0, p, mesh_ground.t[1], mesh_ground.dt)
-        _, _, Sz = unpack_state_1st_order_u(us[end], Int(d.M))
-        inversion = _weighted_inversion(Sz, d.Nj, T)
-    end
-    if w_sil > 0.0
-        mesh_equator === nothing && error("pulse_cost_on_frozen_mesh: equator mesh required when w_sil>0.")
-        u0 = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :equator)
-        us = replay_tsit5_window(u0, p, mesh_equator.t[1], mesh_equator.dt)
-        _, Sp, _ = unpack_state_1st_order_u(us[end], Int(d.M))
-        silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, T)
-        coherence = _weighted_coherence(Sp, d.Nj, T)
-    end
+
+    mesh_ground === nothing && error("pulse_cost_on_frozen_mesh: ground mesh required.")
+    u0g = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :ground)
+    usg = replay_tsit5_window(u0g, p, mesh_ground.t[1], mesh_ground.dt)
+    _, _, Sz = unpack_state_1st_order_u(usg[end], Int(d.M))
+    inversion = _weighted_inversion(Sz, d.Nj, T)
+
+    mesh_equator === nothing && error("pulse_cost_on_frozen_mesh: equator mesh required.")
+    u0e = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :equator)
+    use = replay_tsit5_window(u0e, p, mesh_equator.t[1], mesh_equator.dt)
+    _, Sp, _ = unpack_state_1st_order_u(use[end], Int(d.M))
+    silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, T)
+    coherence = _weighted_coherence(Sp, d.Nj, T)
+
     direct = _direct_cost_term(u, pulse, w_time, w_power, w_tmax)
-    cost = -w_inv * inversion + w_sil * (silencing - convert(T, target_F))^2 + direct
+    silencing_success = one(T) - (silencing - convert(T, target_F))^2
+    fidelity_phys = inversion * silencing_success
+    physics_cost = (one(T) - fidelity_phys)^2
+    cost = physics_cost + direct
     return cost, inversion, silencing, duration, coherence
 end
 
@@ -226,13 +246,22 @@ replacement. `signal_E_of_t` is not differentiated. CPU reverse.
 `checkpoint_stride=typemax(Int)` (default) reverses on the stored
 adaptive snapshots; a finite stride uses windowed Φ-replay from host
 checkpoints (same gradient when L1 replay matches the stored mesh).
+
+Both tracks are always run (see [`inversion_pullback!`](@ref)/
+[`silencing_pullback!`](@ref)'s docstrings): each adjoint sweep seeds
+`λx` with the RAW `∂inversion/∂x`/`∂silencing/∂x` pullback (coefficient
+`+1`, no `target_F`/weight baked in), producing `grad_I = ∇inversion(u)`
+and `grad_F = ∇silencing(u)` -- the same two Jacobians
+[`_pulse_cost_grad_threaded`](@ref) computes via Dual ODEs. This function
+then applies the IDENTICAL analytical chain rule that function uses to
+combine them into `∇physics_cost`, so `pulse_cost_grad_adjoint` and
+`_pulse_cost_grad_threaded` are adjoints of the exact same scalar
+[`pulse_cost`](@ref), just via two different ODE-sensitivity backends.
 """
 function pulse_cost_grad_adjoint(
     u::AbstractVector,
     pulse::CompositePulse,
     d;
-    w_inv=1.0,
-    w_sil=0.7,
     target_F=1.0,
     w_time=0.15,
     w_power=0.05,
@@ -262,42 +291,35 @@ function pulse_cost_grad_adjoint(
 
     chunk = ForwardDiff.Chunk{min(60, n)}()
     direct_only(uu) = _direct_cost_term(uu, pulse, w_time, w_power, w_tmax)
-    grad = ForwardDiff.gradient(direct_only, uθ, ForwardDiff.GradientConfig(direct_only, uθ, chunk))
+    grad_direct = ForwardDiff.gradient(direct_only, uθ, ForwardDiff.GradientConfig(direct_only, uθ, chunk))
     direct_val = direct_only(uθ)
 
-    inversion = 0.0
-    silencing = 0.0
-    coherence = 0.0
     compute_eff = compute
     compute_eff === :auto && (compute_eff = :cpu)
     compute_eff === :gpu && @warn "pulse_cost_grad_adjoint v1 reverses on CPU; ignoring compute=:gpu"
 
+    local inversion, silencing, coherence, grad_I, grad_F
     try
-        if w_inv > 0.0
-            function pb_inv!(λx, a, Sp, Sz)
-                inversion_pullback!(λx, Sz, d.Nj, w_inv)
-                return λx
-            end
-            g_g, _, _, Sz, _, _ = _adjoint_one_track(
-                uθ, pulse, d, :ground, pb_inv!,
-                reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
-            )
-            inversion = Float64(_weighted_inversion(Sz, d.Nj, Float64))
-            grad .+= g_g
+        function pb_inv!(λx, a, Sp, Sz)
+            inversion_pullback!(λx, Sz, d.Nj)
+            return λx
         end
-        if w_sil > 0.0
-            function pb_sil!(λx, a, Sp, Sz)
-                silencing_pullback!(λx, Sp, d.g_b, d.Nj, w_sil, target_F)
-                return λx
-            end
-            g_e, _, Sp, _, _, _ = _adjoint_one_track(
-                uθ, pulse, d, :equator, pb_sil!,
-                reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
-            )
-            silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, Float64))
-            coherence = Float64(_weighted_coherence(Sp, d.Nj, Float64))
-            grad .+= g_e
+        grad_I, _, _, Sz, _, _ = _adjoint_one_track(
+            uθ, pulse, d, :ground, pb_inv!,
+            reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+        )
+        inversion = Float64(_weighted_inversion(Sz, d.Nj, Float64))
+
+        function pb_sil!(λx, a, Sp, Sz)
+            silencing_pullback!(λx, Sp, d.g_b, d.Nj)
+            return λx
         end
+        grad_F, _, Sp, _, _, _ = _adjoint_one_track(
+            uθ, pulse, d, :equator, pb_sil!,
+            reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+        )
+        silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, Float64))
+        coherence = Float64(_weighted_coherence(Sp, d.Nj, Float64))
     catch e
         e isa PulseSolveFailed || rethrow()
         GC.gc(false)
@@ -305,6 +327,18 @@ function pulse_cost_grad_adjoint(
     end
 
     GC.gc(false)
-    cost = -w_inv * inversion + w_sil * (silencing - Float64(target_F))^2 + direct_val
+
+    # Same analytical chain rule as _pulse_cost_grad_threaded: the raw
+    # per-track Jacobians grad_I/grad_F combine through physics_cost's
+    # multiplicative coupling here, not inside either pullback.
+    silencing_success = 1.0 - (silencing - Float64(target_F))^2
+    fidelity_phys = inversion * silencing_success
+    physics_cost = (1.0 - fidelity_phys)^2
+
+    grad_S = -2.0 * (silencing - Float64(target_F)) .* grad_F
+    grad_physics = -2.0 * (1.0 - fidelity_phys) .* (silencing_success .* grad_I .+ inversion .* grad_S)
+
+    grad = grad_physics .+ grad_direct
+    cost = physics_cost + direct_val
     return grad, cost, inversion, silencing, duration, coherence
 end
