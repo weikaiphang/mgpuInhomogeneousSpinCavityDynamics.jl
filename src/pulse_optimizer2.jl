@@ -506,7 +506,7 @@ end
 
 function _solver_kwargs(kwargs)
     nt = NamedTuple(kwargs)
-    for k in (:compute, :threaded_grad)
+    for k in (:compute, :threaded_grad, :grad_mode, :checkpoint_stride, :use_checkpoints)
         nt = haskey(nt, k) ? Base.structdiff(nt, NamedTuple{(k,)}) : nt
     end
     return nt
@@ -2139,6 +2139,13 @@ shape). `coherence` is [`pulse_cost`](@ref)'s DIAGNOSTIC-ONLY per-bin
 [`_weighted_coherence`](@ref)) -- recorded for comparison alongside the
 collective `|F|` actually being optimised, never part of `cost` itself.
 
+`grad_mode` (default `:forwarddiff`) selects the ODE gradient. `:forwarddiff`
+is the production Dual-Tsit5 path (`threaded_grad` applies here only).
+`:adjoint` uses [`pulse_cost_grad_adjoint`](@ref)'s frozen-mesh discrete
+Tsit5 VJP instead — a different derivative object than Dual-Tsit5;
+`threaded_grad` is ignored for that mode. Do not pass `:adjoint` unless
+you explicitly want that object.
+
 `cf_lr_scale` (default `1.0`, i.e. no change from the original uniform-`lr`
 behaviour) multiplies the effective step size for the CHIRP/frequency
 coefficients (`raw_cf`) only -- `gap`/`duration`/`phi0`/`cA` always step at
@@ -2166,8 +2173,12 @@ large-swing) epoch-to-epoch behaviour as the signal that a smaller
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
                          learning_rate::Real=0.05, cf_lr_scale::Real=1.0, label::AbstractString="",
-                         threaded_grad::Bool=false, compute::Symbol=:auto, solve_kwargs...)
+                         threaded_grad::Bool=false, compute::Symbol=:auto,
+                         grad_mode::Symbol=:forwarddiff, solve_kwargs...)
     _forbid_initial_condition(solve_kwargs)
+    (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
+        "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
+    )
     u = copy(u_start)
     n = length(u)
     adam = AdamState(n)
@@ -2219,6 +2230,10 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
             adam.m .= adam_m0
             adam.v .= adam_v0
             adam.t = adam_t0
+        elseif grad_mode === :adjoint
+            grad, cost, inv_, sil_, dur_, coh_ = pulse_cost_grad_adjoint(
+                u, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...,
+            )
         elseif threaded_grad
             grad, cost, inv_, sil_, dur_, coh_ = _pulse_cost_grad_threaded(
                 u, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...,
@@ -2293,7 +2308,8 @@ end
         n_hops=3, hop_patience=2, hop_step_size=0.5, temperature=1.0,
         degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
         w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, seed=42,
-        warm_start_u=nothing, label_prefix="", threaded_grad=true, compute=:auto, solve_kwargs...)
+        warm_start_u=nothing, label_prefix="", threaded_grad=true, compute=:auto,
+        grad_mode=:forwarddiff, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Basin-hopping global search over composite-pulse solutions for THIS
@@ -2387,9 +2403,12 @@ function optimise_composite_pulse(
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
     w_inv::Real=1.0, w_sil::Real=0.7, target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
-    threaded_grad::Bool=true, compute::Symbol=:auto, solve_kwargs...,
+    threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff, solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
+    (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
+        "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
+    )
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
     cost_kwargs = (w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time)
     rng = Random.Xoshiro(seed)
@@ -2404,7 +2423,7 @@ function optimise_composite_pulse(
          num_epochs=num_epochs, learning_rate=learning_rate, cf_lr_scale=cf_lr_scale, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed,
-         threaded_grad=threaded_grad, compute=compute, n_gpus=pulse_gpu_count()),
+         threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count()),
         solve_settings,
     )
 
@@ -2429,7 +2448,8 @@ function optimise_composite_pulse(
 
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
-        label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, compute=compute, solve_kwargs...
+        label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, compute=compute,
+        grad_mode=grad_mode, solve_kwargs...
     )
     append!(history, hop0_history)
     global_best_u, global_best_cost = current_u, current_cost
@@ -2442,7 +2462,8 @@ function optimise_composite_pulse(
         cand_u, cand_cost, _, _, _, hop_history = run_local_adam(
             candidate_u0, pulse, d, cost_kwargs;
             hop, num_epochs, patience, tol, learning_rate, cf_lr_scale,
-            label="$(label_prefix)[hop $hop]", threaded_grad=threaded_grad, compute=compute, solve_kwargs...,
+            label="$(label_prefix)[hop $hop]", threaded_grad=threaded_grad, compute=compute,
+            grad_mode=grad_mode, solve_kwargs...,
         )
         append!(history, hop_history)
 

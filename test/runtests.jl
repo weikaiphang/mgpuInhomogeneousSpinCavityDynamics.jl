@@ -10,7 +10,10 @@ include(joinpath(@__DIR__, "..", "src", "composite_pulse.jl"))
 include(joinpath(@__DIR__, "..", "src", "canon_pulses.jl"))
 include(joinpath(@__DIR__, "..", "src", "state_layout_1st_order.jl"))
 include(joinpath(@__DIR__, "..", "src", "rhs_1st_order.jl"))
+include(joinpath(@__DIR__, "..", "src", "rhs_1st_order_real.jl"))
 include(joinpath(@__DIR__, "..", "src", "pulse_optimizer2.jl"))
+include(joinpath(@__DIR__, "..", "src", "tsit5_discrete_adjoint.jl"))
+include(joinpath(@__DIR__, "..", "src", "pulse_adjoint.jl"))
 
 const FAKE_D = (
     timespan=(0.0, 1e-4),
@@ -280,4 +283,6 @@ end
         u0, pulse, FAKE_D_ODE, cost_kwargs; initial_condition=:ground
     )
 end
+
+include(joinpath(@__DIR__, "adjoint.jl"))
 
