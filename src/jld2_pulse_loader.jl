@@ -134,16 +134,19 @@ function _segment_matched_seed_init(control_cfg, pulse::CompositePulse)
         gap = max(t_start - t_prev_end, pulse.gap_scale * 1e-3)
         dur_arg = max(duration - pulse.dur_floor, pulse.dur_scale * 1e-3)
 
-        raw_gap[i] = _softplus_inv(gap / pulse.gap_scale)
-        raw_dur[i] = _softplus_inv(dur_arg / pulse.dur_scale)
+        raw_gap[i] = _encode_scaled_softplus(gap, pulse.gap_scale)
+        raw_dur[i] = _encode_scaled_softplus(dur_arg, pulse.dur_scale)
 
         amp = hasproperty(cfg, :amp) ? Float64(cfg.amp) : pulse.amp_scale
-        raw_cA[:, i] .= _softplus_inv(max(amp, 1e-30) / pulse.amp_scale)
+        raw_cA[:, i] .= _encode_scaled_softplus(amp, pulse.amp_scale)
 
         if hasproperty(cfg, :bandwidth)
             bw = Float64(cfg.bandwidth)
             chirp_sign = hasproperty(cfg, :chirp_sign) ? Float64(cfg.chirp_sign) : 1.0
-            raw_cf[:, i] .= chirp_sign .* range(-bw / 2, bw / 2; length=pulse.n_coeff_f) ./ pulse.freq_scale
+            raw_cf[:, i] .= _clip_cf_raw(
+                collect(chirp_sign .* range(-bw / 2, bw / 2; length=pulse.n_coeff_f) ./ pulse.freq_scale),
+                20.0,
+            )
         else
             raw_cf[:, i] .= 0.0
         end
@@ -204,10 +207,15 @@ segment list" step behind every seed-fitting entry point in this file that
 starts from `control_cfg` rather than an already-sampled trace.
 """
 function _sample_control_cfg(control_cfg, d, N_samples::Integer)
+    N_samples >= 2 || error("_sample_control_cfg: N_samples must be >= 2, got $N_samples.")
     E_target = build_E_of_t(control_cfg)
     T_max = d.timespan[2] - d.timespan[1]
     Ex, Ep = sample_E_of_t(E_target, T_max, N_samples)
+    length(Ex) == N_samples && length(Ep) == N_samples || error(
+        "_sample_control_cfg: sample_E_of_t returned lengths $(length(Ex))/$(length(Ep)), expected $N_samples."
+    )
     t = collect(range(0.0, T_max; length=N_samples))
+    length(t) == N_samples || error("_sample_control_cfg: t length $(length(t)) != N_samples=$N_samples.")
     return t, Ex, Ep
 end
 
@@ -272,6 +280,7 @@ function _load_reference_trace(source::AbstractString; load_mode::Symbol=:jld2, 
 
         t_end, Ex, Ep = load_E_samples(pulsemat_path)
         N = length(Ex)
+        length(Ep) == N || error("_load_reference_trace: I/Q length mismatch $(N)/$(length(Ep)).")
         t = collect(range(0.0, t_end; length=N))
 
         data = load_jld2_run(jld2_path)
@@ -511,16 +520,12 @@ caller would use rather than just checking the in-memory arrays
 (source_pulsemat=..., source_jld2=..., fitparas=..., fitpulsemat=...,
 fitsamplediff=...)`.
 
-Do not be surprised to see `diff_report.rel_l2` stay large (tens of
-percent) even when `fit_report.phi_rms_rad` reports an excellent
-per-sub-pulse phase SHAPE fit -- see
-[`_fit_composite_pulse_from_samples_linear`](@ref)'s own "KNOWN LIMITATION"
-paragraph: `CompositePulse` has no parameter for a sub-pulse's ABSOLUTE
-phase reference (sub-pulse 1 always reconstructs starting at phase `0`),
-so a real trace whose own recorded phase at that instant is not
-numerically `0` reconstructs rotated by that difference -- a real,
-currently-unfixed gap in `CompositePulse`/`build_E_of_t`, not a bug in
-this smoke test or in the fit.
+Do not be surprised to see a large `diff_report.rel_l2` only when the
+source trace is a genuinely different functional family from a clamped
+B-spline (WURST `tanh`/`sin^n`/quadratic chirp vs this seed) -- the
+per-sub-pulse absolute phase is now a `CompositePulse` parameter
+(`raw_phi0`, recovered by the `:linear` fitter), so a recorded phase
+offset at sub-pulse 1 is no longer an unfixable reconstruction rotation.
 """
 function smoke_test_fit_from_pulsemat(
     pulsemat_path::AbstractString;
@@ -637,24 +642,21 @@ function run_sim_1st_order_trajectory(
     E_of_t, d;
     initial_condition::Symbol=:ground, alg=Tsit5(),
     reltol=1e-8, abstol=1e-8, tstops=Float64[],
+    compute::Symbol=:auto,
 )
-    M = d.M
+    M = _assert_ensemble_shapes(d)
+    hasproperty(d, :t_save) || error("run_sim_1st_order_trajectory: derived ensemble `d` is missing t_save.")
+    compute_eff = _resolve_compute(compute, M)
     u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
-    p = (d.delta0, d.kappa_e, d.kappa_i, d.delta_b, d.g_b, M, E_of_t)
-    prob = ODEProblem(rhs_1st_order!, u0, d.timespan, p)
-    sol = solve(prob, alg; reltol=reltol, abstol=abstol, saveat=d.t_save, tstops=tstops)
-
-    Nt = length(sol.t)
-    a = Vector{ComplexF64}(undef, Nt)
-    Sp = Matrix{ComplexF64}(undef, Nt, M)
-    Sz = Matrix{ComplexF64}(undef, Nt, M)
-    @inbounds for i in 1:Nt
-        ai, Spi, Szi = unpack_state_1st_order_u(sol.u[i], M)
-        a[i] = ai
-        Sp[i, :] .= Spi
-        Sz[i, :] .= Szi
-    end
-    return sol.t, a, Sp, Sz
+    t, a, Sp, Sz = _run_sim_1st_order_from_u0(
+        u0, E_of_t, d;
+        alg=alg, reltol=reltol, abstol=abstol, tstops=tstops,
+        save_mode=:trajectory, t_save=d.t_save, compute=compute_eff,
+    )
+    size(Sp) == (length(t), M) && size(Sz) == (length(t), M) || error(
+        "run_sim_1st_order_trajectory: Sp/Sz shapes $(size(Sp))/$(size(Sz)) != ($((length(t), M)))."
+    )
+    return t, a, Sp, Sz
 end
 
 """
@@ -695,16 +697,17 @@ function run_sim_1st_order_final(
     E_of_t, d;
     initial_condition::Symbol=:ground, alg=Tsit5(),
     reltol=1e-8, abstol=1e-8, tstops=Float64[],
+    compute::Symbol=:auto,
 )
-    M = d.M
+    M = _assert_ensemble_shapes(d)
+    compute_eff = _resolve_compute(compute, M)
     u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
-    p = (d.delta0, d.kappa_e, d.kappa_i, d.delta_b, d.g_b, M, E_of_t)
-    prob = ODEProblem(rhs_1st_order!, u0, d.timespan, p)
-    sol = solve(
-        prob, alg; reltol=reltol, abstol=abstol, tstops=tstops,
-        save_everystep=false, save_start=false,
+    a, Sp, Sz = _run_sim_1st_order_from_u0(
+        u0, E_of_t, d;
+        alg=alg, reltol=reltol, abstol=abstol, tstops=tstops,
+        save_mode=:final, compute=compute_eff,
     )
-    return unpack_state_1st_order_u(sol.u[end], M)
+    return a, Sp, Sz
 end
 
 """

@@ -263,16 +263,49 @@ function unpack(pulse::CompositePulse, u::AbstractVector)
     )
     k = pulse.k
     nA = k * pulse.n_coeff_A
+    nf = k * pulse.n_coeff_f
+    length(u) == 3k + nA + nf || error(
+        "unpack: internal n_params mismatch (length(u)=$(length(u)), 3k+nA+nf=$(3k+nA+nf))."
+    )
     raw_gap = u[1:k]
     raw_dur = u[k+1:2k]
     raw_phi0 = u[2k+1:3k]
     raw_cA = reshape(u[3k+1:3k+nA], pulse.n_coeff_A, k)
-    raw_cf = reshape(u[3k+nA+1:end], pulse.n_coeff_f, k)
+    raw_cf = reshape(u[3k+nA+1:3k+nA+nf], pulse.n_coeff_f, k)
+    size(raw_cA) == (pulse.n_coeff_A, k) || error(
+        "unpack: raw_cA size $(size(raw_cA)) != ($(pulse.n_coeff_A), $k)."
+    )
+    size(raw_cf) == (pulse.n_coeff_f, k) || error(
+        "unpack: raw_cf size $(size(raw_cf)) != ($(pulse.n_coeff_f), $k)."
+    )
     return raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf
 end
 
-function pack(::CompositePulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
-    return vcat(vec(raw_gap), vec(raw_dur), vec(raw_phi0), vec(raw_cA), vec(raw_cf))
+function _coeff_len(raw, n_coeff::Integer, k::Integer, name::AbstractString)
+    if raw isa AbstractMatrix
+        size(raw) == (n_coeff, k) || error(
+            "pack: $name size $(size(raw)) != ($n_coeff, $k)."
+        )
+        return n_coeff * k
+    end
+    length(raw) == n_coeff * k || error(
+        "pack: $name has length $(length(raw)), expected $n_coeff×$k = $(n_coeff * k)."
+    )
+    return length(raw)
+end
+
+function pack(pulse::CompositePulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
+    k = pulse.k
+    length(raw_gap) == k || error("pack: raw_gap length $(length(raw_gap)) != k=$k.")
+    length(raw_dur) == k || error("pack: raw_dur length $(length(raw_dur)) != k=$k.")
+    length(raw_phi0) == k || error("pack: raw_phi0 length $(length(raw_phi0)) != k=$k.")
+    _coeff_len(raw_cA, pulse.n_coeff_A, k, "raw_cA")
+    _coeff_len(raw_cf, pulse.n_coeff_f, k, "raw_cf")
+    packed = vcat(vec(raw_gap), vec(raw_dur), vec(raw_phi0), vec(raw_cA), vec(raw_cf))
+    length(packed) == n_params(pulse) || error(
+        "pack: packed length $(length(packed)) != n_params=$(n_params(pulse))."
+    )
+    return packed
 end
 
 """
@@ -331,6 +364,15 @@ function decode(pulse::CompositePulse, u::AbstractVector)
     phi0 = raw_phi0
     cA = pulse.amp_scale .* _softplus.(raw_cA)
     cf = pulse.freq_scale .* raw_cf
+    length(t_start) == k && length(t_end) == k || error(
+        "decode: t_start/t_end lengths $(length(t_start))/$(length(t_end)) != k=$k."
+    )
+    size(cA) == (pulse.n_coeff_A, k) || error(
+        "decode: cA size $(size(cA)) != ($(pulse.n_coeff_A), $k)."
+    )
+    size(cf) == (pulse.n_coeff_f, k) || error(
+        "decode: cf size $(size(cf)) != ($(pulse.n_coeff_f), $k)."
+    )
     return t_start, t_end, phi0, cA, cf
 end
 
@@ -353,6 +395,29 @@ function initial_guess(pulse::CompositePulse; seed::Integer=42)
     raw_cA = _softplus_inv.(0.5 .+ 1.0 .* rand(rng, nA, k))
     raw_cf = 0.3 .* randn(rng, nf, k)
     return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
+end
+
+"""
+    _subpulse_knots(pulse, t_start, t_end) -> (knots_A_list, knots_f_list)
+
+Clamped knot vectors for every sub-pulse's amplitude and frequency
+B-splines. Shared by [`build_E_of_t`](@ref) and [`build_A_f_of_t`](@ref)
+so the two closures cannot drift onto different knot constructions.
+"""
+function _subpulse_knots(pulse::CompositePulse, t_start::AbstractVector, t_end::AbstractVector)
+    k = pulse.k
+    length(t_start) == k && length(t_end) == k || error(
+        "_subpulse_knots: t_start/t_end lengths $(length(t_start))/$(length(t_end)) != k=$k."
+    )
+    degree = pulse.degree
+    T = eltype(t_start)
+    knots_A_list = Vector{Vector{T}}(undef, k)
+    knots_f_list = Vector{Vector{T}}(undef, k)
+    @inbounds for i in 1:k
+        knots_A_list[i] = make_clamped_knots(pulse.n_coeff_A, t_start[i], t_end[i], degree)
+        knots_f_list[i] = make_clamped_knots(pulse.n_coeff_f, t_start[i], t_end[i], degree)
+    end
+    return knots_A_list, knots_f_list
 end
 
 """
@@ -395,16 +460,14 @@ function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
     k = pulse.k
     degree = pulse.degree
     T = eltype(t_start)
+    knots_A_list, knots_f_list = _subpulse_knots(pulse, t_start, t_end)
 
-    knots_A_list = Vector{Vector{T}}(undef, k)
     knots_fp_list = Vector{Vector{T}}(undef, k)
     d_f_list = Vector{Vector{T}}(undef, k)
     phase_offset = Vector{T}(undef, k)
     running = zero(T)
     @inbounds for i in 1:k
-        knots_A_list[i] = make_clamped_knots(pulse.n_coeff_A, t_start[i], t_end[i], degree)
-        knots_f = make_clamped_knots(pulse.n_coeff_f, t_start[i], t_end[i], degree)
-        knots_fp, d_f = bspline_antiderivative(view(cf, :, i), knots_f, degree)
+        knots_fp, d_f = bspline_antiderivative(view(cf, :, i), knots_f_list[i], degree)
         knots_fp_list[i] = knots_fp
         d_f_list[i] = d_f
         phase_offset[i] = running + phi0[i]
@@ -456,13 +519,7 @@ function build_A_f_of_t(pulse::CompositePulse, u::AbstractVector)
     k = pulse.k
     degree = pulse.degree
     T = eltype(t_start)
-
-    knots_A_list = Vector{Vector{T}}(undef, k)
-    knots_f_list = Vector{Vector{T}}(undef, k)
-    @inbounds for i in 1:k
-        knots_A_list[i] = make_clamped_knots(pulse.n_coeff_A, t_start[i], t_end[i], degree)
-        knots_f_list[i] = make_clamped_knots(pulse.n_coeff_f, t_start[i], t_end[i], degree)
-    end
+    knots_A_list, knots_f_list = _subpulse_knots(pulse, t_start, t_end)
 
     taper_frac = pulse.taper_frac
     A_of_t = function (t)

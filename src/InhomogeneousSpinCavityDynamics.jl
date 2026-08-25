@@ -103,6 +103,7 @@ export CompositePulse, n_params, decode, initial_guess, total_area, pulse_durati
 export points_per_segment_for_budget
 export k_of_seed_kind, seed_hs1, seed_composite_with_ghosts, seed_corpse, seed_bb1, seed_canonical
 export run_sim_1st_order_pure, pulse_metrics, pulse_cost
+export pulse_gpu_count
 export AdamState, adam_step!, run_local_adam, optimise_composite_pulse
 export optimise_composite_pulse_over_k
 
