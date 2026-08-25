@@ -118,6 +118,8 @@ function reverse_tsit5_on_checkpoints!(
         us = replay_tsit5_window(stack.u[w], p, mesh.t[i0], dts)
         tloc = mesh.t[i0:i1]
         reverse_tsit5_on_states!(gθ, λx, us, collect(tloc), dts, p, pulse, u_pulse, ws)
+        us = nothing
+        GC.gc(false)
     end
     return gθ
 end
@@ -158,6 +160,7 @@ function _adjoint_one_track(
         # the caller does with `mesh` afterward: _adjoint_one_track's own
         # two call sites (below) both discard the returned `mesh`.
         mesh.u = Vector{ComplexF64}[]
+        GC.gc(false)
         reverse_tsit5_on_checkpoints!(gθ, λx, mesh, stack, p, pulse, collect(Float64, u), ws)
     else
         reverse_tsit5_on_states!(gθ, λx, mesh.u, mesh.t, mesh.dt, p, pulse, collect(Float64, u), ws)
@@ -297,9 +300,11 @@ function pulse_cost_grad_adjoint(
         end
     catch e
         e isa PulseSolveFailed || rethrow()
+        GC.gc(false)
         return fill(NaN, n), Inf, NaN, NaN, duration, NaN
     end
 
+    GC.gc(false)
     cost = -w_inv * inversion + w_sil * (silencing - Float64(target_F))^2 + direct_val
     return grad, cost, inversion, silencing, duration, coherence
 end

@@ -37,6 +37,10 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
     prob_gpu = ODEProblem(rhs_2nd_order!, u0_gpu, d.timespan, p_gpu)
 
+    sol_gpu = nothing
+    cb = nothing
+
+    try
     # --------------------------------------------------------
     # Save arrays
     # --------------------------------------------------------
@@ -143,23 +147,25 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
     println("Saving to: ", filename)
 
-    if clean_gpu
-        println("Cleaning GPU memory...")
-
-        u0_gpu = nothing
-        delta_b_gpu = nothing
-        g_b_gpu = nothing
-        diag_mask = nothing
-
-        p_gpu = nothing
-        prob_gpu = nothing
-        sol_gpu = nothing
-
-        GC.gc()
-        CUDA.reclaim()
-
-        println("GPU memory cleanup finished.")
-    end
-
     return data
+    finally
+        if clean_gpu
+            println("Cleaning GPU memory...")
+
+            u0_gpu = nothing
+            delta_b_gpu = nothing
+            g_b_gpu = nothing
+            diag_mask = nothing
+
+            p_gpu = nothing
+            prob_gpu = nothing
+            sol_gpu = nothing
+            cb = nothing
+
+            GC.gc()
+            CUDA.reclaim()
+
+            println("GPU memory cleanup finished.")
+        end
+    end
 end

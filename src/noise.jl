@@ -672,6 +672,7 @@ function _noise_EdE_QRT_streaming_gpu(
     Sp_grid = CuArray(Sp_grid_cpu)
     Sz_grid = CuArray(Sz_grid_cpu)
 
+    try
     ########################################################
     # Diagonal contribution
     ########################################################
@@ -945,10 +946,27 @@ function _noise_EdE_QRT_streaming_gpu(
             total += sum(contrib_gpu)
         end
 
+        a_col = nothing
+        adag_col = nothing
+        Sp_col = nothing
+        Sm_col = nothing
+        Sz_col = nothing
+        tmp = nothing
+        vj_gpu = nothing
+        adag_start_gpu = nothing
+        GC.gc(false)
         CUDA.reclaim()
     end
 
-    return total
+        return total
+    finally
+        delta_b_gpu = nothing
+        g_b_gpu = nothing
+        Sp_grid = nothing
+        Sz_grid = nothing
+        GC.gc(false)
+        CUDA.reclaim()
+    end
 end
 
 ############################################################

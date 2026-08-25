@@ -68,6 +68,12 @@ function run_sim_1st_order(
         p_gpu,
     )
 
+    peak_Sp_gpu = nothing
+    peak_Sz_gpu = nothing
+    sol_gpu = nothing
+    cb = nothing
+
+    try
     # ========================================================
     # ENSEMBLE DIMENSIONS
     # ========================================================
@@ -550,30 +556,27 @@ function run_sim_1st_order(
     println()
     println("Saving to: ", filename)
 
-    # ========================================================
-    # GPU CLEANUP
-    # ========================================================
-
-    if clean_gpu
-        println("Cleaning GPU memory...")
-
-        u0_gpu = nothing
-        delta_b_gpu = nothing
-        g_b_gpu = nothing
-
-        peak_Sp_gpu = nothing
-        peak_Sz_gpu = nothing
-
-        p_gpu = nothing
-        prob_gpu = nothing
-        sol_gpu = nothing
-        cb = nothing
-
-        GC.gc()
-        CUDA.reclaim()
-
-        println("GPU memory cleanup finished.")
-    end
-
     return data
+    finally
+        if clean_gpu
+            println("Cleaning GPU memory...")
+
+            u0_gpu = nothing
+            delta_b_gpu = nothing
+            g_b_gpu = nothing
+
+            peak_Sp_gpu = nothing
+            peak_Sz_gpu = nothing
+
+            p_gpu = nothing
+            prob_gpu = nothing
+            sol_gpu = nothing
+            cb = nothing
+
+            GC.gc()
+            CUDA.reclaim()
+
+            println("GPU memory cleanup finished.")
+        end
+    end
 end

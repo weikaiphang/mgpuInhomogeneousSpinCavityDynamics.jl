@@ -180,13 +180,46 @@ function _gpu_free_bytes()
     end
 end
 
-function _reclaim_gpu_memory()
+function _reclaim_current_gpu_memory()
     C = _cuda_mod()
     C === nothing && return nothing
     try
         C.functional() || return nothing
         GC.gc(false)
         C.reclaim()
+    catch
+    end
+    return nothing
+end
+
+"""
+    _reclaim_gpu_memory()
+
+`GC.gc(false)` then `CUDA.reclaim()` on every pulse device. Call only
+when no pulse ODE is in flight on those devices (e.g. after
+`_run_pulse_jobs!` returns). Mid-job per-device cleanup uses
+[`_reclaim_current_gpu_memory`](@ref) so a sibling GPU is not touched.
+"""
+function _reclaim_gpu_memory()
+    C = _cuda_mod()
+    C === nothing && return nothing
+    try
+        C.functional() || return nothing
+        GC.gc(false)
+        devices = _pulse_gpu_devices()
+        if isempty(devices)
+            C.reclaim()
+            return nothing
+        end
+        prev = C.device()
+        try
+            for dev in devices
+                C.device!(dev)
+                C.reclaim()
+            end
+        finally
+            C.device!(prev)
+        end
     catch
     end
     return nothing
@@ -319,6 +352,12 @@ function _run_sim_1st_order_from_u0(
         g_b = nothing
         p = nothing
         sol = nothing
+        # Dual GPU keeps the CUDA pool for the next Dual chunk/IC on this
+        # device. Primal GPU solves (jld2, Float64 pulse_cost) have already
+        # copied results to the host.
+        if compute === :gpu && !(eltype(u0_host) <: ForwardDiff.Dual)
+            _reclaim_current_gpu_memory()
+        end
     end
 end
 
@@ -483,6 +522,7 @@ function run_sim_1st_order_pure(
         e isa PulseSolveFailed && rethrow()
         if compute_eff === :gpu && T <: ForwardDiff.Dual && _GPU_DUAL_OK[] !== true
             _GPU_DUAL_OK[] = false
+            _reclaim_current_gpu_memory()
             @warn "GPU Dual 1st-order ODE failed; falling back to the host Dual path" exception = e
             a, Sp, Sz = _run_sim_1st_order_from_u0(
                 u0, E_of_t, d;

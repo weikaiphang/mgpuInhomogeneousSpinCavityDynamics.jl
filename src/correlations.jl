@@ -1124,10 +1124,16 @@ function compute_ase_rase_correlations_gpu(
         verbose = verbose,
     )
 
-    Sp_gpu = CuArray(workspace.Sp_sol)
-    Sz_gpu = CuArray(workspace.Sz_sol)
-    delta_gpu = CuArray(workspace.delta_b_us)
-    g_gpu = CuArray(workspace.g_b_us)
+    Sp_gpu = nothing
+    Sz_gpu = nothing
+    delta_gpu = nothing
+    g_gpu = nothing
+
+    try
+        Sp_gpu = CuArray(workspace.Sp_sol)
+        Sz_gpu = CuArray(workspace.Sz_sol)
+        delta_gpu = CuArray(workspace.delta_b_us)
+        g_gpu = CuArray(workspace.g_b_us)
 
     verbose && println(
         "Running ASE-RASE correlations with adaptive Tsit5 ...",
@@ -1272,8 +1278,15 @@ function compute_ase_rase_correlations_gpu(
         ),
     )
 
-    CUDA.reclaim()
-    return result
+        return result
+    finally
+        Sp_gpu = nothing
+        Sz_gpu = nothing
+        delta_gpu = nothing
+        g_gpu = nothing
+        GC.gc(false)
+        CUDA.reclaim()
+    end
 end
 
 # ============================================================
