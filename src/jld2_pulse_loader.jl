@@ -748,8 +748,12 @@ seed-quality gate follows the same final-state-only philosophy (see
 comparing a fitted seed's full trajectory against the recorded one.
 
 Returns `(ok::Bool, report::NamedTuple, data, d)` -- `report` holds
-`rel_a`/`rel_p`/`rel_z` (and their absolute counterparts, all scalars now)
-for inspection regardless of `ok`. This is a REQUIRED gate before
+`rel_a`/`rel_p`/`rel_z` (and their absolute counterparts, all scalars now),
+plus `inversion` -- the collective FINAL inversion fraction
+([`_final_inversion`](@ref)) of this SAME `:ground`-track solve (the
+default `initial_condition` this function's own `run_sim_1st_order_final`
+call uses), at no extra ODE-solve cost -- for inspection regardless of
+`ok`. This is a REQUIRED gate before
 [`optimise_control_pulse_from_jld2`](@ref) proceeds to optimisation --
 any parsing/ensemble/physics mismatch between this port and the file's
 own provenance is caught here before it can silently corrupt an
@@ -789,6 +793,7 @@ function reconcile_against_jld2(
     )
     Sigma_p_check = sum(Sp_check)
     Sigma_z_check = sum(Sz_check)
+    inversion = _final_inversion(Sigma_z_check, d.N_total)
 
     err_a = abs(a_check - data.a_sol[end])
     err_p = abs(Sigma_p_check - data.Σp_sol[end])
@@ -807,9 +812,10 @@ function reconcile_against_jld2(
         println("  a:  abs_err=$err_a  rel_err=$rel_a")
         println("  Σp: abs_err=$err_p  rel_err=$rel_p")
         println("  Σz: abs_err=$err_z  rel_err=$rel_z")
+        println("  inversion (:ground track) = $inversion")
     end
 
-    report = (rel_a=rel_a, rel_p=rel_p, rel_z=rel_z, err_a=err_a, err_p=err_p, err_z=err_z)
+    report = (rel_a=rel_a, rel_p=rel_p, rel_z=rel_z, err_a=err_a, err_p=err_p, err_z=err_z, inversion=inversion)
     return ok, report, data, d
 end
 
@@ -886,7 +892,7 @@ end
     save_optimisation_run_log(path, data, d, pulse, signal_E_of_t,
                                n_signal, use_signal, u0, initial_metrics,
                                best_u, final_metrics, history, optimizer_settings;
-                               out_dir=nothing, pulsemat_N=nothing)
+                               out_dir=nothing, pulsemat_N=nothing, benchmark_metrics=nothing)
         -> (optrunlog_path, pulsemat_path, pulsepara_path)
 
 Writes this run's full record to `<basename>_optrunlog.jld2` (see
@@ -923,6 +929,13 @@ convention [`load_jld2_run`](@ref) already reads):
     `target_F`/`w_time`) -- see [`optimise_composite_pulse`](@ref)'s own
     docstring for exactly what it captures and why (and what it
     deliberately excludes, e.g. non-serialisable closures)
+  - `benchmark_metrics` -- `(inversion, duration, silencing, coherence)` of
+    the SOURCE FILE's own original, unfitted pulse (never the optimised
+    CompositePulse), as computed by
+    [`optimise_control_pulse_from_jld2`](@ref)'s own reconciliation step;
+    `nothing` if that caller passed `reconcile=false` (nothing to
+    benchmark against in that case) -- see that function's own docstring
+    for exactly how each field is computed
   - `initial_u` (the candidate pulse's own raw parameterisation, `u0`,
     used only after reconciliation passed)
   - `initial_metrics` (`(cost, inversion, silencing, duration, coherence)`
@@ -962,7 +975,7 @@ function save_optimisation_run_log(
     n_signal::Integer, use_signal::Bool,
     u0::AbstractVector, initial_metrics,
     best_u::AbstractVector, final_metrics, history, optimizer_settings;
-    out_dir=nothing, pulsemat_N=nothing,
+    out_dir=nothing, pulsemat_N=nothing, benchmark_metrics=nothing,
 )
     optrunlog_path, pulsemat_path, pulsepara_path = optrunlog_paths(path; out_dir=out_dir)
 
@@ -989,6 +1002,7 @@ function save_optimisation_run_log(
         SIM_SETTING=data.SIM_SETTING, SYSTEM_CONFIG=data.SYSTEM_CONFIG,
         k=pulse.k, n_coeff_A=pulse.n_coeff_A, n_coeff_f=pulse.n_coeff_f,
         optimizer_settings=full_settings,
+        benchmark_metrics=benchmark_metrics,
         initial_u=collect(u0), initial_metrics=initial_metrics, initial_output=initial_output,
         initial_coherence=initial_coherence,
         history=history,
@@ -1016,7 +1030,7 @@ end
         reconcile_seed=true, inversion_rtol=0.01, inversion_atol=1e-3,
         save_log=true, log_out_dir=nothing,
         pulsemat_N=nothing, optimizer_kwargs...)
-        -> (best_u, best_cost, pulse::CompositePulse, signal_E_of_t, d, data, seed_fit_report)
+        -> (best_u, best_cost, pulse::CompositePulse, signal_E_of_t, d, data, seed_fit_report, benchmark_metrics)
 
 End-to-end workflow tying [`load_jld2_run`](@ref),
 [`reconcile_against_jld2`](@ref),
@@ -1041,7 +1055,23 @@ End-to-end workflow tying [`load_jld2_run`](@ref),
      catches a parsing/ensemble/physics mismatch just as reliably here).
      Throws an error and refuses to proceed if this does not match within
      `rtol_check`/`atol_check`: optimisation MUST NOT run against physics
-     this port hasn't first verified it can reproduce.
+     this port hasn't first verified it can reproduce. Once reconciliation
+     PASSES, computes `benchmark_metrics` -- `(inversion, duration,
+     silencing, coherence)` of the FILE's own original, unfitted pulse
+     (never the optimised `CompositePulse` steps 5-6 below go on to
+     build), for later comparison against whatever the optimisation
+     produces: `inversion` reuses [`reconcile_against_jld2`](@ref)'s own
+     `:ground`-track final-state solve (its `report.inversion`, no extra
+     ODE cost); `duration` is `max(t_center + duration/2)` over
+     `control_cfg`'s own sub-pulses -- the SAME "elapsed time from `t=0`
+     to the last sub-pulse's own end" [`pulse_duration`](@ref)/
+     [`pulse_cost`](@ref) use for the fitted `CompositePulse`, so this
+     benchmark number stays directly comparable to `final_metrics.duration`
+     below; `silencing`/`coherence` need one ADDITIONAL `:equator`-track
+     final-state solve of the SAME recorded signal+control drive (see
+     [`pulse_metrics`](@ref)'s own docstring for what these mean) --
+     `nothing` when `reconcile=false` (nothing to benchmark against, and no
+     validated physics to trust a benchmark solve against either).
   4. Builds the FIXED signal drive ([`build_signal_E_of_t`](@ref)) --
      `use_signal=true` (default) uses the file's own recorded signal
      pulse exactly; `use_signal=false` (the `USE_SIGNAL` mode flag) zeroes
@@ -1167,7 +1197,11 @@ alongside [`_final_inversion`](@ref)'s fit-vs-recorded values and their
 relative difference, i.e. the actual numbers `seed_ok`/step 5's gate above
 was decided from (`fit_report` as documented in
 [`fit_composite_pulse_seed_linear_exact`](@ref)/
-[`_fit_composite_pulse_from_samples_linear`](@ref)).
+[`_fit_composite_pulse_from_samples_linear`](@ref)). Finally,
+`benchmark_metrics` -- step 3's own `(inversion, duration, silencing,
+coherence)` for the file's original pulse, `nothing` if `reconcile=false`
+-- the same value also saved into `_optrunlog.jld2` when `save_log=true`
+(see [`save_optimisation_run_log`](@ref)).
 """
 function optimise_control_pulse_from_jld2(
     path::AbstractString,
@@ -1214,6 +1248,7 @@ function optimise_control_pulse_from_jld2(
     d = prepare_derived(CONFIG)
     signal_cfg, control_cfg = split_signal_control(data.PULSE_CONFIG; n_signal=n_signal)
 
+    benchmark_metrics = nothing
     if reconcile
         ok, report, _, _ = reconcile_against_jld2(
             path; n_signal=n_signal, rtol=rtol_check, atol=atol_check,
@@ -1225,6 +1260,49 @@ function optimise_control_pulse_from_jld2(
             "refusing to optimise against physics this port hasn't verified it can " *
             "reproduce. Inspect the printed errors above, or pass reconcile=false to " *
             "override at your own risk."
+        )
+
+        # BENCHMARK metrics -- characterise the FILE's own ORIGINAL,
+        # unmodified pulse (never the fitted CompositePulse this pipeline
+        # goes on to build/optimise below), computed only once
+        # reconciliation has already confirmed this port reproduces the
+        # file's own recorded physics, so there is something meaningful to
+        # benchmark. `inversion` reuses reconcile_against_jld2's OWN
+        # :ground-track final-state solve (its own report.inversion) -- no
+        # extra ODE cost. `duration` uses the SAME definition
+        # pulse_cost/pulse_duration use for the OPTIMISED CompositePulse
+        # (elapsed time from t=0 to the last sub-pulse's own end), read
+        # directly off control_cfg's own t_center/duration fields instead
+        # of decode(pulse,u) since there is no CompositePulse yet at this
+        # point -- so this benchmark number stays directly comparable to
+        # the pulse produced later. `silencing`/`coherence` need a
+        # SEPARATE :equator-track final-state solve (see pulse_metrics's
+        # own docstring for what these mean) of the SAME recorded
+        # signal+control drive reconcile_against_jld2 itself used.
+        benchmark_duration = maximum(
+            Float64(cfg.t_center) + Float64(cfg.duration) / 2 for cfg in control_cfg
+        )
+        signal_E_bench = build_E_of_t(signal_cfg)
+        control_E_bench = build_E_of_t(control_cfg)
+        E_of_t_bench(t) = signal_E_bench(t) + control_E_bench(t)
+        reltol_bench = check_reltol === nothing ? data.SIM_SETTING.reltol : check_reltol
+        abstol_bench = check_abstol === nothing ? data.SIM_SETTING.abstol : check_abstol
+        _, Sp_bench, _ = run_sim_1st_order_final(
+            E_of_t_bench, d; initial_condition=:equator, reltol=reltol_bench, abstol=abstol_bench,
+        )
+        benchmark_silencing = _weighted_silencing_factor(Sp_bench, d.g_b, d.Nj, Float64)
+        benchmark_coherence = _weighted_coherence(Sp_bench, d.Nj, Float64)
+
+        benchmark_metrics = (
+            inversion=report.inversion, duration=benchmark_duration,
+            silencing=benchmark_silencing, coherence=benchmark_coherence,
+        )
+        println(
+            "Benchmark metrics for $path's own original pulse: " *
+            "inversion=$(round(benchmark_metrics.inversion, sigdigits=6))  " *
+            "duration=$(round(benchmark_duration, sigdigits=6))s  " *
+            "silencing=$(round(benchmark_silencing, sigdigits=6))  " *
+            "coherence=$(round(benchmark_coherence, sigdigits=6))"
         )
     end
 
@@ -1378,11 +1456,11 @@ function optimise_control_pulse_from_jld2(
         save_optimisation_run_log(
             path, data, d, pulse, signal_E_of_t, n_signal, use_signal,
             u0, initial_metrics, best_u, final_metrics, history, full_settings;
-            out_dir=log_out_dir, pulsemat_N=pulsemat_N,
+            out_dir=log_out_dir, pulsemat_N=pulsemat_N, benchmark_metrics=benchmark_metrics,
         )
     end
 
-    return best_u, best_cost, pulse, signal_E_of_t, d, data, seed_fit_report
+    return best_u, best_cost, pulse, signal_E_of_t, d, data, seed_fit_report, benchmark_metrics
 end
 
 """

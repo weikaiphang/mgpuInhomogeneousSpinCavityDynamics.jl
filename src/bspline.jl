@@ -38,6 +38,79 @@ function make_clamped_knots(n_coeff::Integer, t0, t1, degree::Integer=3)
     return knots
 end
 
+# ============================================================
+# SCRATCH-BUFFER CACHE FOR bspline_basis's OWN Cox-de Boor RECURSION
+#
+# bspline_basis is called once per ODE RHS evaluation (i.e. once per
+# solver step * per RK stage, via build_E_of_t's own closure) -- the
+# single largest allocation source on that hot path, measured directly:
+# each call previously allocated degree+1 fresh arrays (one initial
+# `zeros(T,n0)`, then one more per recursion level), worse still under
+# ForwardDiff.Dual arithmetic (heavier per-element than Float64). This
+# caches/reuses two PING-PONGED scratch buffers, sized to the largest
+# array the recursion needs (n0 = length(knots)-1); each recursion level
+# uses only the first `n` elements of whichever buffer is currently
+# active, via a `view`. `bspline_basis` itself still returns a fresh,
+# independently-owned `Vector` (see its own `collect(...)` at the very
+# end) -- so this caching is a purely INTERNAL implementation detail,
+# invisible to and safe for every existing caller (verified directly:
+# grepped every `bspline_basis(` call site in this package -- each either
+# reduces the result immediately, in the same expression, e.g.
+# `sum(bspline_basis(...))`, or broadcast-COPIES it into a pre-existing
+# array right away, e.g. `Basis[j,:] .= bspline_basis(...)` -- none holds
+# a reference to one call's result across a LATER call, which reusing the
+# returned vector itself, rather than copying out, would have made unsafe).
+#
+# Keyed by (Threads.threadid(), T, n0), with ONE Dict PER THREAD (never
+# one Dict shared across threads) so two concurrent calls on DIFFERENT
+# threads -- this package's own Threads.@threads usage, both pre-existing
+# in optimise_composite_pulse_over_k and newly added in
+# _pulse_cost_grad_threaded's 2-way IC parallelism (pulse_optimizer2.jl)
+# -- never share a buffer, which would otherwise be a silent data race
+# (Julia's base `Dict` is not safe for concurrent inserts even to
+# logically-disjoint keys, since internal resizing can corrupt the whole
+# table). `T` varies between `Float64` (forward-only calls) and
+# `ForwardDiff.Dual{Tag,V,N}` (differentiated calls) -- ForwardDiff
+# assigns a distinct `Tag` per differentiated closure, so e.g. this
+# file's own `:ground`- and `:equator`-track gradients (different
+# closures) get different `Dual` types and hence different, non-aliasing
+# cache entries even when running concurrently on different threads with
+# the same `n0`.
+#
+# The per-thread pool is built LAZILY, on first actual use, rather than
+# as a top-level `const` evaluated at module load -- a `const` sized from
+# `Threads.maxthreadid()` at PRECOMPILE time would silently go stale if
+# this package is later loaded (`using InhomogeneousSpinCavityDynamics`)
+# in a session started with a DIFFERENT `-t N`/`JULIA_NUM_THREADS` than
+# whatever process precompiled it; building lazily on first call means
+# the size always reflects the ACTUAL running session's own thread count.
+mutable struct _BsplineScratchPool
+    caches::Vector{Dict{Tuple{DataType,Int},NTuple{2,Vector}}}
+end
+const _BSPLINE_SCRATCH_POOL = Ref{Union{Nothing,_BsplineScratchPool}}(nothing)
+const _BSPLINE_SCRATCH_POOL_LOCK = ReentrantLock()
+
+function _bspline_scratch_pair(::Type{T}, n0::Integer) where {T}
+    pool = _BSPLINE_SCRATCH_POOL[]
+    tid = Threads.threadid()
+    if pool === nothing || tid > length(pool.caches)
+        lock(_BSPLINE_SCRATCH_POOL_LOCK) do
+            pool2 = _BSPLINE_SCRATCH_POOL[]
+            needed = Threads.maxthreadid()
+            if pool2 === nothing || length(pool2.caches) < needed
+                _BSPLINE_SCRATCH_POOL[] = _BsplineScratchPool(
+                    [Dict{Tuple{DataType,Int},NTuple{2,Vector}}() for _ in 1:needed]
+                )
+            end
+        end
+        pool = _BSPLINE_SCRATCH_POOL[]
+    end
+    cache = @inbounds pool.caches[tid]
+    return get!(cache, (T, Int(n0))) do
+        (Vector{T}(undef, n0), Vector{T}(undef, n0))
+    end::NTuple{2,Vector{T}}
+end
+
 """
     bspline_basis(t, knots, degree) -> Vector
 
@@ -83,6 +156,13 @@ the same way, both signs now match finite differences), matching
 `_gevrey_bump`'s existing "branch on `ForwardDiff.value`, compute on the
 real (possibly `Dual`) arithmetic" convention -- `ForwardDiff.value` is a
 no-op on plain `Float64`, so the non-AD code path is unaffected.
+
+Internally reuses two cached, thread-local scratch buffers across calls
+for the recursion's own intermediate arrays (see the scratch-pool
+machinery just above this function) rather than allocating fresh ones
+every time -- a purely internal performance detail with no effect on the
+math: the value RETURNED to the caller is always a fresh, independently-
+owned `Vector`, exactly as before.
 """
 function bspline_basis(t, knots::AbstractVector, degree::Integer)
     K = length(knots)
@@ -90,7 +170,8 @@ function bspline_basis(t, knots::AbstractVector, degree::Integer)
     T = promote_type(typeof(t), eltype(knots))
     tv = ForwardDiff.value(t)
     knots_end_v = ForwardDiff.value(knots[end])
-    B = zeros(T, n0)
+    buf_a, buf_b = _bspline_scratch_pair(T, n0)
+    B = view(buf_a, 1:n0)
     @inbounds for i in 1:n0
         lo, hi = knots[i], knots[i+1]
         lov, hiv = ForwardDiff.value(lo), ForwardDiff.value(hi)
@@ -98,11 +179,13 @@ function bspline_basis(t, knots::AbstractVector, degree::Integer)
             B[i] = one(T)
         elseif tv == knots_end_v && hiv == knots_end_v && lov < hiv
             B[i] = one(T)
+        else
+            B[i] = zero(T)
         end
     end
     for p in 1:degree
         n = K - p - 1
-        Bnew = zeros(T, n)
+        Bnew = view(isodd(p) ? buf_b : buf_a, 1:n)
         @inbounds for i in 1:n
             tau_i, tau_ip = knots[i], knots[i+p]
             tau_i1, tau_ip1 = knots[i+1], knots[i+p+1]
@@ -112,7 +195,7 @@ function bspline_basis(t, knots::AbstractVector, degree::Integer)
         end
         B = Bnew
     end
-    return B
+    return collect(B)
 end
 
 """

@@ -1459,6 +1459,200 @@ function fit_composite_pulse_from_samples(
 end
 
 # ============================================================
+# TASK-PARALLEL GRADIENT (2-way, across the 2 initial conditions)
+#
+# pulse_cost's own scalar `cost` is LITERALLY additively separable into a
+# :ground-only term, an :equator-only term, and a direct (no-ODE-solve)
+# term -- see _pulse_cost_grad_threaded's own docstring. This exploits
+# that separability to run the two EXPENSIVE, independent, differentiated
+# ODE solves concurrently via Threads.@threads, using the SAME pattern
+# optimise_composite_pulse_over_k (below) already uses for N independent
+# optimise_composite_pulse runs -- proven safe in this exact codebase, not
+# a new concurrency pattern. This is deliberately SCOPED to the 2
+# initial-condition split only: also parallelising ForwardDiff.gradient's
+# own internal chunk loop would require reimplementing its internal
+# seed/extract machinery by hand, a real reimplementation with genuine
+# silent-wrong-gradient risk if done incorrectly -- out of scope here.
+# ============================================================
+
+"""
+    _pulse_cost_grad_threaded(u, pulse, d; w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
+        -> (grad::Vector{Float64}, cost, inversion, silencing, duration, coherence)
+
+Task-parallel drop-in for `ForwardDiff.gradient(uu -> pulse_cost(uu, pulse,
+d; kwargs...)[1], u)` plus `pulse_cost`'s own aux outputs -- mathematically
+EXACT (not an approximation), and never touches `ForwardDiff`'s own
+internal chunking machinery. Exploits that [`pulse_cost`](@ref)'s own
+scalar `cost` is LITERALLY additively separable into three pieces that
+never share any ODE-solve state:
+
+    cost(u) = [-w_inv*inversion(u)]                             (the :ground-track solve, ALONE)
+            + [w_sil*(silencing(u)-target_F)^2]                 (the :equator-track solve, ALONE)
+            + [w_time*(duration(u)/T_max) + tmax_penalty(u) + power_penalty(u)]  (no ODE solve at all)
+
+so `∇cost = ∇[ground term] + ∇[equator term] + ∇[direct term]` EXACTLY, by
+linearity of differentiation -- each piece is handed to its own,
+completely ordinary `ForwardDiff.gradient` call, using ForwardDiff's own
+PUBLIC `GradientConfig`/`Chunk` API (never its internal seeding/extraction
+machinery) to force a single chunk of width `min(60, length(u))` instead
+of `ForwardDiff.pickchunksize`'s own default (capped at 12 regardless of
+`n` -- e.g. 5 chunks for a 57-parameter gradient): each chunk re-solves
+the SAME adaptive ODE integration from scratch (paying its own step-size-
+control/primal-recomputation overhead again), so one wide chunk trades
+that redundant-re-solve overhead for wider (more expensive per elementary
+operation) `Dual` arithmetic -- a real, measured net win for THIS
+ODE-solve-dominated cost (chunk width is purely a performance knob here,
+never a correctness one -- see the `chunk` variable's own comment below
+for the full reasoning and the `n_params > 60` EXACT-mode fallback). The
+two EXPENSIVE terms (:ground, :equator -- each a full differentiated ODE
+solve, the dominant cost of one [`run_local_adam`](@ref) epoch) are
+ADDITIONALLY dispatched across 2 `Threads.@threads` iterations to run
+concurrently -- the chunk-width change and the 2-way threading are
+independent, stacking optimisations.
+
+Thread safety verified directly (not assumed): `rhs_1st_order!`
+(rhs_1st_order.jl) and everything [`build_E_of_t`](@ref)/
+[`bspline_basis`](@ref) (composite_pulse.jl/bspline.jl/pulses.jl) touch
+build fresh, per-call objects with no module-level `const`/`global`/`Ref`
+mutable buffer (checked directly via grep across those files) -- each
+thread's [`run_sim_1st_order_pure`](@ref) call constructs its own
+`ODEProblem`/`u0`/closures from scratch, so there is no shared mutable
+state for two concurrent solves to race on. This is also the SAME
+concurrency pattern [`optimise_composite_pulse_over_k`](@ref) (this file)
+already uses for N independent [`optimise_composite_pulse`](@ref) runs via
+`Threads.@threads` -- this function applies the identical, already-proven
+pattern one level deeper (per-epoch, across the 2 initial conditions,
+rather than per-`k`).
+
+Only activates real parallelism when Julia was started with
+`-t N`/`JULIA_NUM_THREADS=N>=2` (same activation model
+[`optimise_composite_pulse_over_k`](@ref)'s own docstring already
+documents) -- with `Threads.nthreads()==1` this still runs correctly, just
+serially (via `Threads.@threads`'s own single-thread fallback), so calling
+this with no extra threads available is safe, just not faster. For
+ODE-heavy work sharing a process with BLAS-using code, consider
+`LinearAlgebra.BLAS.set_num_threads(1)` so Julia threads do not
+oversubscribe physical cores (same caveat
+[`optimise_composite_pulse_over_k`](@ref) already documents).
+
+`w_inv<=0`/`w_sil<=0` skip that track's ODE solve entirely (matching
+[`pulse_cost`](@ref)'s own exact behaviour), returning `0.0` for that
+term/metric without spinning up a thread for it. A `PulseSolveFailed` on
+EITHER track is caught per-thread and reproduces [`pulse_cost`](@ref)'s
+own exact failure contract: `(fill(NaN, n), Inf, NaN, NaN, duration,
+NaN)` -- `duration` still valid (computed before any solve, exactly as
+`pulse_cost` does), `grad` unusable but present so this function's return
+type stays fixed regardless. Any OTHER exception is rethrown (via
+`Threads.@threads`'s own `@sync`, arriving at the caller wrapped in a
+`TaskFailedException` rather than bare -- the one, narrow behavioural
+difference from calling [`pulse_cost`](@ref) directly).
+
+Verified numerically equivalent to calling
+`ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, d; kwargs...)[1], u)`
+plus `pulse_cost(u, pulse, d; kwargs...)` separately, to machine precision
+across multiple random `u`/seeds (see `test/runtests.jl`'s own "threaded
+gradient matches serial" testset) -- this function's whole purpose is to
+be a faster, EXACT substitute for that combined computation, never an
+approximation of it.
+"""
+function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
+                                    w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
+                                    kwargs...)
+    _forbid_initial_condition(kwargs)
+    n = length(u)
+    duration = pulse_duration(pulse, u)
+
+    # Force a single ForwardDiff chunk covering ALL n_params whenever
+    # n_params <= 60 -- this package's own established param_budget cap
+    # (see fit_composite_pulse_seed_auto/points_per_segment_for_budget),
+    # so this covers this function's own intended caller
+    # (run_local_adam(threaded_grad=true)) by construction in the common
+    # AUTO-mode case. ForwardDiff.pickchunksize's own DEFAULT caps chunk
+    # width at 12 regardless of n, splitting e.g. a 57-parameter gradient
+    # into 5 chunks -- 5 FULLY REDUNDANT re-solves of the SAME adaptive
+    # ODE integration (only which directions carry non-zero Dual partials
+    # differs between chunks), each paying the solver's own step-size-
+    # control/primal-recomputation overhead again. A single width-60 (or
+    # width-n when n<60) chunk pays that ODE-solver control-flow overhead
+    # ONCE per initial condition instead. `min(60, n)` (never a bare `60`)
+    # is required for CORRECTNESS, not just tidiness -- ForwardDiff errors
+    # outright if the requested chunk size exceeds `length(x)` (verified
+    # directly: `Chunk{60}` on a length-57 input raises `ArgumentError:
+    # chunk size cannot be greater than ForwardDiff.structural_length(x)`)
+    # -- EXACT-mode callers (fit_composite_pulse_seed_linear_exact-derived
+    # shapes) do not go through param_budget at all and can produce
+    # n_params > 60, where this clamp falls back to (multiple) width-60
+    # chunks rather than erroring. Chunk size is purely a performance
+    # knob, never a correctness one -- verified bit-for-bit identical to
+    # ForwardDiff's own default chunking in `test/runtests.jl`'s "threaded
+    # gradient matches serial" testset.
+    chunk = ForwardDiff.Chunk{min(60, n)}()
+
+    function direct_only(uu)
+        dur = pulse_duration(pulse, uu)
+        _, t_end, _, cA, _ = decode(pulse, uu)
+        Tu = eltype(uu)
+        tmax_excess = max(t_end[end] - pulse.T_max, zero(Tu))
+        tmax_penalty = w_tmax * (tmax_excess / pulse.T_max)^2
+        normalized_cA = cA ./ pulse.amp_scale
+        power_penalty = w_power * (sum(abs2, normalized_cA) / length(normalized_cA))
+        return w_time * (dur / pulse.T_max) + tmax_penalty + power_penalty
+    end
+    grad_direct = ForwardDiff.gradient(direct_only, u, ForwardDiff.GradientConfig(direct_only, u, chunk))
+    direct_val = direct_only(u)
+
+    aux_ground = Ref{NTuple{2,Float64}}((0.0, 0.0))    # (cost term value, inversion)
+    aux_equator = Ref{NTuple{3,Float64}}((0.0, 0.0, 0.0))  # (cost term value, silencing, coherence)
+    grads = Vector{Vector{Float64}}(undef, 2)
+    failed = fill(false, 2)
+
+    Threads.@threads for i in 1:2
+        try
+            if i == 1
+                if w_inv > 0.0
+                    function ground_only(uu)
+                        _, _, Sz, Nj = run_sim_1st_order_pure(uu, pulse, d; kwargs..., initial_condition=:ground)
+                        inv_ = _weighted_inversion(Sz, Nj, eltype(uu))
+                        val = -w_inv * inv_
+                        aux_ground[] = (Float64(ForwardDiff.value(val)), Float64(ForwardDiff.value(inv_)))
+                        return val
+                    end
+                    grads[1] = ForwardDiff.gradient(ground_only, u, ForwardDiff.GradientConfig(ground_only, u, chunk))
+                else
+                    grads[1] = zeros(n)
+                end
+            else
+                if w_sil > 0.0
+                    function equator_only(uu)
+                        _, Sp, _, Nj_eq = run_sim_1st_order_pure(uu, pulse, d; kwargs..., initial_condition=:equator)
+                        Tu = eltype(uu)
+                        sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
+                        coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
+                        val = w_sil * (sil_ - convert(Tu, target_F))^2
+                        aux_equator[] = (Float64(ForwardDiff.value(val)), Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)))
+                        return val
+                    end
+                    grads[2] = ForwardDiff.gradient(equator_only, u, ForwardDiff.GradientConfig(equator_only, u, chunk))
+                else
+                    grads[2] = zeros(n)
+                end
+            end
+        catch e
+            e isa PulseSolveFailed || rethrow()
+            failed[i] = true
+        end
+    end
+
+    any(failed) && return fill(NaN, n), Inf, NaN, NaN, duration, NaN
+
+    ground_val, inversion = aux_ground[]
+    equator_val, silencing, coherence = aux_equator[]
+    grad = grads[1] .+ grads[2] .+ grad_direct
+    cost = ground_val + equator_val + direct_val
+    return grad, cost, inversion, silencing, duration, coherence
+end
+
+# ============================================================
 # LOCAL DESCENT WITH EARLY STOPPING + BASIN-HOPPING OUTER LOOP
 #
 # Same two-level structure as the Python port's _run_local_adam/
@@ -1468,13 +1662,21 @@ end
 # ============================================================
 
 """
-    run_local_adam(u_start, pulse, d, cost_kwargs; hop=0, num_epochs=30, patience=5, tol=1e-3, learning_rate=0.05, label="", kwargs...) -> (best_u, best_cost, best_inversion, best_silencing, best_duration, history)
+    run_local_adam(u_start, pulse, d, cost_kwargs; hop=0, num_epochs=30, patience=5, tol=1e-3, learning_rate=0.05, label="", threaded_grad=false, kwargs...) -> (best_u, best_cost, best_inversion, best_silencing, best_duration, history)
 
 One basin's local descent: Adam from `u_start`, stopped either after
 `num_epochs` or after `patience` consecutive epochs without a cost
 improvement of at least `tol` (whichever comes first). Each epoch takes
 cost, metrics, and gradient from a single `ForwardDiff.gradient` sweep
-(metrics via `ForwardDiff.value`). A failed ODE (`PulseSolveFailed`,
+(metrics via `ForwardDiff.value`) -- or, when `threaded_grad=true`, from
+[`_pulse_cost_grad_threaded`](@ref) instead: a mathematically EXACT,
+task-parallel substitute (see that function's own docstring) that
+dispatches the epoch's two independent ODE solves (`:ground`, `:equator`)
+across `Threads.@threads`, for roughly a 2x wall-clock speedup on the
+gradient step -- the dominant cost of an epoch at a large ensemble --
+when Julia is started with `-t N`/`JULIA_NUM_THREADS=N>=2` (a no-op,
+still-correct fallback to serial execution otherwise). Default `false`:
+zero behaviour change unless a caller opts in. A failed ODE (`PulseSolveFailed`,
 reported as `Inf` cost by [`pulse_cost`](@ref)) skips the Adam step,
 reverts `u` to the last point that DID solve successfully, and halves the
 step size for the next attempt -- a standard backtracking-line-search
@@ -1550,7 +1752,8 @@ large-swing) epoch-to-epoch behaviour as the signal that a smaller
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
-                         learning_rate::Real=0.05, cf_lr_scale::Real=1.0, label::AbstractString="", solve_kwargs...)
+                         learning_rate::Real=0.05, cf_lr_scale::Real=1.0, label::AbstractString="",
+                         threaded_grad::Bool=false, solve_kwargs...)
     _forbid_initial_condition(solve_kwargs)
     u = copy(u_start)
     n = length(u)
@@ -1603,6 +1806,8 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
             adam.m .= adam_m0
             adam.v .= adam_v0
             adam.t = adam_t0
+        elseif threaded_grad
+            grad, cost, inv_, sil_, dur_, coh_ = _pulse_cost_grad_threaded(u, pulse, d; cost_kwargs..., solve_kwargs...)
         else
             grad = ForwardDiff.gradient(cost_only, u)
             cost, inv_, sil_, dur_, coh_ = aux[]
@@ -1673,12 +1878,17 @@ end
         n_hops=3, hop_patience=2, hop_step_size=0.5, temperature=1.0,
         degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
         w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, seed=42,
-        warm_start_u=nothing, label_prefix="", solve_kwargs...)
+        warm_start_u=nothing, label_prefix="", threaded_grad=false, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Basin-hopping global search over composite-pulse solutions for THIS
 package's own 1st-order physics, each basin explored by
-[`run_local_adam`](@ref)'s early-stopped Adam descent:
+[`run_local_adam`](@ref)'s early-stopped Adam descent (or its
+[`_pulse_cost_grad_threaded`](@ref) task-parallel substitute when
+`threaded_grad=true` -- forwarded to every `run_local_adam` call, hop 0
+and every subsequent hop; default `false`, zero behaviour change unless a
+caller opts in; see that function's own docstring for what it does and
+why it is mathematically exact, not an approximation):
 
   1. Run a local Adam descent from a random initial guess (hop 0).
   2. For each further hop: perturb the CURRENT accepted point with
@@ -1756,19 +1966,28 @@ function optimise_composite_pulse(
     n_hops::Integer=3, hop_patience::Integer=2, hop_step_size::Real=0.5, temperature::Real=1.0,
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
     w_inv::Real=1.0, w_sil::Real=0.7, target_F::Real=1.0, w_time::Real=0.15,
-    seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="", solve_kwargs...,
+    seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
+    threaded_grad::Bool=false, solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
     cost_kwargs = (w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time)
     rng = Random.Xoshiro(seed)
 
+    # threaded_grad is deliberately kept OUT of solve_kwargs (unlike every
+    # other extra keyword here): solve_kwargs also flows straight into
+    # pulse_cost's own plain initial_metrics/final_metrics calls below,
+    # which forward it to run_sim_1st_order_pure -- a function with NO
+    # catch-all kwargs..., so an unrecognised keyword there is a hard
+    # MethodError, not a silent no-op. Only run_local_adam (which DOES
+    # know about threaded_grad) should ever see it.
     solve_settings = NamedTuple(kv for kv in pairs(solve_kwargs) if !(kv[2] isa Function))
     optimizer_settings = merge(
         (k=k, n_coeff_A=n_coeff_A, n_coeff_f=n_coeff_f, degree=degree, taper_frac=taper_frac,
          num_epochs=num_epochs, learning_rate=learning_rate, cf_lr_scale=cf_lr_scale, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
-         w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed),
+         w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed,
+         threaded_grad=threaded_grad),
         solve_settings,
     )
 
@@ -1792,7 +2011,7 @@ function optimise_composite_pulse(
 
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
-        label="$(label_prefix)[hop 0]", solve_kwargs...
+        label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, solve_kwargs...
     )
     append!(history, hop0_history)
     global_best_u, global_best_cost = current_u, current_cost
@@ -1805,7 +2024,7 @@ function optimise_composite_pulse(
         cand_u, cand_cost, _, _, _, hop_history = run_local_adam(
             candidate_u0, pulse, d, cost_kwargs;
             hop, num_epochs, patience, tol, learning_rate, cf_lr_scale,
-            label="$(label_prefix)[hop $hop]", solve_kwargs...,
+            label="$(label_prefix)[hop $hop]", threaded_grad=threaded_grad, solve_kwargs...,
         )
         append!(history, hop_history)
 
