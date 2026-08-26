@@ -164,6 +164,40 @@ end
     @test _relmax(gθ, g_dual) < 1e-8
 end
 
+@testset "record_adaptive_tsit5_mesh: lean recording matches full recording" begin
+    d = FAKE_D_ODE
+    M = Int(d.M)
+    pulse = CompositePulse(1, 4, 4, d)
+    θ = seed_canonical(pulse, :hs1)
+    t_start, t_end, _, _, _ = decode(pulse, θ)
+    tstops = collect(Float64, vcat(t_start, t_end))
+    E = build_E_of_t(pulse, θ)
+    p = _host_ode_p(d, E)
+    u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, :ground)
+
+    for stride in (1, 2, 5, 1000)
+        mesh_full, stack_full, uend_full = record_adaptive_tsit5_mesh(
+            u0, p, d.timespan; reltol=1e-8, abstol=1e-8, tstops=tstops,
+            checkpoint_stride=stride, record_full_u=true,
+        )
+        mesh_lean, stack_lean, uend_lean = record_adaptive_tsit5_mesh(
+            u0, p, d.timespan; reltol=1e-8, abstol=1e-8, tstops=tstops,
+            checkpoint_stride=stride, record_full_u=false,
+        )
+        @test mesh_full.t == mesh_lean.t
+        @test mesh_full.dt == mesh_lean.dt
+        @test isempty(mesh_lean.u)
+        @test length(mesh_full.u) == length(mesh_full.t)
+        @test stack_full.index == stack_lean.index
+        @test stack_full.t == stack_lean.t
+        @test stack_full.stride == stack_lean.stride
+        @test all(isapprox(stack_full.u[i], stack_lean.u[i]; atol=1e-12) for i in eachindex(stack_full.u))
+        @test uend_full ≈ uend_lean atol=1e-12
+        @test uend_full == stack_full.u[end]
+        @test uend_lean == stack_lean.u[end]
+    end
+end
+
 @testset "forced replay matches adaptive primal" begin
     d = FAKE_D_ODE
     M = Int(d.M)
@@ -234,6 +268,14 @@ end
     g_full, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., checkpoint_stride=typemax(Int))
     g_win, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., checkpoint_stride=2, use_checkpoints=true)
     @test g_win ≈ g_full atol=1e-10 rtol=1e-10
+
+    # use_checkpoints=true with checkpoint_stride left at its default gives
+    # exactly one window spanning the whole trajectory -- still correct
+    # (same gradient), but should warn since it provides no memory saving.
+    g_nostride = @test_logs (:warn, r"no memory saving") pulse_cost_grad_adjoint(
+        θ, pulse, d; cost_kw..., use_checkpoints=true,
+    )[1]
+    @test g_nostride ≈ g_full atol=1e-10 rtol=1e-10
 end
 
 @testset "run_local_adam grad_mode=:adjoint smoke" begin

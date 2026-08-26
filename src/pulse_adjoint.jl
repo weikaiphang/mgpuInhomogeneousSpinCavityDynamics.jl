@@ -157,9 +157,18 @@ function _adjoint_one_track(
     E_of_t = _control_plus_signal_E(pulse, u, signal_E_of_t)
     p = _host_ode_p(d, E_of_t)
     u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
+    # record_full_u=!use_checkpoints: when the caller wants the checkpointed
+    # reverse sweep, record_adaptive_tsit5_mesh's own memory-bounded mode
+    # never materialises the full per-node state list (mesh.u) IN THE
+    # FIRST PLACE -- this is what actually bounds memory at a large
+    # ensemble; dropping mesh.u only AFTER building it in full (an earlier
+    # version of this function did that, right before the backward sweep)
+    # still pays the full O(steps) peak during recording itself, which is
+    # exactly where a real M=20000 run was observed to exhaust memory.
     mesh, stack, u_end = record_adaptive_tsit5_mesh(
         u0, p, d.timespan;
         reltol=reltol, abstol=abstol, tstops=tstops, checkpoint_stride=checkpoint_stride,
+        record_full_u=!use_checkpoints,
     )
     a, Sp, Sz = unpack_state_1st_order_u(u_end, M)
     nR = real_state_length_1st_order(M)
@@ -167,21 +176,15 @@ function _adjoint_one_track(
     pullback!(λx, a, Sp, Sz)
     gθ = zeros(Float64, length(u))
     ws = _tsit5_adj_workspace(M)
-    use_checkpoints_eff = use_checkpoints && length(stack.index) >= 2 && stack.stride < length(mesh.u)
-    if use_checkpoints_eff
+    if use_checkpoints
         # reverse_tsit5_on_checkpoints! reads only mesh.t/mesh.dt/stack.u
         # (it replays each window from stack's own downsampled snapshots,
-        # never from mesh.u -- see that function's own body) -- mesh.u
-        # itself (the FULL per-accepted-step state list, easily hundreds
-        # of MB at a real ensemble, see FrozenTsit5Mesh's own docstring)
-        # is therefore provably dead from this point on. Dropping the
-        # reference here, before the (also allocation-heavy, replay-based)
-        # backward sweep starts, lets the GC reclaim it during that sweep
-        # instead of holding both simultaneously. Safe regardless of what
-        # the caller does with `mesh` afterward: _adjoint_one_track's own
-        # two call sites (below) both discard the returned `mesh`.
-        mesh.u = Vector{ComplexF64}[]
-        GC.gc(false)
+        # never from mesh.u -- see that function's own body), so it is
+        # correct here even in the degenerate case where checkpoint_stride
+        # was left large enough that stack ends up with only the first/last
+        # node (one window covering the whole trajectory, replayed in one
+        # shot -- correct, just without the memory saving a smaller stride
+        # would give).
         reverse_tsit5_on_checkpoints!(gθ, λx, mesh, stack, p, pulse, collect(Float64, u), ws)
     else
         reverse_tsit5_on_states!(gθ, λx, mesh.u, mesh.t, mesh.dt, p, pulse, collect(Float64, u), ws)
@@ -247,6 +250,16 @@ replacement. `signal_E_of_t` is not differentiated. CPU reverse.
 adaptive snapshots; a finite stride uses windowed Φ-replay from host
 checkpoints (same gradient when L1 replay matches the stored mesh).
 
+`use_checkpoints=true` ALONE bounds only the forward recording pass
+(`record_adaptive_tsit5_mesh`'s `mesh.u` is never materialised). It does
+NOT by itself bound the reverse sweep: with `checkpoint_stride` left at
+its default, there is exactly ONE checkpoint window spanning the whole
+trajectory, and `replay_tsit5_window` rebuilds the full per-step state
+list for that one window anyway -- no memory saving over
+`use_checkpoints=false`. Pass an explicit, finite `checkpoint_stride`
+(e.g. a few hundred) to actually bound peak memory end-to-end at a large
+ensemble; leaving it unset triggers a `@warn`.
+
 Both tracks are always run (see [`inversion_pullback!`](@ref)/
 [`silencing_pullback!`](@ref)'s docstrings): each adjoint sweep seeds
 `λx` with the RAW `∂inversion/∂x`/`∂silencing/∂x` pullback (coefficient
@@ -278,6 +291,14 @@ function pulse_cost_grad_adjoint(
     length(u) == n_params(pulse) || error(
         "pulse_cost_grad_adjoint: u has length $(length(u)), expected n_params=$(n_params(pulse))."
     )
+    if use_checkpoints && checkpoint_stride == typemax(Int)
+        @warn "pulse_cost_grad_adjoint: use_checkpoints=true but checkpoint_stride was left " *
+              "at its default (typemax(Int)) -- this produces exactly ONE checkpoint window " *
+              "spanning the ENTIRE trajectory, so the reverse sweep still replays/holds the " *
+              "FULL per-step state list (no memory saving over use_checkpoints=false; the " *
+              "forward recording pass is bounded, but the reverse pass is not). Pass an " *
+              "explicit, finite checkpoint_stride (e.g. a few hundred) to actually bound memory."
+    end
     duration = pulse_duration(pulse, u)
     uθ = collect(Float64, u)
     signal_E_of_t = haskey(sk, :signal_E_of_t) ? sk.signal_E_of_t : _zero_drive

@@ -380,13 +380,65 @@ function _host_ode_p(d, E_of_t)
 end
 
 """
-    record_adaptive_tsit5_mesh(u0, p, tspan; reltol, abstol, tstops, checkpoint_stride)
+    _checkpoint_indices(n, stride) -> Vector{Int}
+
+1-based node indices `{1, 1+stride, 1+2*stride, ..., n}` into an
+`n`-node trajectory (`n >= 2`): node 1 (the initial condition) and node
+`n` (the final state) are always included; every other checkpoint is
+`stride` nodes apart. Shared by both [`record_adaptive_tsit5_mesh`](@ref)
+recording modes so a caller sees the IDENTICAL checkpoint set regardless
+of which one ran.
+"""
+function _checkpoint_indices(n::Integer, stride::Integer)
+    idxs = Int[1]
+    if stride < n
+        k = 1 + stride
+        while k < n
+            push!(idxs, k)
+            k += stride
+        end
+    end
+    idxs[end] != n && push!(idxs, n)
+    return idxs
+end
+
+"""
+    record_adaptive_tsit5_mesh(u0, p, tspan; reltol, abstol, tstops, checkpoint_stride, record_full_u=true)
         -> (mesh, stack, u_end)
 
 Adaptive `Tsit5()` solve of `rhs_1st_order!` (same solver as production),
-logging every accepted node. CPU only. `mesh.u` holds every snapshot;
-`stack` downsamples those snapshots every `checkpoint_stride` nodes
-(always including the first and last).
+logging every accepted node. CPU only. `stack` downsamples the recorded
+nodes every `checkpoint_stride` nodes (always including the first and
+last, see [`_checkpoint_indices`](@ref)); `mesh.t`/`mesh.dt` always hold
+every node's time/step (`O(steps)` `Float64` scalars, cheap even at tens
+of thousands of steps -- [`reverse_tsit5_on_checkpoints!`](@ref) needs the
+FULL `dt` sequence to replay each window, not just the checkpoint times).
+
+`record_full_u=true` (default) additionally materialises `mesh.u`, every
+node's FULL state (`state_length_1st_order(M)` complex numbers per node --
+`O(M)` per node, `O(steps)` nodes, "easily hundreds of MB at a real
+ensemble size" per [`FrozenTsit5Mesh`](@ref)'s own docstring, and far more
+than that at `M` in the tens of thousands over a fine adaptive solve).
+This is required by [`reverse_tsit5_on_states!`](@ref) (the non-
+checkpointed reverse sweep, `use_checkpoints=false`), which needs every
+intermediate state directly, not replayed.
+
+`record_full_u=false` instead uses a `DiffEqCallbacks.FunctionCallingCallback`
+firing on every accepted step to build `mesh.t`/`mesh.dt` incrementally
+WITHOUT ever storing the full per-node state list: only the checkpoint
+nodes' own states are copied out of the integrator (`O(steps/stride)`
+memory instead of `O(steps)`), directly into `stack.u`. `mesh.u` comes
+back an EMPTY vector in this mode -- only [`reverse_tsit5_on_checkpoints!`](@ref)
+(never `reverse_tsit5_on_states!`) can consume the result; this is exactly
+what fixes the checkpointed adjoint path actually OOMing during the
+forward recording pass itself (an earlier version of this function always
+built the full `mesh.u` regardless of `checkpoint_stride`/`use_checkpoints`,
+so `record_full_u=false` was never reachable and a large-ensemble
+`grad_mode=:adjoint, use_checkpoints=true` run paid the full O(steps)
+memory cost anyway, before checkpointing ever got a chance to help).
+Both recording modes produce the IDENTICAL `mesh.t`/`mesh.dt`/`stack`
+content for the same trajectory -- only which states get materialised
+differs.
 """
 function record_adaptive_tsit5_mesh(
     u0::AbstractVector,
@@ -396,6 +448,7 @@ function record_adaptive_tsit5_mesh(
     abstol=1e-8,
     tstops=Float64[],
     checkpoint_stride::Integer=typemax(Int),
+    record_full_u::Bool=true,
     alg=Tsit5(),
 )
     eltype(u0) <: ForwardDiff.Dual && error(
@@ -404,34 +457,70 @@ function record_adaptive_tsit5_mesh(
     nameof(typeof(alg)) === :Tsit5 || error(
         "record_adaptive_tsit5_mesh only supports Tsit5, got $(typeof(alg))."
     )
-    u0c = ComplexF64.(u0)
-    prob = ODEProblem(rhs_1st_order!, u0c, tspan, p)
-    sol = solve(prob, Tsit5(); reltol=reltol, abstol=abstol, tstops=tstops,
-                save_everystep=true, save_start=true, dense=false)
-    _successful_solve(sol) || throw(PulseSolveFailed(sol.retcode))
-    t = collect(Float64, sol.t)
-    length(t) >= 2 || error("record_adaptive_tsit5_mesh: solver returned fewer than 2 nodes.")
-    dt = diff(t)
-    u = Vector{Vector{ComplexF64}}(undef, length(t))
-    @inbounds for i in eachindex(t)
-        u[i] = ComplexF64.(Array(sol.u[i]))
-    end
-    n = length(u)
     stride = Int(checkpoint_stride)
     stride < 1 && error("checkpoint_stride must be >= 1, got $stride.")
-    idxs = Int[]
-    push!(idxs, 1)
-    if stride < n
-        k = 1 + stride
-        while k < n
-            push!(idxs, k)
-            k += stride
+    u0c = ComplexF64.(u0)
+
+    if record_full_u
+        prob = ODEProblem(rhs_1st_order!, u0c, tspan, p)
+        sol = solve(prob, Tsit5(); reltol=reltol, abstol=abstol, tstops=tstops,
+                    save_everystep=true, save_start=true, dense=false)
+        _successful_solve(sol) || throw(PulseSolveFailed(sol.retcode))
+        t = collect(Float64, sol.t)
+        length(t) >= 2 || error("record_adaptive_tsit5_mesh: solver returned fewer than 2 nodes.")
+        dt = diff(t)
+        u = Vector{Vector{ComplexF64}}(undef, length(t))
+        @inbounds for i in eachindex(t)
+            u[i] = ComplexF64.(Array(sol.u[i]))
         end
+        n = length(u)
+        idxs = _checkpoint_indices(n, stride)
+        stack = HostCheckpointStack(t[idxs], [copy(u[i]) for i in idxs], idxs, stride)
+        mesh = FrozenTsit5Mesh(t, dt, u)
+        return mesh, stack, copy(u[end])
     end
-    idxs[end] != n && push!(idxs, n)
-    stack = HostCheckpointStack(t[idxs], [copy(u[i]) for i in idxs], idxs, stride)
-    mesh = FrozenTsit5Mesh(t, dt, u)
-    return mesh, stack, copy(u[end])
+
+    # Memory-bounded recording: never materialises the full per-node state
+    # list. `step[]` counts accepted steps (node 1 is u0, recorded below
+    # before the solve starts); a node `n>=2` is a checkpoint exactly when
+    # `_checkpoint_indices` would include it, i.e. `(n-1) % stride == 0` --
+    # the periodic part of that same arithmetic sequence, evaluated live
+    # instead of from a known final `n`. The final node is topped up
+    # afterward if it didn't already land on that periodic schedule,
+    # reproducing `_checkpoint_indices(n, stride)` exactly either way (see
+    # that function: the trailing `idxs[end] != n && push!(idxs, n)` step
+    # has the same effect).
+    t_log = Float64[Float64(tspan[1])]
+    u_stack = Vector{ComplexF64}[ComplexF64.(u0c)]
+    idx_stack = Int[1]
+    step = Ref(0)
+    function record!(u, t, _integrator)
+        step[] += 1
+        n = step[] + 1
+        push!(t_log, Float64(t))
+        if (n - 1) % stride == 0
+            push!(u_stack, ComplexF64.(u))
+            push!(idx_stack, n)
+        end
+        return nothing
+    end
+    cb = FunctionCallingCallback(record!; func_everystep=true, func_start=false)
+    prob = ODEProblem(rhs_1st_order!, u0c, tspan, p)
+    sol = solve(prob, Tsit5(); reltol=reltol, abstol=abstol, tstops=tstops,
+                save_everystep=false, save_start=false, save_end=true, dense=false,
+                callback=cb)
+    _successful_solve(sol) || throw(PulseSolveFailed(sol.retcode))
+    n = step[] + 1
+    n >= 2 || error("record_adaptive_tsit5_mesh: solver returned fewer than 2 nodes.")
+    if idx_stack[end] != n
+        push!(u_stack, ComplexF64.(Array(sol.u[end])))
+        push!(idx_stack, n)
+    end
+    t = t_log
+    dt = diff(t)
+    stack = HostCheckpointStack(t[idx_stack], u_stack, idx_stack, stride)
+    mesh = FrozenTsit5Mesh(t, dt, Vector{ComplexF64}[])
+    return mesh, stack, copy(u_stack[end])
 end
 
 """

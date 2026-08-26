@@ -3,6 +3,7 @@ using ForwardDiff
 using QuadGK
 using Random
 using DifferentialEquations
+using DiffEqCallbacks
 
 # Include the pulse stack without loading the full CUDA package.
 include(joinpath(@__DIR__, "..", "src", "bspline.jl"))
