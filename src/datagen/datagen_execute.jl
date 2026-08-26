@@ -6,28 +6,116 @@ const RULE_SIMULATION_ORDER = :order1
 const RULE_NT_SAVE = 5001
 const RULE_RELTOL = 1e-8
 const RULE_ABSTOL = 1e-8
-# Paper 1st-order maxima (Hanamura & Touzard):
-#   M_delta = 3000  — fig. 3b ACE / ROSE
-#   M_g     = 20    — fig. 3c silencing (Gaussian g)
-# Constant g still forces M_g = 1 (package binning).
-const RULE_M_DELTA = 3000
-const RULE_M_G_INHOM = 20
-const RULE_M_PRODUCT_MAX = 3000 * 20
+const RULE_SPLIT_SAFETY_FACTOR = 3.0
+const RULE_QUADRATURE_BINS = 30
 
-function run_rule_M_g(sys)
-    return sys.g_inhomogeneity.kind === :constant ? 1 : RULE_M_G_INHOM
+# ============================================================
+# Optimal Ensemble Splitting Framework
+# Computes M_delta and M_g dynamically based on the Fourier
+# limits of the chosen continuous distributions.
+# ============================================================
+
+"""
+    compute_optimal_splitting(freq_inhomogeneity, g_inhomogeneity, T_max;
+                              safety_factor=3.0, quadrature_bins=30) -> NamedTuple
+
+Calculates the optimal allocation for M_delta and M_g to prevent
+artificial Dirichlet revivals while minimizing computational waste.
+
+# Arguments
+- `freq_inhomogeneity`: The detuning NamedTuple from SYSTEM_CONFIG.
+- `g_inhomogeneity`: The coupling NamedTuple from SYSTEM_CONFIG.
+- `T_max`: The maximum physical duration of the pulse sequence (in seconds).
+- `safety_factor`: Multiplier applied to M_min. Use 3.0 for global search,
+                   10.0 for geometric stepping, and higher for asymptotic convergence.
+- `quadrature_bins`: The fixed number of bins used for M_g if the coupling
+                     distribution is continuous.
+"""
+function compute_optimal_splitting(
+    freq_inhomogeneity,
+    g_inhomogeneity,
+    T_max::Real;
+    safety_factor::Real=3.0,
+    quadrature_bins::Integer=30
+)
+    # --------------------------------------------------------
+    # 1. Determine Frequency Bandwidth (BW)
+    # --------------------------------------------------------
+    kind_f = freq_inhomogeneity.kind
+    FWHM = freq_inhomogeneity.FWHM
+
+    if kind_f == :gaussian
+        # Matches gaussian_sigma_from_FWHM in frequency_inhomogeneity.jl
+        sigma = FWHM / (2 * sqrt(2 * log(2)))
+        span_sigma = freq_inhomogeneity.span_sigma
+        BW = 2 * span_sigma * sigma
+
+    elseif kind_f == :lorentzian
+        # Matches lorentzian_gamma_from_FWHM in frequency_inhomogeneity.jl
+        gammaL = FWHM / 2
+        span_gamma = freq_inhomogeneity.span_gamma
+        BW = 2 * span_gamma * gammaL
+
+    else
+        error("Unsupported freq_inhomogeneity kind for splitting: $(kind_f).")
+    end
+
+    # --------------------------------------------------------
+    # 2. Determine M_delta (Phase Sensitivity / Fourier Bound)
+    # --------------------------------------------------------
+    M_delta_min = (T_max * BW) / (2 * pi)
+
+    if safety_factor < 1.0
+        @warn "safety_factor < 1.0 violates the Fourier limit. Optimization will likely overfit to artificial revivals."
+    end
+
+    M_delta = ceil(Int, M_delta_min * safety_factor)
+
+    # --------------------------------------------------------
+    # 3. Determine M_g (Amplitude Sensitivity / Quadrature)
+    # --------------------------------------------------------
+    kind_g = g_inhomogeneity.kind
+
+    if kind_g == :constant
+        # A constant coupling uses exactly one effective bin
+        M_g = 1
+    elseif kind_g in (:gaussian, :powerlaw_g, :user_defined)
+        # Continuous distributions converge rapidly via standard quadrature
+        M_g = quadrature_bins
+    else
+        error("Unsupported g_inhomogeneity kind for splitting: $(kind_g).")
+    end
+
+    M_total = M_delta * M_g
+
+    return (
+        M_delta = M_delta,
+        M_g = M_g,
+        M_total = M_total,
+        M_delta_min = M_delta_min,
+        BW = BW
+    )
+end
+
+function splitting_for_run(sys, Ttotal::Float64)
+    split = compute_optimal_splitting(
+        sys.freq_inhomogeneity,
+        sys.g_inhomogeneity,
+        Ttotal;
+        safety_factor = RULE_SPLIT_SAFETY_FACTOR,
+        quadrature_bins = RULE_QUADRATURE_BINS,
+    )
+    split.M_delta >= 1 || error("computed M_delta = $(split.M_delta) is not positive.")
+    split.M_g >= 1 || error("computed M_g = $(split.M_g) is not positive.")
+    return split
 end
 
 function build_sim_setting(sys, Ttotal::Float64, ic::Symbol, saved_file_name::AbstractString)
-    M_g = run_rule_M_g(sys)
-    M_delta = RULE_M_DELTA
-    M_delta * M_g <= RULE_M_PRODUCT_MAX || error(
-        "M_delta*M_g = $(M_delta * M_g) exceeds $(RULE_M_PRODUCT_MAX)."
-    )
+    split = splitting_for_run(sys, Ttotal)
     return (
         simulation_order = RULE_SIMULATION_ORDER,
-        M_delta = M_delta,
-        M_g = M_g,
+        M_delta = split.M_delta,
+        M_g = split.M_g,
         initial_condition = ic,
         Ttotal = Ttotal,
         Nt_save = RULE_NT_SAVE,
@@ -149,14 +237,14 @@ function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString
     return elapsed
 end
 
-function simulate_catalog_entry(run_id::Integer, sys, PULSE_SPEC; skip_existing::Bool = true)
+function simulate_catalog_entry(stem::AbstractString, sys, PULSE_SPEC; skip_existing::Bool = true)
     n_ok = 0
     n_skipped = 0
     n_failed = 0
     reports = Dict{String, Any}()
 
     for ic in (:ground, :equator)
-        outpath = result_path(run_id, ic)
+        outpath = result_path(stem, ic)
         if skip_existing && isfile(outpath)
             reports[String(ic)] = Dict("status" => "skipped", "path" => outpath)
             n_skipped += 1
@@ -177,7 +265,7 @@ function simulate_catalog_entry(run_id::Integer, sys, PULSE_SPEC; skip_existing:
                 "error" => sprint(showerror, err),
             )
             n_failed += 1
-            println("[run_$(lpad(run_id, 6, '0')) $ic] FAILED: ", sprint(showerror, err))
+            println("[$stem $ic] FAILED: ", sprint(showerror, err))
         end
         GC.gc()
     end

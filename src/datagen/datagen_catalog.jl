@@ -77,34 +77,33 @@ end
 
 function write_catalog!(pairs; dry_run::Bool = false, limit::Int = 0)
     ensure_datagen_dirs()
-    stamp = git_commit_stamp()
     n = 0
     n_write = 0
+    used = Set{String}()
+    stems = String[]
     for (i, pair) in enumerate(pairs)
         limit > 0 && i > limit && break
         n += 1
-        Ttotal = derive_ttotal(pair.SYSTEM_CONFIG, pair.PULSE_SPEC)
-        metadata = (
-            run_id = i,
-            run_rules_version = RUN_RULES_VERSION,
-            git_commit = stamp,
-            layer = pair.layer,
-            family = pair.PULSE_SPEC.family,
-            derived_Ttotal = Ttotal,
-            M_delta = RULE_M_DELTA,
-            M_g = run_rule_M_g(pair.SYSTEM_CONFIG),
-        )
+        stem = uniquify_stem(datagen_stem(pair.SYSTEM_CONFIG, pair.PULSE_SPEC), used)
+        push!(stems, stem)
         if !dry_run
             save_simulconfig(
-                simulconfig_path(i),
+                simulconfig_path(stem),
                 pair.SYSTEM_CONFIG,
                 pair.PULSE_SPEC,
-                metadata,
             )
             n_write += 1
         end
     end
-    return n, n_write
+    return n, n_write, stems
+end
+
+function clear_existing_configs!()
+    for fname in readdir(DATAGEN_CONFIG_DIR)
+        endswith(fname, "_simulconfig.jld2") || continue
+        rm(joinpath(DATAGEN_CONFIG_DIR, fname); force=true)
+    end
+    return nothing
 end
 
 function phase_configs(; dry_run::Bool = false, limit::Int = 0)
@@ -123,11 +122,20 @@ function phase_configs(; dry_run::Bool = false, limit::Int = 0)
     println("  unique validated (system, pulse) pairs: $(length(pairs))")
     println("  simulations if executed: $(2 * length(pairs))  (ground + equator)")
 
-    n, n_write = write_catalog!(pairs; dry_run = dry_run, limit = limit)
+    if !dry_run
+        clear_existing_configs!()
+    end
+    n, n_write, stems = write_catalog!(pairs; dry_run = dry_run, limit = limit)
     if dry_run
         println("Dry run: would write $n simulconfig files under $(DATAGEN_CONFIG_DIR).")
+        if !isempty(stems)
+            println("  example stem: $(stems[1])")
+        end
     else
         println("Wrote $n_write simulconfig files under $(DATAGEN_CONFIG_DIR).")
+        if !isempty(stems)
+            println("  example stem: $(stems[1])")
+        end
     end
     return n
 end
@@ -145,18 +153,18 @@ function phase_simulate(; skip_existing::Bool = true, start_id::Int = 1, stop_id
     n_failed = 0
     n_done = 0
 
-    for fname in files
+    for (idx, fname) in enumerate(files)
         entry = load_simulconfig(joinpath(DATAGEN_CONFIG_DIR, fname))
-        run_id = Int(entry.metadata.run_id)
-        run_id < start_id && continue
-        stop_id > 0 && run_id > stop_id && continue
+        stem = stem_from_simulconfig_path(fname)
+        idx < start_id && continue
+        stop_id > 0 && idx > stop_id && continue
 
         println()
         println("=" ^ 60)
+        println("[$stem]")
         println(
             @sprintf(
-                "[run_%06d] family=%s  C_ens=%.3g  g=%s  freq=%s",
-                run_id,
+                "  family=%s  C_ens=%.3g  g=%s  freq=%s",
                 entry.PULSE_SPEC.family,
                 entry.SYSTEM_CONFIG.C_ens,
                 entry.SYSTEM_CONFIG.g_inhomogeneity.kind,
@@ -166,7 +174,7 @@ function phase_simulate(; skip_existing::Bool = true, start_id::Int = 1, stop_id
         println("=" ^ 60)
 
         ok, skipped, failed, reports = simulate_catalog_entry(
-            run_id,
+            stem,
             entry.SYSTEM_CONFIG,
             entry.PULSE_SPEC;
             skip_existing = skip_existing,
@@ -176,8 +184,8 @@ function phase_simulate(; skip_existing::Bool = true, start_id::Int = 1, stop_id
         n_failed += failed
         n_done += 1
 
-        manifest[@sprintf("run_%06d", run_id)] = Dict{String, Any}(
-            "run_id" => run_id,
+        manifest[stem] = Dict{String, Any}(
+            "stem" => stem,
             "family" => String(entry.PULSE_SPEC.family),
             "run_rules_version" => RUN_RULES_VERSION,
             "ics" => reports,

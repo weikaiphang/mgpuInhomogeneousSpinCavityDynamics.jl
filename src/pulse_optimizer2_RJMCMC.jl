@@ -517,6 +517,20 @@ one left off. Must have length `n_params(pulse)`, i.e. be a raw parameter
 vector for a `CompositePulse` with the SAME `(k, n_coeff_A, n_coeff_f)`
 as this call's -- an error is raised otherwise, since a length mismatch
 would silently decode into a nonsensical pulse rather than fail loudly.
+
+`dynamic_w_time`/`w_time_decay` (defaults `false`/`0.05`, forwarded
+unchanged to every `run_local_adam` call, hop 0 and every subsequent
+hop -- INCLUDING across a `_grow_pulse`/`_shrink_pulse` dimension change,
+since they're a `run_local_adam`-level schedule, not a `pulse`-level one)
+anneal each hop's own duration-penalty gradient in from near-zero as that
+hop's physics fidelity improves -- see [`run_local_adam`](@ref)'s own
+docstring and [`_dynamic_w_time`](@ref) for the schedule. As with the
+fixed-`k` `optimise_composite_pulse`, these are explicit keywords here
+specifically so they are NEVER part of `solve_kwargs` -- `initial_metrics`/
+`final_metrics` (`pulse_cost` calls, which know nothing about them) and
+every hop's `_extract_physics_cost` comparison therefore still see only
+the STATIC, `w_time`-fixed cost `run_local_adam` already reconstitutes
+before returning.
 """
 function optimise_composite_pulse_rjmcmc(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
@@ -524,7 +538,8 @@ function optimise_composite_pulse_rjmcmc(
     n_hops::Integer=3, hop_patience::Integer=2, hop_step_size::Real=0.5, temperature::Real=1.0,
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
     target_F::Real=1.0, w_time::Real=0.15,
-    seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="", solve_kwargs...,
+    seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
+    dynamic_w_time::Bool=false, w_time_decay::Real=0.05, solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
@@ -536,7 +551,8 @@ function optimise_composite_pulse_rjmcmc(
         (k=k, n_coeff_A=n_coeff_A, n_coeff_f=n_coeff_f, degree=degree, taper_frac=taper_frac,
          num_epochs=num_epochs, learning_rate=learning_rate, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
-         w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed),
+         w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
+         dynamic_w_time=dynamic_w_time, w_time_decay=w_time_decay),
         solve_settings,
     )
 
@@ -560,7 +576,8 @@ function optimise_composite_pulse_rjmcmc(
 
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate,
-        label="$(label_prefix)[hop 0]", solve_kwargs...
+        label="$(label_prefix)[hop 0]", dynamic_w_time=dynamic_w_time, w_time_decay=w_time_decay,
+        solve_kwargs...
     )
     append!(history, hop0_history)
     current_pulse = pulse
@@ -590,7 +607,8 @@ function optimise_composite_pulse_rjmcmc(
         cand_u, cand_cost, _, _, _, hop_history = run_local_adam(
             candidate_u0, candidate_pulse, d, cost_kwargs;
             hop, num_epochs, patience, tol, learning_rate,
-            label="$(label_prefix)[hop $hop move=$move k=$(candidate_pulse.k)]", solve_kwargs...,
+            label="$(label_prefix)[hop $hop move=$move k=$(candidate_pulse.k)]",
+            dynamic_w_time=dynamic_w_time, w_time_decay=w_time_decay, solve_kwargs...,
         )
         append!(history, hop_history)
         cand_phys_cost = _extract_physics_cost(cand_cost, cand_u, candidate_pulse, w_power)

@@ -6,7 +6,8 @@
 #   julia --project=. src/datagen/datagen_run.jl --phase simulate
 #   julia --project=. src/datagen/datagen_run.jl --phase all
 #
-# Optional: --limit N   --start ID   --stop ID   --no-skip
+# Optional: --limit N   --start IDX   --stop IDX   --no-skip
+# (--start/--stop are 1-based indices into the sorted configs listing)
 
 module DataGen
 
