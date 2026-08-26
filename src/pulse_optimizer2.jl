@@ -1877,6 +1877,73 @@ function _direct_cost_term(uu, pulse::CompositePulse, w_time, w_power, w_tmax)
     return w_time * (dur / pulse.T_max) + tmax_penalty + power_penalty
 end
 
+# ============================================================
+# DYNAMIC w_time ANNEALING (run_local_adam(dynamic_w_time=true))
+#
+# Optional curriculum schedule: suppress the duration penalty while the
+# pulse is still physically bad, so early epochs' gradient descends purely
+# on inversion/silencing rather than being pulled toward "just make it
+# short" before it even inverts anything, then let the penalty ramp back
+# up toward the caller's own `w_time` as physics_cost improves. Detached
+# from the epoch's own AD tape (built from the PREVIOUS accepted point's
+# plain-Float64 metrics, never from the Dual/adjoint state being
+# differentiated THIS epoch), and reconstructed back to the exact static
+# cost afterward (see `_reconstitute_static_w_time_cost`) so every
+# comparison outside this one epoch's own gradient step -- `best_cost`/
+# `improved`/early stopping here, and basin-hopping/final reporting one
+# level up in `optimise_composite_pulse` -- stays on the SAME fixed
+# objective the caller actually asked for, never a moving target.
+# ============================================================
+
+"""
+    _dynamic_w_time(base_w_time, inv, sil, target_F, w_time_decay) -> Float64
+
+Curriculum weight for [`run_local_adam`](@ref)'s `dynamic_w_time=true`
+duration-penalty schedule: `base_w_time * exp(-physics_loss / w_time_decay)`,
+where `physics_loss = (1 - inv*(1-(sil-target_F)^2))^2` is [`pulse_cost`](@ref)'s
+own `physics_cost` formula evaluated at the supplied `(inv, sil)` (the
+LAST ACCEPTED point's metrics, plain `Float64` -- see this section's own
+comment for why that detachment matters). `physics_loss ∈ [0, 1]`
+(`inv`/`sil ∈ [0, 1]`, so `physics_cost` is too), so this is always in
+`(0, base_w_time]`: it can only SUPPRESS the caller's own `w_time`, never
+exceed it -- `physics_loss=0` (perfect fidelity) recovers `base_w_time`
+exactly; `physics_loss=1` (worst case) suppresses it toward (but never
+reaching) `0`. `inv`/`sil` may be `NaN` (no accepted point yet, e.g.
+epoch 1) -- treated as `0` each, i.e. worst-case `physics_loss=1`, the
+correct "haven't measured any fidelity yet" starting point.
+"""
+function _dynamic_w_time(base_w_time::Real, inv::Real, sil::Real, target_F::Real, w_time_decay::Real)
+    w_time_decay > 0 || error("_dynamic_w_time: w_time_decay must be > 0, got $w_time_decay.")
+    inv_c = isnan(inv) ? 0.0 : Float64(inv)
+    sil_c = isnan(sil) ? 0.0 : Float64(sil)
+    silencing_success = 1.0 - (sil_c - Float64(target_F))^2
+    physics_fidelity = inv_c * silencing_success
+    physics_loss = (1.0 - physics_fidelity)^2
+    return Float64(base_w_time) * exp(-physics_loss / Float64(w_time_decay))
+end
+
+"""
+    _reconstitute_static_w_time_cost(dyn_cost, base_w_time, dyn_w_time, duration, T_max) -> Float64
+
+Exact (not approximate) conversion of a [`pulse_cost`](@ref) value computed
+under `w_time=dyn_w_time` back to what it would have been under
+`w_time=base_w_time`, WITHOUT a second ODE solve. Valid because `w_time`
+enters `pulse_cost` through exactly one term, `w_time*(duration/T_max)`,
+linearly, and every other term (`physics_cost`, `tmax_penalty`,
+`power_penalty`) is independent of `w_time` entirely -- so for the SAME
+`u` (hence the same `duration`, `physics_cost`, `tmax_penalty`,
+`power_penalty`), the cost at any other `w_time` differs from `dyn_cost`
+by exactly `(new_w_time - dyn_w_time)*(duration/T_max)`. `dyn_cost=Inf`
+(a caught `PulseSolveFailed`, see [`pulse_cost`](@ref)'s own failure
+contract) passes through unchanged (`Inf` plus a finite correction is
+still `Inf`), correctly preserving [`run_local_adam`](@ref)'s
+`!isfinite(cost)` failure check.
+"""
+function _reconstitute_static_w_time_cost(dyn_cost::Real, base_w_time::Real, dyn_w_time::Real,
+                                          duration::Real, T_max::Real)
+    return dyn_cost + (Float64(base_w_time) - Float64(dyn_w_time)) * (Float64(duration) / Float64(T_max))
+end
+
 function _gradient_on_indices(f, u::AbstractVector, idxs::Vector{Int})
     isempty(idxs) && return zeros(Float64, length(u))
     return _gradient_on_indices_val(f, u, idxs, Val{length(idxs)}())
@@ -2224,15 +2291,40 @@ non-`1.0` value is asserted as a universal default here -- watch
 `history`'s `cost`/`silencing` columns for erratic (non-monotone,
 large-swing) epoch-to-epoch behaviour as the signal that a smaller
 `cf_lr_scale` is worth trying.
+
+`dynamic_w_time` (default `false`, i.e. zero behaviour change unless a
+caller opts in) anneals the duration penalty in via
+[`_dynamic_w_time`](@ref): each epoch's GRADIENT is computed under
+`w_time = base_w_time * exp(-physics_loss/w_time_decay)` (`physics_loss`
+from the LAST ACCEPTED point, detached from this epoch's own AD tape --
+see that function's docstring), so early epochs -- where `physics_loss`
+starts near its worst case -- descend almost purely on inversion/
+silencing, only picking up the duration penalty once fidelity is
+actually good. `w_time_decay` (default `0.05`) sets how fast that
+suppression relaxes; smaller values relax faster. Critically, `cost`
+itself (the value used for `best_cost`/`improved`/early stopping here,
+and everything [`optimise_composite_pulse`](@ref) does with the
+`run_local_adam`-returned cost one level up: basin-hopping's Metropolis
+test and `final_metrics`) is NOT the raw value that dynamic `w_time`
+produced -- it is exactly reconstituted back to what it would have been
+under the caller's own static `w_time` via
+[`_reconstitute_static_w_time_cost`](@ref), so every one of those
+comparisons still happens on the SAME fixed objective throughout, even
+though the GRADIENT driving `u` was shaped by a moving one. Only the
+descent direction is annealed; nothing that compares costs across epochs,
+hops, or calls ever sees a moving target.
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
                          learning_rate::Real=0.05, cf_lr_scale::Real=1.0, label::AbstractString="",
-                         threaded_grad::Bool=false, compute::Symbol=:auto,
-                         grad_mode::Symbol=:forwarddiff, solve_kwargs...)
+                         threaded_grad::Bool=false, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
+                         dynamic_w_time::Bool=false, w_time_decay::Real=0.05, solve_kwargs...)
     _forbid_initial_condition(solve_kwargs)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
         "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
+    )
+    dynamic_w_time && w_time_decay <= 0 && error(
+        "w_time_decay must be > 0 when dynamic_w_time=true, got $w_time_decay."
     )
     u = copy(u_start)
     n = length(u)
@@ -2242,17 +2334,8 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         fill(cf_lr_scale, pulse.n_coeff_f, pulse.k),
     )
     aux = Ref{NTuple{5,Float64}}((NaN, NaN, NaN, NaN, NaN))
-    function cost_only(uu)
-        c, inv_, sil_, dur_, coh_ = pulse_cost(uu, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
-        aux[] = (
-            Float64(ForwardDiff.value(c)),
-            Float64(ForwardDiff.value(inv_)),
-            Float64(ForwardDiff.value(sil_)),
-            Float64(ForwardDiff.value(dur_)),
-            Float64(ForwardDiff.value(coh_)),
-        )
-        return c
-    end
+    base_w_time = haskey(cost_kwargs, :w_time) ? Float64(cost_kwargs.w_time) : 0.15
+    target_F_val = haskey(cost_kwargs, :target_F) ? Float64(cost_kwargs.target_F) : 1.0
 
     best_u = copy(u_start)
     best_cost, best_inv, best_sil, best_dur = Inf, 0.0, 0.0, 0.0
@@ -2269,6 +2352,20 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
 
     for epoch in 1:num_epochs
         t_wall = time()
+
+        # dynamic_w_time: shape THIS epoch's gradient with a w_time annealed
+        # from the LAST ACCEPTED point's own (plain-Float64, AD-detached)
+        # metrics -- see _dynamic_w_time's own docstring. Computing this
+        # unconditionally (even when dynamic_w_time=false, or when
+        # just_reverted -- where it's dead, since that branch below never
+        # reads epoch_cost_kwargs/dyn_w_time at all) is harmless: it's a few
+        # scalar ops, and dyn_w_time==base_w_time whenever dynamic_w_time is
+        # false, so epoch_cost_kwargs reduces to cost_kwargs unchanged.
+        dyn_w_time = dynamic_w_time ?
+            _dynamic_w_time(base_w_time, last_good_aux[2], last_good_aux[3], target_F_val, w_time_decay) :
+            base_w_time
+        epoch_cost_kwargs = dynamic_w_time ? merge(cost_kwargs, (w_time=dyn_w_time,)) : cost_kwargs
+
         # After a revert, `u` is exactly `last_good_u` -- a point already
         # fully evaluated (one ODE solve + AD gradient) the first time it
         # was accepted. Re-running that identical, expensive, deterministic
@@ -2279,6 +2376,12 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # each retry blends the SAME cached gradient into momentum exactly
         # once (as a normal step would), rather than accumulating it again
         # on top of whatever the previous failed attempt already blended in.
+        # `last_good_aux` already holds the STATIC (reconstituted) cost --
+        # see where it's cached below -- so it's read back directly here,
+        # with no reconstruction re-applied: re-reconstructing against the
+        # freshly-recomputed `dyn_w_time` above would be wrong, since it
+        # need not match the w_time `last_good_aux`'s cost was actually
+        # computed under.
         if just_reverted
             grad = last_good_grad
             cost, inv_, sil_, dur_, coh_ = last_good_aux
@@ -2286,16 +2389,33 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
             adam.v .= adam_v0
             adam.t = adam_t0
         elseif grad_mode === :adjoint
-            grad, cost, inv_, sil_, dur_, coh_ = pulse_cost_grad_adjoint(
-                u, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...,
+            grad, dyn_cost, inv_, sil_, dur_, coh_ = pulse_cost_grad_adjoint(
+                u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
+            cost = dynamic_w_time ?
+                _reconstitute_static_w_time_cost(dyn_cost, base_w_time, dyn_w_time, dur_, pulse.T_max) : dyn_cost
         elseif threaded_grad
-            grad, cost, inv_, sil_, dur_, coh_ = _pulse_cost_grad_threaded(
-                u, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...,
+            grad, dyn_cost, inv_, sil_, dur_, coh_ = _pulse_cost_grad_threaded(
+                u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
+            cost = dynamic_w_time ?
+                _reconstitute_static_w_time_cost(dyn_cost, base_w_time, dyn_w_time, dur_, pulse.T_max) : dyn_cost
         else
+            function cost_only(uu)
+                c, inv_2, sil_2, dur_2, coh_2 = pulse_cost(uu, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...)
+                aux[] = (
+                    Float64(ForwardDiff.value(c)),
+                    Float64(ForwardDiff.value(inv_2)),
+                    Float64(ForwardDiff.value(sil_2)),
+                    Float64(ForwardDiff.value(dur_2)),
+                    Float64(ForwardDiff.value(coh_2)),
+                )
+                return c
+            end
             grad = ForwardDiff.gradient(cost_only, u)
-            cost, inv_, sil_, dur_, coh_ = aux[]
+            dyn_cost, inv_, sil_, dur_, coh_ = aux[]
+            cost = dynamic_w_time ?
+                _reconstitute_static_w_time_cost(dyn_cost, base_w_time, dyn_w_time, dur_, pulse.T_max) : dyn_cost
         end
         if !isfinite(cost)
             epochs_since_improve += 1
@@ -2451,6 +2571,15 @@ would silently decode into a nonsensical pulse rather than fail loudly.
 `cf_lr_scale` (default `1.0`) is forwarded unchanged to every
 [`run_local_adam`](@ref) call (hop 0 and every subsequent hop) -- see that
 function's own docstring for what it does and why.
+
+`dynamic_w_time`/`w_time_decay` (defaults `false`/`0.05`, forwarded
+unchanged to every `run_local_adam` call, hop 0 and every subsequent hop)
+anneal each hop's own duration-penalty gradient in from near-zero as that
+hop's physics fidelity improves -- see [`run_local_adam`](@ref)'s own
+docstring and [`_dynamic_w_time`](@ref) for the schedule and why the
+`cost` this function itself compares (basin-hopping's Metropolis test,
+`final_metrics`) is unaffected: `run_local_adam` already reconstitutes it
+back to the static, `w_time`-fixed value before returning it.
 """
 function optimise_composite_pulse(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
@@ -2459,7 +2588,8 @@ function optimise_composite_pulse(
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
-    threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff, solve_kwargs...,
+    threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
+    dynamic_w_time::Bool=false, w_time_decay::Real=0.05, solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
@@ -2479,7 +2609,8 @@ function optimise_composite_pulse(
          num_epochs=num_epochs, learning_rate=learning_rate, cf_lr_scale=cf_lr_scale, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
-         threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count()),
+         threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count(),
+         dynamic_w_time=dynamic_w_time, w_time_decay=w_time_decay),
         solve_settings,
     )
 
@@ -2505,7 +2636,7 @@ function optimise_composite_pulse(
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
         label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, compute=compute,
-        grad_mode=grad_mode, solve_kwargs...
+        grad_mode=grad_mode, dynamic_w_time=dynamic_w_time, w_time_decay=w_time_decay, solve_kwargs...
     )
     append!(history, hop0_history)
     global_best_u, global_best_cost = current_u, current_cost
@@ -2519,7 +2650,7 @@ function optimise_composite_pulse(
             candidate_u0, pulse, d, cost_kwargs;
             hop, num_epochs, patience, tol, learning_rate, cf_lr_scale,
             label="$(label_prefix)[hop $hop]", threaded_grad=threaded_grad, compute=compute,
-            grad_mode=grad_mode, solve_kwargs...,
+            grad_mode=grad_mode, dynamic_w_time=dynamic_w_time, w_time_decay=w_time_decay, solve_kwargs...,
         )
         append!(history, hop_history)
 

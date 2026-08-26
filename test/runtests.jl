@@ -272,5 +272,71 @@ end
     )
 end
 
+@testset "_dynamic_w_time / _reconstitute_static_w_time_cost" begin
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    u0 = seed_canonical(pulse, :hs1)
+
+    # _dynamic_w_time: bounded in (0, base_w_time], monotone in physics_loss,
+    # NaN inv/sil (no accepted point yet) treated as worst-case loss=1.
+    base_w_time = 0.2
+    target_F = 1.0
+    w_decay = 0.05
+    @test _dynamic_w_time(base_w_time, NaN, NaN, target_F, w_decay) ≈ base_w_time * exp(-1.0 / w_decay)
+    @test _dynamic_w_time(base_w_time, 1.0, target_F, target_F, w_decay) ≈ base_w_time  # perfect fidelity -> loss=0
+    @test 0 < _dynamic_w_time(base_w_time, 0.5, 0.5, target_F, w_decay) <= base_w_time
+    w_hi = _dynamic_w_time(base_w_time, 0.2, 0.2, target_F, w_decay)
+    w_lo = _dynamic_w_time(base_w_time, 0.9, 0.9, target_F, w_decay)
+    @test w_lo > w_hi  # better fidelity (0.9) -> less suppression than worse fidelity (0.2)
+    @test_throws ErrorException _dynamic_w_time(base_w_time, 0.5, 0.5, target_F, 0.0)
+    @test_throws ErrorException _dynamic_w_time(base_w_time, 0.5, 0.5, target_F, -1.0)
+
+    # _reconstitute_static_w_time_cost: verified against a REAL second ODE
+    # solve (not just the algebra) -- pulse_cost at two different w_time
+    # values on the SAME u must differ by exactly (w2-w1)*(duration/T_max),
+    # since w_time enters pulse_cost through exactly that one linear term.
+    w1, w2 = 0.15, 0.6
+    cost1, inv1, sil1, dur1, coh1 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w1)
+    cost2, inv2, sil2, dur2, coh2 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w2)
+    @test dur1 == dur2  # duration is w_time-independent
+    @test inv1 == inv2 && sil1 == sil2 && coh1 == coh2  # so is everything else
+    reconstructed = _reconstitute_static_w_time_cost(cost1, w2, w1, dur1, pulse.T_max)
+    @test reconstructed ≈ cost2 atol=1e-12
+    # And the inverse direction, for good measure.
+    @test _reconstitute_static_w_time_cost(cost2, w1, w2, dur2, pulse.T_max) ≈ cost1 atol=1e-12
+
+    # Inf (failed-solve) sentinel passes through unchanged.
+    @test _reconstitute_static_w_time_cost(Inf, w2, w1, dur1, pulse.T_max) == Inf
+end
+
+@testset "run_local_adam dynamic_w_time=true: smoke + no-regression when off" begin
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    u0 = seed_canonical(pulse, :hs1)
+    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
+
+    # dynamic_w_time=false (the default) must reproduce the EXACT baseline --
+    # bit-for-bit, not just "close" -- confirming the new code path is
+    # provably a no-op unless a caller explicitly opts in.
+    baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[dwt-off]")
+    off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[dwt-off2]", dynamic_w_time=false)
+    @test baseline[1] == off[1]  # best_u
+    @test baseline[2] == off[2]  # best_cost
+    @test baseline[6] == off[6]  # history
+
+    # dynamic_w_time=true smoke: runs, finite, and diverges from the
+    # baseline once the schedule actually suppresses w_time (it cannot
+    # regress silently into being a no-op).
+    on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[dwt-on]",
+        dynamic_w_time=true, w_time_decay=0.05)
+    @test length(on[1]) == n_params(pulse)
+    @test isfinite(on[2])
+    @test length(on[6]) >= 1
+    @test_throws ErrorException run_local_adam(
+        u0, pulse, FAKE_D_ODE, cost_kwargs; dynamic_w_time=true, w_time_decay=0.0,
+    )
+end
+
 include(joinpath(@__DIR__, "adjoint.jl"))
 

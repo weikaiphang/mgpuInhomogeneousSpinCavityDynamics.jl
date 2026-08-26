@@ -7,7 +7,7 @@ const DATAGEN_CONFIG_DIR = joinpath(DATAGEN_ROOT, "configs")
 const DATAGEN_RESULT_DIR = joinpath(DATAGEN_ROOT, "results")
 const DATAGEN_MANIFEST = joinpath(DATAGEN_ROOT, "manifest.json")
 
-const RUN_RULES_VERSION = "1"
+const RUN_RULES_VERSION = "2"
 
 function ensure_datagen_dirs()
     mkpath(DATAGEN_CONFIG_DIR)

@@ -6,8 +6,13 @@ const RULE_SIMULATION_ORDER = :order1
 const RULE_NT_SAVE = 5001
 const RULE_RELTOL = 1e-8
 const RULE_ABSTOL = 1e-8
-const RULE_M_DELTA = 1000
+# Paper 1st-order maxima (Hanamura & Touzard):
+#   M_delta = 3000  — fig. 3b ACE / ROSE
+#   M_g     = 20    — fig. 3c silencing (Gaussian g)
+# Constant g still forces M_g = 1 (package binning).
+const RULE_M_DELTA = 3000
 const RULE_M_G_INHOM = 20
+const RULE_M_PRODUCT_MAX = 3000 * 20
 
 function run_rule_M_g(sys)
     return sys.g_inhomogeneity.kind === :constant ? 1 : RULE_M_G_INHOM
@@ -16,8 +21,8 @@ end
 function build_sim_setting(sys, Ttotal::Float64, ic::Symbol, saved_file_name::AbstractString)
     M_g = run_rule_M_g(sys)
     M_delta = RULE_M_DELTA
-    M_delta * M_g <= 50000 || error(
-        "M_delta*M_g = $(M_delta * M_g) exceeds 50000."
+    M_delta * M_g <= RULE_M_PRODUCT_MAX || error(
+        "M_delta*M_g = $(M_delta * M_g) exceeds $(RULE_M_PRODUCT_MAX)."
     )
     return (
         simulation_order = RULE_SIMULATION_ORDER,
