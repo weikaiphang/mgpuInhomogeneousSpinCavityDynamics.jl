@@ -13,6 +13,7 @@ include(joinpath(@__DIR__, "..", "src", "state_layout_1st_order.jl"))
 include(joinpath(@__DIR__, "..", "src", "rhs_1st_order.jl"))
 include(joinpath(@__DIR__, "..", "src", "rhs_1st_order_real.jl"))
 include(joinpath(@__DIR__, "..", "src", "pulse_optimizer2.jl"))
+include(joinpath(@__DIR__, "..", "src", "pulse_optimizer2_RJMCMC.jl"))
 include(joinpath(@__DIR__, "..", "src", "tsit5_discrete_adjoint.jl"))
 include(joinpath(@__DIR__, "..", "src", "pulse_adjoint.jl"))
 
@@ -460,138 +461,115 @@ end
     ) == Inf
 end
 
-@testset "run_local_adam anneal_direct_weights=true: smoke + no-regression when off" begin
+@testset "run_local_adam anneal_direct_weights=true by default + mandatory calibration" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
     cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
 
-    # anneal_direct_weights=false (the default) must reproduce the EXACT
-    # baseline -- bit-for-bit, not just "close" -- confirming the new code
-    # path is provably a no-op unless a caller explicitly opts in.
+    # anneal_direct_weights=true is now the default: calling with NOTHING
+    # else set must reproduce EXACTLY the same result as explicitly passing
+    # anneal_direct_weights=true (with its own default x_tune_alpha) --
+    # bit-for-bit, confirming the default really is what the keyword's own
+    # default claims.
     baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-off]")
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-default]")
+    explicit_on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-explicit]", anneal_direct_weights=true)
+    @test baseline[1] == explicit_on[1]  # best_u
+    @test baseline[2] == explicit_on[2]  # best_cost
+    @test baseline[6] == explicit_on[6]  # history
+
+    # anneal_direct_weights=false must still be a real opt-OUT, recovering
+    # the plain fixed-weight cost (schedule_factor == 1.0 on every row) and
+    # diverging from the annealed-by-default baseline.
     off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-off2]", anneal_direct_weights=false)
-    @test baseline[1] == off[1]  # best_u
-    @test baseline[2] == off[2]  # best_cost
-    @test baseline[6] == off[6]  # history
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-off]", anneal_direct_weights=false)
+    @test all(h.schedule_factor == 1.0 for h in off[6])
+    @test off[6] != baseline[6]
 
-    # anneal_direct_weights=true smoke: runs, finite, and diverges from the
-    # baseline once the schedule actually suppresses the direct weights (it
-    # cannot regress silently into being a no-op).
-    on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-on]",
-        anneal_direct_weights=true, x_tune=-3.0)
-    @test length(on[1]) == n_params(pulse)
-    @test isfinite(on[2])
-    @test length(on[6]) >= 1
-
-    # history now records x_tune/schedule_factor per epoch (x_tune=-3.0,
-    # no x_tune_alpha, so x_tune_eff is constant across every row).
-    @test all(h.x_tune == -3.0 for h in on[6])
+    # history's x_tune field carries the CALIBRATED value (constant across
+    # every row) matching solve_optimal_x_start applied to u0's own
+    # measured fidelity under _DEFAULT_X_TUNE_ALPHA exactly.
+    _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
+    F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
+    x_tune_expected = solve_optimal_x_start(F_0, _DEFAULT_X_TUNE_ALPHA)
+    @test all(h.x_tune == x_tune_expected for h in baseline[6])
     # Epoch 1's factor comes from last_good_aux still at its NaN/NaN
     # sentinel (no accepted point yet) -- _curriculum_fidelity_weight
     # treats that as worst-case fidelity_phys=0, giving factor==0 exactly.
-    @test on[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, -3.0)
+    @test baseline[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, x_tune_expected)
     # Every later epoch's factor must reproduce _curriculum_fidelity_weight
     # applied to the PREVIOUS row's own (inversion, silencing) -- i.e. the
     # last ACCEPTED point, not the epoch about to run.
-    for i in 2:length(on[6])
-        expected = _curriculum_fidelity_weight(on[6][i-1].inversion, on[6][i-1].silencing, 1.0, -3.0)
-        @test on[6][i].schedule_factor == expected
+    for i in 2:length(baseline[6])
+        expected = _curriculum_fidelity_weight(
+            baseline[6][i-1].inversion, baseline[6][i-1].silencing, 1.0, x_tune_expected)
+        @test baseline[6][i].schedule_factor == expected
     end
-    # anneal_direct_weights=false rows always carry the identity factor.
-    @test all(h.schedule_factor == 1.0 for h in baseline[6])
 
-    # x_tune=0.0 (default, plain linear) also smoke-tests cleanly.
-    on_linear = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-on-linear]", anneal_direct_weights=true)
-    @test isfinite(on_linear[2])
+    # Passing x_tune_alpha=nothing EXPLICITLY is the escape hatch: bypasses
+    # calibration entirely, falling back to the plain linear schedule
+    # (x_tune=0, i.e. factor = fidelity_phys exactly) since there is no raw
+    # x_tune keyword to fall back to any more.
+    manual = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-manual]",
+        x_tune_alpha=nothing)
+    @test all(h.x_tune == 0.0 for h in manual[6])
+    @test manual[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, 0.0)
+    @test manual[6] != baseline[6]  # linear (x_tune=0) differs from the calibrated default
 
-    @test_throws ErrorException run_local_adam(
-        u0, pulse, FAKE_D_ODE, cost_kwargs; anneal_direct_weights=true, x_tune=NaN,
-    )
-    @test_throws ErrorException run_local_adam(
-        u0, pulse, FAKE_D_ODE, cost_kwargs; anneal_direct_weights=true, x_tune=800.0,
-    )
-end
-
-@testset "run_local_adam x_tune_alpha auto-calibration" begin
-    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
-    u0 = seed_canonical(pulse, :hs1)
-    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
-
-    # x_tune_alpha=nothing (the default) must reproduce the EXACT
-    # anneal_direct_weights=true baseline bit-for-bit -- this new keyword is
-    # provably a no-op unless a caller explicitly sets it.
-    baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[xta-off]",
-        anneal_direct_weights=true, x_tune=-3.0)
-    off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[xta-off2]",
-        anneal_direct_weights=true, x_tune=-3.0, x_tune_alpha=nothing)
-    @test baseline[1] == off[1]  # best_u
-    @test baseline[2] == off[2]  # best_cost
-    @test baseline[6] == off[6]  # history
-
-    # x_tune_alpha set: calibrates x_tune from the measured starting
-    # fidelity at u0 instead of using the passed x_tune directly, so this
-    # must smoke-test cleanly and diverge from a run with the SAME x_tune
-    # left uncalibrated (the calibration must actually take effect, not
-    # silently fall through to the caller's x_tune).
-    on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[xta-on]",
-        anneal_direct_weights=true, x_tune=0.0, x_tune_alpha=0.9)
-    @test length(on[1]) == n_params(pulse)
-    @test isfinite(on[2])
-    @test length(on[6]) >= 1
-    @test on[6] != baseline[6]  # calibrated x_tune != -3.0 -> different per-epoch trajectory
-
-    # history's x_tune field must carry the CALIBRATED value (constant
-    # across every row, since calibration runs once before the epoch
-    # loop), not the raw x_tune=0.0 passed in -- and it must match
-    # solve_optimal_x_start applied to u0's own measured fidelity exactly.
-    _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
-    F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
-    x_tune_expected = solve_optimal_x_start(F_0, 0.9)
-    @test all(h.x_tune == x_tune_expected for h in on[6])
-    @test x_tune_expected != 0.0
-
-    # x_tune_alpha without anneal_direct_weights=true has nothing to
-    # calibrate x_tune for -- must error, not silently ignore it.
-    @test_throws ErrorException run_local_adam(
-        u0, pulse, FAKE_D_ODE, cost_kwargs; anneal_direct_weights=false, x_tune_alpha=0.5,
-    )
+    # A custom x_tune_alpha overrides the default target, actually takes
+    # effect (diverges from both the default-alpha baseline and the
+    # uncalibrated linear manual run), and is a silent no-op when
+    # anneal_direct_weights=false (nothing to calibrate for).
+    custom_alpha = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-custom]", x_tune_alpha=0.5)
+    @test custom_alpha[6][1].x_tune == solve_optimal_x_start(F_0, 0.5)
+    @test custom_alpha[6] != baseline[6]
+    @test custom_alpha[6] != manual[6]
+    off_with_alpha = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-off-alpha]",
+        anneal_direct_weights=false, x_tune_alpha=0.5)
+    @test all(h.schedule_factor == 1.0 for h in off_with_alpha[6])
 end
 
 @testset "optimise_composite_pulse: mandatory upfront x_tune_alpha calibration + recalibrate_optima_x" begin
     common = (n_hops=2, num_epochs=2, patience=2, tol=1e-3, learning_rate=0.05,
               hop_step_size=0.5, seed=7, threaded_grad=false)
 
-    # x_tune_alpha=nothing (the default) must reproduce the EXACT
-    # anneal_direct_weights=true baseline bit-for-bit -- both this keyword
-    # AND recalibrate_optima_x are provable no-ops unless x_tune_alpha is
-    # explicitly set.
+    # anneal_direct_weights=true is now the default: calling with nothing
+    # else set must reproduce EXACTLY the same result as explicitly passing
+    # anneal_direct_weights=true (default x_tune_alpha, default
+    # recalibrate_optima_x=true) -- bit-for-bit.
     baseline = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
-        common..., label_prefix="[ocp-off] ", anneal_direct_weights=true, x_tune=-3.0)
-    off = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
-        common..., label_prefix="[ocp-off2] ", anneal_direct_weights=true, x_tune=-3.0,
-        x_tune_alpha=nothing, recalibrate_optima_x=false)
-    @test baseline[1] == off[1]  # best_u
-    @test baseline[2] == off[2]  # best_cost
-    @test baseline[6] == off[6]  # history
+        common..., label_prefix="[ocp-default] ")
+    explicit_on = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[ocp-explicit] ", anneal_direct_weights=true)
+    @test baseline[1] == explicit_on[1]  # best_u
+    @test baseline[2] == explicit_on[2]  # best_cost
+    @test baseline[6] == explicit_on[6]  # history
 
-    # x_tune_alpha set, recalibrate_optima_x=true (default): every hop
-    # (including hop 0) calibrates its own x_tune from its own starting
-    # point -- identical to what run_local_adam already did per-hop before
-    # this pipeline-level feature existed, since hop 0's starting point IS
-    # the seed pulse u0. Smoke-tests cleanly and diverges from x_tune=-3.0.
+    # x_tune_alpha=nothing bypasses calibration entirely (the escape
+    # hatch): falls back to the plain linear schedule (x_tune=0) for every
+    # hop, diverging from the calibrated-by-default baseline above.
+    manual = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[ocp-manual] ",
+        x_tune_alpha=nothing, recalibrate_optima_x=false)
+    @test all(h.x_tune == 0.0 for h in manual[6])
+    @test manual[6] != baseline[6]
+
+    # x_tune_alpha set to a custom value, recalibrate_optima_x=true
+    # (default): every hop calibrates its own x_tune from its own starting
+    # point -- hop 0 from u0 (this function's own seed calibration), every
+    # later hop independently via run_local_adam's internal calibration.
+    # Smoke-tests cleanly and diverges from the uncalibrated manual run
+    # above.
     recal_true = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-recal-true] ", anneal_direct_weights=true,
-        x_tune=0.0, x_tune_alpha=0.9, recalibrate_optima_x=true)
+        x_tune_alpha=0.9, recalibrate_optima_x=true)
     @test length(recal_true[1]) == n_params(CompositePulse(1, 4, 4, FAKE_D_ODE))
     @test isfinite(recal_true[2])
-    @test recal_true[6] != baseline[6]
+    @test recal_true[6] != manual[6]
 
     # x_tune_alpha set, recalibrate_optima_x=false: the SAME single
     # seed-calibrated x_tune (from u0, hop 0's starting point) is reused
@@ -600,15 +578,72 @@ end
     # per-hop recalibration).
     recal_false = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-recal-false] ", anneal_direct_weights=true,
-        x_tune=0.0, x_tune_alpha=0.9, recalibrate_optima_x=false)
+        x_tune_alpha=0.9, recalibrate_optima_x=false)
     @test isfinite(recal_false[2])
     n_hop0 = count(h -> h.hop == 0, recal_true[6])
     @test recal_true[6][1:n_hop0] == recal_false[6][1:n_hop0]  # hop 0 identical either way
 
-    # x_tune_alpha without anneal_direct_weights=true has nothing to
-    # calibrate x_tune for -- must error, not silently ignore it.
-    @test_throws ErrorException optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+    # x_tune_alpha with anneal_direct_weights=false is a silent no-op (like
+    # x_tune itself) -- nothing to calibrate x_tune for, but no error.
+    off_with_alpha = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., anneal_direct_weights=false, x_tune_alpha=0.5)
+    @test all(h.schedule_factor == 1.0 for h in off_with_alpha[6])
+end
+
+@testset "optimise_composite_pulse_rjmcmc: mandatory upfront x_tune_alpha calibration + recalibrate_optima_x" begin
+    common = (n_hops=2, num_epochs=2, patience=2, tol=1e-3, learning_rate=0.05,
+              hop_step_size=0.5, seed=7)
+
+    # anneal_direct_weights=true is now the default: calling with nothing
+    # else set must reproduce EXACTLY the same result as explicitly passing
+    # anneal_direct_weights=true (default x_tune_alpha, default
+    # recalibrate_optima_x=true) -- bit-for-bit.
+    baseline = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[rj-default] ")
+    explicit_on = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[rj-explicit] ", anneal_direct_weights=true)
+    @test baseline[1] == explicit_on[1]  # best_u
+    @test baseline[2] == explicit_on[2]  # best_cost
+    @test baseline[6] == explicit_on[6]  # history
+
+    # x_tune_alpha=nothing bypasses calibration entirely (the escape
+    # hatch): falls back to the plain linear schedule (x_tune=0) for every
+    # hop, diverging from the calibrated-by-default baseline above.
+    manual = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[rj-manual] ",
+        x_tune_alpha=nothing, recalibrate_optima_x=false)
+    @test all(h.x_tune == 0.0 for h in manual[6])
+    @test manual[6] != baseline[6]
+
+    # x_tune_alpha set, recalibrate_optima_x=false: the SAME single
+    # seed-calibrated x_tune (from u0, hop 0's starting point, always at
+    # the INPUT k) is reused for every hop, so hop 0 itself must be
+    # UNCHANGED vs recalibrate=true (both calibrate identically from u0),
+    # while later hops differ (no per-hop recalibration) -- INCLUDING
+    # across any _grow_pulse/_shrink_pulse k-change a hop might take.
+    recal_true = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[rj-recal-true] ", anneal_direct_weights=true,
+        x_tune_alpha=0.9, recalibrate_optima_x=true)
+    recal_false = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[rj-recal-false] ", anneal_direct_weights=true,
+        x_tune_alpha=0.9, recalibrate_optima_x=false)
+    @test isfinite(recal_true[2])
+    @test isfinite(recal_false[2])
+    n_hop0 = count(h -> h.hop == 0, recal_true[6])
+    @test recal_true[6][1:n_hop0] == recal_false[6][1:n_hop0]  # hop 0 identical either way
+
+    # x_tune_alpha with anneal_direct_weights=false is a silent no-op --
+    # nothing to calibrate x_tune for, but no error.
+    off_with_alpha = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
+        common..., anneal_direct_weights=false, x_tune_alpha=0.5)
+    @test all(h.schedule_factor == 1.0 for h in off_with_alpha[6])
+
+    # optimizer_settings carries every explicit keyword actually forwarded
+    # -- no stray x_tune, and the ones that DO exist reflect what was passed.
+    @test baseline[8].anneal_direct_weights == true
+    @test baseline[8].x_tune_alpha == _DEFAULT_X_TUNE_ALPHA
+    @test baseline[8].recalibrate_optima_x == true
+    @test !haskey(baseline[8], :x_tune)
 end
 
 include(joinpath(@__DIR__, "adjoint.jl"))

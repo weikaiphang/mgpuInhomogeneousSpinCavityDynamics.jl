@@ -265,15 +265,22 @@ end
     pulse = CompositePulse(1, 4, 4, d)
     θ = seed_canonical(pulse, :hs1)
     cost_kw = (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0)
-    g_full, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., checkpoint_stride=typemax(Int))
+    # use_checkpoints=false explicitly here: the reference "full store, no
+    # checkpointing" reverse path, deliberately NOT exercising checkpointing
+    # at all (use_checkpoints now defaults to true, per grad_mode=:adjoint's
+    # own default -- see pulse_cost_grad_adjoint's docstring).
+    g_full, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., use_checkpoints=false)
     g_win, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., checkpoint_stride=2, use_checkpoints=true)
     @test g_win ≈ g_full atol=1e-10 rtol=1e-10
 
-    # use_checkpoints=true with checkpoint_stride left at its default gives
-    # exactly one window spanning the whole trajectory -- still correct
-    # (same gradient), but should warn since it provides no memory saving.
+    # use_checkpoints=true with checkpoint_stride explicitly reset to
+    # typemax(Int) (its old default) gives exactly one window spanning the
+    # whole trajectory -- still correct (same gradient), but should warn
+    # since it provides no memory saving. This degenerate combination no
+    # longer happens under pulse_cost_grad_adjoint's OWN defaults (300, not
+    # typemax(Int)) -- only when checkpoint_stride is reset explicitly.
     g_nostride = @test_logs (:warn, r"no memory saving") pulse_cost_grad_adjoint(
-        θ, pulse, d; cost_kw..., use_checkpoints=true,
+        θ, pulse, d; cost_kw..., use_checkpoints=true, checkpoint_stride=typemax(Int),
     )[1]
     @test g_nostride ≈ g_full atol=1e-10 rtol=1e-10
 end
@@ -339,7 +346,7 @@ end
     adj = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal]",
         grad_mode=:adjoint, threaded_grad=false, compute=:cpu,
-        anneal_direct_weights=true, x_tune=-3.0)
+        anneal_direct_weights=true)
     @test length(adj[1]) == n_params(pulse)
     @test isfinite(adj[2])
     @test length(adj[6]) >= 1
@@ -352,7 +359,7 @@ end
     # matches exactly rather than approximately).
     fwd = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         num_epochs=1, patience=1, learning_rate=0.05, label="[fwd-anneal]",
-        threaded_grad=false, anneal_direct_weights=true, x_tune=-3.0)
+        threaded_grad=false, anneal_direct_weights=true)
     @test adj[6][1].cost == fwd[6][1].cost
     @test adj[6][1].inversion == fwd[6][1].inversion
     @test adj[6][1].silencing == fwd[6][1].silencing

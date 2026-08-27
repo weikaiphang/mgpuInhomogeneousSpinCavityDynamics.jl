@@ -12,6 +12,8 @@
 #   4. M-sizing n>1 adds extra grids at safeties equally spaced on
 #      (3, S], including S; the floor 3 itself is not a sample.
 # Caps, ICs, Nt_save, and n_sizes come from simulate-time run params.
+# Result files are named {stem}_{ic}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2;
+# skip if that path and its pulsemat csv both exist and are non-empty.
 # ============================================================
 
 function frequency_bandwidth(freq_inhomogeneity)
@@ -56,7 +58,9 @@ function compute_optimal_splitting(
 
     BW = frequency_bandwidth(freq_inhomogeneity)
     M_delta_min = (T_max * BW) / TWO_PI
-    M_delta_min > 0 || error("M_delta_min must be positive (T_max=$T_max, BW=$BW).")
+    isfinite(M_delta_min) && M_delta_min > 0 || error(
+        "M_delta_min must be positive and finite (T_max=$T_max, BW=$BW)."
+    )
 
     kind_g = g_inhomogeneity.kind
     M_delta_needed = max(1, ceil(Int, safety_min * M_delta_min))
@@ -112,7 +116,7 @@ function m_g_for_kind(kind_g, M_delta::Integer, M_cap::Integer, M_g_max::Integer
     if kind_g === :constant
         return 1
     elseif kind_g in (:gaussian, :powerlaw_g, :user_defined)
-        return min(Int(M_g_max), max(1, div(Int(M_cap), Int(M_delta))))
+        return min(Int(M_g_max), div(Int(M_cap), Int(M_delta)))
     else
         error("Unsupported g_inhomogeneity kind for splitting: $(kind_g).")
     end
@@ -122,8 +126,16 @@ function split_at_target_safety(default_split, target_safety, kind_g)
     M_delta_min = default_split.M_delta_min
     M_cap = default_split.M_cap
     M_g_max = default_split.M_g_max
-    M_delta = max(1, min(Int(M_cap), ceil(Int, target_safety * M_delta_min)))
+    need = target_safety * M_delta_min
+    isfinite(need) && need > 0 || error(
+        "target_safety * M_delta_min is not a positive finite number " *
+        "(target=$target_safety, M_delta_min=$M_delta_min)."
+    )
+    M_delta = max(1, min(Int(M_cap), ceil(Int, need)))
     M_g = m_g_for_kind(kind_g, M_delta, M_cap, M_g_max)
+    M_g < 1 && error(
+        "M_delta=$M_delta does not leave room for M_g under M_cap=$M_cap."
+    )
     M_total = M_delta * M_g
     M_total <= M_cap || error(
         "computed M_total=$M_total exceeds M_cap=$M_cap (M_delta=$M_delta, M_g=$M_g)."
@@ -141,7 +153,7 @@ function split_at_target_safety(default_split, target_safety, kind_g)
         BW = default_split.BW,
         safety_factor = safety,
         target_safety = Float64(target_safety),
-        safety_min = RULE_SAFETY_MIN,
+        safety_min = Float64(RULE_SAFETY_MIN),
         M_cap = Int(M_cap),
         M_g_max = Int(M_g_max),
     )
@@ -200,6 +212,9 @@ function reduce_trajectory(t, a, Sp, Sz, d, E_of_t)
     M_g = Int(d.M_g)
     Nt = length(t)
     length(a) == Nt || error("trajectory a length $(length(a)) != Nt=$Nt.")
+    if hasproperty(d, :Nt) && Nt != Int(d.Nt)
+        error("trajectory length $Nt != derived Nt=$(d.Nt).")
+    end
     size(Sp) == (Nt, M) && size(Sz) == (Nt, M) || error(
         "trajectory Sp/Sz shapes $(size(Sp))/$(size(Sz)) != ($((Nt, M)))."
     )
@@ -257,8 +272,8 @@ function save_datagen_result(filename, data, E_of_t)
     dir = dirname(filename)
     isempty(dir) || mkpath(dir)
     csv_path = pulsemat_from_result(filename)
-    jld_tmp = filename * ".tmp"
-    csv_tmp = csv_path * ".tmp"
+    jld_tmp = filename * ".part"
+    csv_tmp = csv_path * ".part"
     try
         isfile(jld_tmp) && rm(jld_tmp; force=true)
         isfile(csv_tmp) && rm(csv_tmp; force=true)
@@ -271,6 +286,9 @@ function save_datagen_result(filename, data, E_of_t)
         )
         mv(jld_tmp, filename; force=true)
         mv(csv_tmp, csv_path; force=true)
+        result_is_complete(filename) || error(
+            "save did not produce a complete result pair at $filename."
+        )
     catch
         isfile(jld_tmp) && rm(jld_tmp; force=true)
         isfile(csv_tmp) && rm(csv_tmp; force=true)
@@ -322,7 +340,6 @@ function make_run_params(;
         M_g_max = Int(M_g_max),
         n_sizes = Int(n_sizes),
         Nt_save = Int(Nt_save),
-        tag_sizes = Int(n_sizes) > 1,
     )
 end
 
@@ -334,34 +351,6 @@ function run_params_fingerprint(run)
         "n_sizes" => run.n_sizes,
         "Nt_save" => run.Nt_save,
     )
-end
-
-function _json_int(x)
-    x === nothing && return nothing
-    return Int(x)
-end
-
-function run_params_are_default(run)
-    return (
-        run.M_cap == RULE_M_CAP &&
-        run.M_g_max == RULE_M_G_MAX &&
-        run.n_sizes == 1 &&
-        run.Nt_save == RULE_NT_SAVE
-    )
-end
-
-function run_params_match_manifest(entry, run)
-    prev = json_get(entry, "run_params")
-    # Pre-run_params manifests were produced with the v6 defaults.
-    prev === nothing && return run_params_are_default(run)
-    cur = run_params_fingerprint(run)
-    # ICs are not part of the rerun key: adding/removing an IC must not
-    # overwrite files that already exist for the other ICs.
-    _json_int(json_get(prev, "M_cap")) == cur["M_cap"] || return false
-    _json_int(json_get(prev, "M_g_max")) == cur["M_g_max"] || return false
-    _json_int(json_get(prev, "n_sizes")) == cur["n_sizes"] || return false
-    _json_int(json_get(prev, "Nt_save")) == cur["Nt_save"] || return false
-    return true
 end
 
 function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString, split, run, Ttotal::Float64)
@@ -426,9 +415,7 @@ function simulate_catalog_entry(stem::AbstractString, sys, PULSE_SPEC, run; skip
 
     for ic in run.ics
         for split in splits
-            tag = run.tag_sizes ? split_size_tag(split) : nothing
-            key = tag === nothing ? String(ic) : "$(ic)_$(tag)"
-            outpath = result_path(stem, ic; size_tag = tag)
+            outpath, key = result_target(stem, ic, split.M_delta, split.M_g, run.Nt_save)
             if skip_existing && result_is_complete(outpath)
                 reports[key] = Dict("status" => "skipped", "path" => outpath)
                 n_skipped += 1

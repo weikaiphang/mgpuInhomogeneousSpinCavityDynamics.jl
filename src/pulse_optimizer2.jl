@@ -1987,6 +1987,20 @@ function _curriculum_fidelity_weight(inv::Real, sil::Real, target_F::Real, x_tun
 end
 
 """
+    _DEFAULT_X_TUNE_ALPHA
+
+Default calibration target for [`run_local_adam`](@ref)'s mandatory
+`x_tune_alpha` auto-calibration (used whenever `anneal_direct_weights=true`
+and no explicit `x_tune_alpha` is passed): a small guaranteed floor of
+`w_time`/`w_tmax`/`w_power` weight even from a near-zero starting
+fidelity, protecting the physics-fidelity objective early without letting
+the schedule collapse the direct weights to zero -- see
+[`solve_optimal_x_start`](@ref)'s own docstring for the pathological
+near-zero-fidelity case this guards against.
+"""
+const _DEFAULT_X_TUNE_ALPHA = 0.025
+
+"""
     solve_optimal_x_start(F_0, alpha; x_max=100.0, tol=1e-6, max_iter=200) -> Float64
 
 Finds the curvature `x_tune` such that [`_schedule_shape`](@ref) (the same
@@ -2343,7 +2357,8 @@ end
 """
     run_local_adam(u_start, pulse, d, cost_kwargs; hop=0, num_epochs=30, patience=5, tol=1e-3,
         learning_rate=0.05, cf_lr_scale=1.0, label="", threaded_grad=false, compute=:auto,
-        grad_mode=:forwarddiff, anneal_direct_weights=false, x_tune=0.0, x_tune_alpha=nothing, kwargs...)
+        grad_mode=:forwarddiff, anneal_direct_weights=true,
+        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, kwargs...)
         -> (best_u, best_cost, best_inversion, best_silencing, best_duration, history)
 
 One basin's local descent: Adam from `u_start`, stopped either after
@@ -2448,26 +2463,24 @@ non-`1.0` value is asserted as a universal default here -- watch
 large-swing) epoch-to-epoch behaviour as the signal that a smaller
 `cf_lr_scale` is worth trying.
 
-`anneal_direct_weights` (default `false`, i.e. zero behaviour change
-unless a caller opts in) anneals `w_time`, `w_tmax`, AND `w_power`
-TOGETHER (one shared factor -- not three independent schedules) in via
-[`_curriculum_fidelity_weight`](@ref): each epoch's GRADIENT is computed
-under `(w_time, w_tmax, w_power) = factor .* (base_w_time, base_w_tmax,
-base_w_power)`, where `factor = (exp(x_tune*fidelity_phys)-1)/(exp(x_tune)-1)
-∈ [0,1]` and `fidelity_phys` is [`pulse_cost`](@ref)'s own fidelity from
-the LAST ACCEPTED point (detached from this epoch's own AD tape -- see
-that function's docstring). So early epochs -- where `fidelity_phys`
-starts near its worst case (`0`) -- descend mostly on inversion/
-silencing, only picking up the full duration/tmax/power penalties once
-fidelity is actually good (`factor=1` exactly at `fidelity_phys=1`).
-`x_tune` (default `0.0`, i.e. plain linear interpolation `factor =
-fidelity_phys`) shapes that curve: negative values front-load it (some
-penalty weight even at low fidelity -- useful if a run's fidelity gets
-stuck near `0`, since `factor` then stays boundedly small rather than
-collapsing toward machine epsilon); positive values back-load it (stays
-suppressed until fidelity is already decent). See
-[`_curriculum_fidelity_weight`](@ref) for the exact shape and validity
-range of `x_tune`. Critically, `cost` itself (the value used for
+`anneal_direct_weights` (default `true`) anneals `w_time`, `w_tmax`, AND
+`w_power` TOGETHER (one shared factor -- not three independent schedules)
+via [`_curriculum_fidelity_weight`](@ref): each epoch's GRADIENT is
+computed under `(w_time, w_tmax, w_power) = factor .* (base_w_time,
+base_w_tmax, base_w_power)`, where `factor =
+(exp(x_tune*fidelity_phys)-1)/(exp(x_tune)-1) ∈ [0,1]` and
+`fidelity_phys` is [`pulse_cost`](@ref)'s own fidelity from the LAST
+ACCEPTED point (detached from this epoch's own AD tape -- see that
+function's docstring). So early epochs -- where `fidelity_phys` starts
+near its worst case (`0`) -- descend mostly on inversion/silencing, only
+picking up the full duration/tmax/power penalties once fidelity is
+actually good (`factor=1` exactly at `fidelity_phys=1`). Pass
+`anneal_direct_weights=false` to disable this entirely and recover the
+original fixed-weight cost. `x_tune` (the curvature shaping that curve --
+negative front-loads it, positive back-loads it; see
+[`_curriculum_fidelity_weight`](@ref) for the exact shape) is not a
+keyword here -- it is ALWAYS derived via mandatory calibration, see
+`x_tune_alpha` below. Critically, `cost` itself (the value used for
 `best_cost`/`improved`/early stopping here, and everything
 [`optimise_composite_pulse`](@ref)/[`optimise_composite_pulse_rjmcmc`](@ref)
 does with the `run_local_adam`-returned cost one level up: basin-hopping's
@@ -2480,38 +2493,44 @@ though the GRADIENT driving `u` was shaped by moving ones. Only the
 descent direction is annealed; nothing that compares costs across epochs,
 hops, or calls ever sees a moving target.
 
-`x_tune_alpha` (default `nothing`, i.e. `x_tune` is used exactly as
-passed -- zero behaviour change unless a caller opts in) AUTO-CALIBRATES
-`x_tune` instead of taking it as given: before this basin's epoch loop
-starts, `u_start` is evaluated ONCE via [`pulse_cost`](@ref) (one extra
-ODE-solve pair, the same cost as evaluating any other epoch) to get this
-basin's OWN starting `fidelity_phys = F_0`, then
-[`solve_optimal_x_start`](@ref)`(F_0, x_tune_alpha)` picks the `x_tune`
-that makes the annealing factor equal `x_tune_alpha` AT THAT STARTING
-POINT specifically -- so the schedule is calibrated to what this basin
-actually starts from (which can differ hop to hop, e.g. across a
-`_grow_pulse`/`_shrink_pulse` k-change in
+`x_tune_alpha` (default [`_DEFAULT_X_TUNE_ALPHA`](@ref) -- so calibration
+is MANDATORY BY DEFAULT whenever `anneal_direct_weights=true`, which is
+itself the default) picks `x_tune` via [`solve_optimal_x_start`](@ref):
+before this basin's epoch loop starts, `u_start` is evaluated ONCE via
+[`pulse_cost`](@ref) (one extra ODE-solve pair, the same cost as
+evaluating any other epoch) to get this basin's OWN starting
+`fidelity_phys = F_0`, then `solve_optimal_x_start(F_0, x_tune_alpha)`
+picks the `x_tune` that makes the annealing factor equal `x_tune_alpha`
+AT THAT STARTING POINT specifically -- so the schedule is calibrated to
+what this basin actually starts from (which can differ hop to hop, e.g.
+across a `_grow_pulse`/`_shrink_pulse` k-change in
 [`optimise_composite_pulse_rjmcmc`](@ref)) rather than a single blind
-guess reused everywhere. Requires `anneal_direct_weights=true` -- passing
-`x_tune_alpha` without it is almost certainly a mistake (there is nothing
-to calibrate `x_tune` FOR otherwise), so it errors rather than silently
-ignoring `x_tune_alpha`. When active, the calibrated value overrides
-whatever `x_tune` was also passed and is logged via `label` before the
-epoch loop starts.
+guess reused everywhere. This is logged via `label` before the epoch loop
+starts. Passing `x_tune_alpha=nothing` EXPLICITLY skips calibration and
+uses the plain linear schedule (`x_tune=0`, i.e. `factor = fidelity_phys`
+exactly) instead -- the only way to run the annealed schedule
+uncalibrated; not something that happens by leaving arguments at their
+defaults. `x_tune_alpha` is a silent no-op whenever
+`anneal_direct_weights=false` (nothing to calibrate `x_tune` FOR in that
+case).
+
+`_precalibrated_x_tune` (default `nothing`, internal -- do not pass this
+directly) lets [`optimise_composite_pulse`](@ref)/
+[`optimise_composite_pulse_rjmcmc`](@ref) inject an already-calibrated
+`x_tune` (from an earlier hop's own `history`) for their own
+`recalibrate_optima_x=false` hops, bypassing calibration here entirely
+(takes priority over `x_tune_alpha`, which is ignored when this is set).
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
                          learning_rate::Real=0.05, cf_lr_scale::Real=1.0, label::AbstractString="",
                          threaded_grad::Bool=false, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
-                         anneal_direct_weights::Bool=false, x_tune::Real=0.0,
-                         x_tune_alpha::Union{Nothing,Real}=nothing, solve_kwargs...)
+                         anneal_direct_weights::Bool=true,
+                         x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA,
+                         _precalibrated_x_tune::Union{Nothing,Real}=nothing, solve_kwargs...)
     _forbid_initial_condition(solve_kwargs)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
         "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
-    )
-    x_tune_alpha !== nothing && !anneal_direct_weights && error(
-        "run_local_adam: x_tune_alpha requires anneal_direct_weights=true " *
-        "(there is nothing to calibrate x_tune for otherwise)."
     )
     u = copy(u_start)
     n = length(u)
@@ -2526,23 +2545,33 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     base_w_power = haskey(cost_kwargs, :w_power) ? Float64(cost_kwargs.w_power) : 0.05
     target_F_val = haskey(cost_kwargs, :target_F) ? Float64(cost_kwargs.target_F) : 1.0
 
-    # x_tune_alpha: calibrate x_tune from THIS basin's own starting
-    # fidelity before the epoch loop starts, rather than take x_tune as a
-    # blind guess -- see this function's own docstring for the full
-    # reasoning. One extra pulse_cost evaluation at u_start, same cost as
-    # any other epoch; if u_start itself fails to solve, solve_optimal_x_start's
-    # own F_0∈[0,1] validation rejects the resulting NaN loudly rather than
-    # silently calibrating against garbage.
-    x_tune_eff = x_tune
-    if x_tune_alpha !== nothing
+    # x_tune is never a caller-supplied keyword -- it is ALWAYS one of:
+    # (1) an already-calibrated value injected by a pipeline caller
+    # (_precalibrated_x_tune, for optimise_composite_pulse/
+    # optimise_composite_pulse_rjmcmc's own recalibrate_optima_x=false
+    # hops); (2) freshly calibrated here, from THIS basin's own starting
+    # fidelity, before the epoch loop starts (x_tune_alpha default
+    # _DEFAULT_X_TUNE_ALPHA, so this is MANDATORY whenever
+    # anneal_direct_weights=true); or (3) the plain linear sentinel 0.0,
+    # when x_tune_alpha is explicitly nothing or anneal_direct_weights is
+    # false. One extra pulse_cost evaluation at u_start for case (2), same
+    # cost as any other epoch; if u_start itself fails to solve,
+    # solve_optimal_x_start's own F_0∈[0,1] validation rejects the
+    # resulting NaN loudly rather than silently calibrating against garbage.
+    x_tune_eff = if _precalibrated_x_tune !== nothing
+        Float64(_precalibrated_x_tune)
+    elseif x_tune_alpha !== nothing && anneal_direct_weights
         _, inv0, sil0, _, _ = pulse_cost(u_start, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
         silencing_success0 = 1.0 - (Float64(sil0) - target_F_val)^2
         F_0 = Float64(inv0) * silencing_success0
-        x_tune_eff = solve_optimal_x_start(F_0, Float64(x_tune_alpha))
+        val = solve_optimal_x_start(F_0, Float64(x_tune_alpha))
         println(
-            "$label x_tune_alpha=$(x_tune_alpha): calibrated x_tune=$(round(x_tune_eff, sigdigits=4)) " *
+            "$label x_tune_alpha=$(x_tune_alpha): calibrated x_tune=$(round(val, sigdigits=4)) " *
             "from F_0=$(round(F_0, sigdigits=4)) at u_start"
         )
+        val
+    else
+        0.0
     end
 
     best_u = copy(u_start)
@@ -2707,8 +2736,8 @@ end
         degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
         target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, label_prefix="", threaded_grad=true, compute=:auto,
-        grad_mode=:forwarddiff, anneal_direct_weights=false, x_tune=0.0, x_tune_alpha=nothing,
-        recalibrate_optima_x=true, solve_kwargs...)
+        grad_mode=:forwarddiff, anneal_direct_weights=true,
+        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x=true, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Basin-hopping global search over composite-pulse solutions for THIS
@@ -2796,32 +2825,42 @@ would silently decode into a nonsensical pulse rather than fail loudly.
 [`run_local_adam`](@ref) call (hop 0 and every subsequent hop) -- see that
 function's own docstring for what it does and why.
 
-`anneal_direct_weights`/`x_tune` (defaults `false`/`0.0`, forwarded
-unchanged to every `run_local_adam` call, hop 0 and every subsequent hop)
-anneal each hop's own `w_time`/`w_tmax`/`w_power` gradient in TOGETHER
-(one shared factor) from near-zero as that hop's physics fidelity
-improves -- see [`run_local_adam`](@ref)'s own docstring and
+`anneal_direct_weights` (default `true`, forwarded unchanged to every
+`run_local_adam` call, hop 0 and every subsequent hop) anneals each hop's
+own `w_time`/`w_tmax`/`w_power` gradient TOGETHER (one shared factor)
+from near-zero as that hop's physics fidelity improves -- see
+[`run_local_adam`](@ref)'s own docstring and
 [`_curriculum_fidelity_weight`](@ref) for the schedule and why the `cost`
 this function itself compares (basin-hopping's Metropolis test,
 `final_metrics`) is unaffected: `run_local_adam` already reconstitutes it
 back to the static, caller-configured-weight value before returning it.
+Pass `anneal_direct_weights=false` to disable annealing entirely and
+recover the original fixed-weight cost.
 
-`x_tune_alpha` (default `nothing`) auto-calibrates `x_tune` via
-[`solve_optimal_x_start`](@ref) instead of using a blind guess. When set,
-a SINGLE calibration MANDATORILY runs once, from `u0` (the seed pulse --
-either a fresh `initial_guess` or `warm_start_u`, whichever hop 0 itself
-starts from) -- before hop 0's own `run_local_adam` call, i.e. before any
-actual optimisation begins, reusing `initial_metrics` (already computed
-at `u0`) rather than an extra `pulse_cost` evaluation. That calibrated
-value is what hop 0 actually optimises with. `recalibrate_optima_x`
-(default `true`) controls every hop AFTER hop 0: `true` re-runs the SAME
-per-hop calibration `run_local_adam` already supports internally (against
-THAT hop's own starting point, e.g. after a perturbation moved it
-elsewhere); `false` instead reuses the single seed calibration for every
-subsequent hop unchanged, never recalibrating again. Either way, requires
-`anneal_direct_weights=true` (enforced by `run_local_adam` itself, not
-re-checked here); left at `nothing`, `x_tune_alpha` and
-`recalibrate_optima_x` are both strict no-ops.
+`x_tune_alpha` (default [`_DEFAULT_X_TUNE_ALPHA`](@ref)) picks the
+schedule's curvature via [`solve_optimal_x_start`](@ref) -- there is no
+raw, manually-set curvature keyword; it is always either calibrated or
+the plain linear sentinel (see [`run_local_adam`](@ref)'s own docstring).
+Under the defaults, a SINGLE calibration MANDATORILY runs once, from `u0`
+(the seed pulse -- either a fresh `initial_guess` or `warm_start_u`,
+whichever hop 0 itself starts from) -- before hop 0's own
+`run_local_adam` call, i.e. before any actual optimisation begins,
+reusing `initial_metrics` (already computed at `u0`) rather than an extra
+`pulse_cost` evaluation -- hop 0's own `run_local_adam` call receives this
+calibrated value directly (via its internal `_precalibrated_x_tune`,
+bypassing that function's OWN calibration, which would otherwise
+needlessly re-evaluate `pulse_cost` at the very same point `u0`). That
+calibrated value is what hop 0 actually optimises with.
+`recalibrate_optima_x` (default `true`) controls every
+hop AFTER hop 0: `true` re-runs the SAME per-hop calibration
+`run_local_adam` already supports internally (against THAT hop's own
+starting point, e.g. after a perturbation moved it elsewhere); `false`
+instead reuses the single seed-calibrated value for every subsequent hop
+unchanged (injected via `run_local_adam`'s internal
+`_precalibrated_x_tune`), never recalibrating again. Passing
+`x_tune_alpha=nothing` EXPLICITLY bypasses calibration entirely -- the
+only way to run the annealed schedule uncalibrated (plain linear) -- and
+is a silent no-op whenever `anneal_direct_weights=false`.
 """
 function optimise_composite_pulse(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
@@ -2831,16 +2870,12 @@ function optimise_composite_pulse(
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
-    anneal_direct_weights::Bool=false, x_tune::Real=0.0,
-    x_tune_alpha::Union{Nothing,Real}=nothing, recalibrate_optima_x::Bool=true, solve_kwargs...,
+    anneal_direct_weights::Bool=true,
+    x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true, solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
         "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
-    )
-    x_tune_alpha !== nothing && !anneal_direct_weights && error(
-        "optimise_composite_pulse: x_tune_alpha requires anneal_direct_weights=true " *
-        "(there is nothing to calibrate x_tune for otherwise)."
     )
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
     cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time)
@@ -2857,7 +2892,7 @@ function optimise_composite_pulse(
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
          threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count(),
-         anneal_direct_weights=anneal_direct_weights, x_tune=x_tune, x_tune_alpha=x_tune_alpha,
+         anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
          recalibrate_optima_x=recalibrate_optima_x),
         solve_settings,
     )
@@ -2881,29 +2916,33 @@ function optimise_composite_pulse(
     initial_metrics = pulse_cost(u0, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
     history = NamedTuple[]
 
-    # Mandatory single upfront x_tune calibration from the seed pulse (u0),
-    # before hop 0's own run_local_adam call -- i.e. before any actual
-    # optimisation starts -- reusing initial_metrics (already evaluated at
-    # u0) rather than a second pulse_cost call. NOT gated by
-    # recalibrate_optima_x: that flag only decides whether hops AFTER hop 0
-    # recalibrate again from their OWN starting point, or reuse this single
-    # seed-calibrated value for the rest of the run. See solve_optimal_x_start.
-    x_tune_seed = x_tune
-    if x_tune_alpha !== nothing
+    # Calibrate ONCE here, reusing initial_metrics (already evaluated at
+    # u0), rather than let hop 0's own run_local_adam call redundantly
+    # re-evaluate pulse_cost at that SAME point to do its own internal
+    # calibration -- avoids a second ODE-solve pair. Mirrors
+    # run_local_adam's own calibration formula exactly (see its docstring).
+    # x_tune_seed is what hop 0 ALWAYS runs with (via _precalibrated_x_tune,
+    # bypassing run_local_adam's internal calibration entirely), and what
+    # every later hop reuses too when recalibrate_optima_x=false.
+    x_tune_seed = if x_tune_alpha !== nothing && anneal_direct_weights
         silencing_success0 = 1.0 - (Float64(initial_metrics[3]) - target_F)^2
         F_0_seed = Float64(initial_metrics[2]) * silencing_success0
-        x_tune_seed = solve_optimal_x_start(F_0_seed, Float64(x_tune_alpha))
+        val = solve_optimal_x_start(F_0_seed, Float64(x_tune_alpha))
         println(
             "$(label_prefix)x_tune_alpha=$(x_tune_alpha): seed calibration (u0) x_tune=" *
-            "$(round(x_tune_seed, sigdigits=4)) from F_0=$(round(F_0_seed, sigdigits=4))"
+            "$(round(val, sigdigits=4)) from F_0=$(round(F_0_seed, sigdigits=4))"
         )
+        val
+    else
+        0.0
     end
 
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
         label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, compute=compute,
-        grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights, x_tune=x_tune_seed,
-        x_tune_alpha=nothing, solve_kwargs...
+        grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights,
+        x_tune_alpha=nothing, _precalibrated_x_tune=x_tune_seed,
+        solve_kwargs...
     )
     append!(history, hop0_history)
     global_best_u, global_best_cost = current_u, current_cost
@@ -2916,21 +2955,16 @@ function optimise_composite_pulse(
         # recalibrate_optima_x=true (default): let run_local_adam recalibrate
         # x_tune again from THIS hop's own candidate_u0, exactly as before
         # this feature existed. false: skip that, reusing the single
-        # seed-calibrated x_tune_seed for every remaining hop unchanged.
-        hop_x_tune, hop_x_tune_alpha = if x_tune_alpha === nothing
-            (x_tune, nothing)
-        elseif recalibrate_optima_x
-            (x_tune, x_tune_alpha)
-        else
-            (x_tune_seed, nothing)
-        end
-
+        # seed-calibrated x_tune_seed for every remaining hop unchanged, via
+        # run_local_adam's internal _precalibrated_x_tune.
         cand_u, cand_cost, _, _, _, hop_history = run_local_adam(
             candidate_u0, pulse, d, cost_kwargs;
             hop, num_epochs, patience, tol, learning_rate, cf_lr_scale,
             label="$(label_prefix)[hop $hop]", threaded_grad=threaded_grad, compute=compute,
-            grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights, x_tune=hop_x_tune,
-            x_tune_alpha=hop_x_tune_alpha, solve_kwargs...,
+            grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights,
+            x_tune_alpha=(recalibrate_optima_x ? x_tune_alpha : nothing),
+            _precalibrated_x_tune=(recalibrate_optima_x ? nothing : x_tune_seed),
+            solve_kwargs...,
         )
         append!(history, hop_history)
 

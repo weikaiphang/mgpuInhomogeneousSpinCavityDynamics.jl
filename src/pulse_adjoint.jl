@@ -246,19 +246,25 @@ end
 Frozen-mesh discrete Tsit5 adjoint of [`pulse_cost`](@ref). Dual-Tsit5
 gradients are a different object; this is not a drop-in bit-identical
 replacement. `signal_E_of_t` is not differentiated. CPU reverse.
-`checkpoint_stride=typemax(Int)` (default) reverses on the stored
-adaptive snapshots; a finite stride uses windowed Φ-replay from host
-checkpoints (same gradient when L1 replay matches the stored mesh).
+Defaults `use_checkpoints=true, checkpoint_stride=300` -- this is the ONLY
+gradient backend [`run_local_adam`](@ref)'s `grad_mode=:adjoint` selects,
+so these defaults are effectively "the `grad_mode=:adjoint` defaults":
+memory-bounded windowed Φ-replay from host checkpoints out of the box
+(same gradient as the unbounded path when L1 replay matches the stored
+mesh), rather than the full per-step state list every accepted point
+would otherwise pin in memory for the whole trajectory. Pass
+`use_checkpoints=false` (unbounded, reverses on the full stored adaptive
+snapshots) or an explicit different `checkpoint_stride` to override.
 
 `use_checkpoints=true` ALONE bounds only the forward recording pass
 (`record_adaptive_tsit5_mesh`'s `mesh.u` is never materialised). It does
 NOT by itself bound the reverse sweep: with `checkpoint_stride` left at
-its default, there is exactly ONE checkpoint window spanning the whole
+`typemax(Int)`, there is exactly ONE checkpoint window spanning the whole
 trajectory, and `replay_tsit5_window` rebuilds the full per-step state
 list for that one window anyway -- no memory saving over
-`use_checkpoints=false`. Pass an explicit, finite `checkpoint_stride`
-(e.g. a few hundred) to actually bound peak memory end-to-end at a large
-ensemble; leaving it unset triggers a `@warn`.
+`use_checkpoints=false`. That degenerate combination triggers a `@warn`;
+it cannot happen under the defaults, only if `checkpoint_stride` is
+explicitly reset to `typemax(Int)` while `use_checkpoints=true`.
 
 Both tracks are always run (see [`inversion_pullback!`](@ref)/
 [`silencing_pullback!`](@ref)'s docstrings): each adjoint sweep seeds
@@ -280,8 +286,8 @@ function pulse_cost_grad_adjoint(
     w_power=0.05,
     w_tmax=1.0,
     compute::Symbol=:cpu,
-    checkpoint_stride::Integer=typemax(Int),
-    use_checkpoints::Bool=false,
+    checkpoint_stride::Integer=300,
+    use_checkpoints::Bool=true,
     kwargs...,
 )
     _forbid_initial_condition(kwargs)

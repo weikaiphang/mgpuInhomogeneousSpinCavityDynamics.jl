@@ -63,6 +63,7 @@ function segment_support(seg)
 end
 
 function pulse_drive_span(segments)
+    isempty(segments) && error("pulse has no segments.")
     t0 = Inf
     t1 = -Inf
     for seg in segments
@@ -70,6 +71,9 @@ function pulse_drive_span(segments)
         t0 = min(t0, a)
         t1 = max(t1, b)
     end
+    isfinite(t0) && isfinite(t1) && t1 >= t0 || error(
+        "pulse support is not a finite interval, got [$t0, $t1]."
+    )
     return t0, t1
 end
 
@@ -121,7 +125,7 @@ function derive_ttotal(sys, PULSE_SPEC)
     t_echo_end = pulse_echo_end(PULSE_SPEC.family, PULSE_SPEC.segments)
     t_protocol_end = max(t_drive_end, t_echo_end)
     Ttotal = t_protocol_end + t_settle(sys)
-    Ttotal > 0 || error("derived Ttotal must be positive, got $Ttotal.")
+    isfinite(Ttotal) && Ttotal > 0 || error("derived Ttotal must be positive and finite, got $Ttotal.")
     return Ttotal
 end
 

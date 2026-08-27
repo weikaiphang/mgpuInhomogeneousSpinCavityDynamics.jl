@@ -35,6 +35,12 @@ function _need_value(args, i, flag)
     return args[i + 1], i + 2
 end
 
+function _parse_int(val, flag)
+    n = tryparse(Int, val)
+    n === nothing && error("$flag expects an integer, got $(val).")
+    return n
+end
+
 function parse_args(args)
     phase = "configs"
     dry_run = false
@@ -58,13 +64,13 @@ function parse_args(args)
             i += 1
         elseif a == "--limit"
             val, i = _need_value(args, i, a)
-            limit = parse(Int, val)
+            limit = _parse_int(val, a)
         elseif a == "--start"
             val, i = _need_value(args, i, a)
-            start_id = parse(Int, val)
+            start_id = _parse_int(val, a)
         elseif a == "--stop"
             val, i = _need_value(args, i, a)
-            stop_id = parse(Int, val)
+            stop_id = _parse_int(val, a)
         elseif a == "--no-skip"
             skip_existing = false
             i += 1
@@ -72,15 +78,15 @@ function parse_args(args)
             conditions, i = _need_value(args, i, a)
         elseif a == "--M-cap"
             val, i = _need_value(args, i, a)
-            M_cap = parse(Int, val)
+            M_cap = _parse_int(val, a)
         elseif a == "--M-g-cap"
             val, i = _need_value(args, i, a)
-            M_g_max = parse(Int, val)
+            M_g_max = _parse_int(val, a)
         elseif a == "--M-sizing"
             m_sizing, i = _need_value(args, i, a)
         elseif a == "--NT-save"
             val, i = _need_value(args, i, a)
-            Nt_save = parse(Int, val)
+            Nt_save = _parse_int(val, a)
         else
             error("Unknown argument: $a")
         end

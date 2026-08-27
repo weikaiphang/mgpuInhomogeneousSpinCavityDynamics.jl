@@ -163,54 +163,59 @@ function phase_simulate(run; skip_existing::Bool = true, start_id::Int = 1, stop
         stop_id > 0 && idx > stop_id && break
         limit > 0 && n_done >= limit && break
 
-        entry = load_simulconfig(joinpath(DATAGEN_CONFIG_DIR, fname))
         stem = stem_from_simulconfig_path(fname)
+        try
+            entry = load_simulconfig(joinpath(DATAGEN_CONFIG_DIR, fname))
 
-        entry_skip = skip_existing
-        if skip_existing && haskey(manifest, stem)
-            prev = manifest[stem]
-            ver = manifest_run_rules_version(prev)
-            params_ok = run_params_match_manifest(prev, run)
-            if (ver !== nothing && ver != RUN_RULES_VERSION) || !params_ok
-                entry_skip = false
-                println("[$stem] re-running: run_rules/params changed")
+            entry_skip = skip_existing
+            if skip_existing && haskey(manifest, stem)
+                ver = manifest_run_rules_version(manifest[stem])
+                if ver !== nothing && ver != RUN_RULES_VERSION
+                    entry_skip = false
+                    println("[$stem] re-running: run_rules_version changed")
+                end
             end
-        end
 
-        println()
-        println("=" ^ 60)
-        println("[$stem]")
-        println(
-            @sprintf(
-                "  family=%s  C_ens=%.3g  g=%s  freq=%s",
-                entry.PULSE_SPEC.family,
-                entry.SYSTEM_CONFIG.C_ens,
-                entry.SYSTEM_CONFIG.g_inhomogeneity.kind,
-                entry.SYSTEM_CONFIG.freq_inhomogeneity.kind,
+            println()
+            println("=" ^ 60)
+            println("[$stem]")
+            println(
+                @sprintf(
+                    "  family=%s  C_ens=%.3g  g=%s  freq=%s",
+                    entry.PULSE_SPEC.family,
+                    entry.SYSTEM_CONFIG.C_ens,
+                    entry.SYSTEM_CONFIG.g_inhomogeneity.kind,
+                    entry.SYSTEM_CONFIG.freq_inhomogeneity.kind,
+                )
             )
-        )
-        println("=" ^ 60)
+            println("=" ^ 60)
 
-        ok, skipped, failed, reports = simulate_catalog_entry(
-            stem,
-            entry.SYSTEM_CONFIG,
-            entry.PULSE_SPEC,
-            run;
-            skip_existing = entry_skip,
-        )
-        n_ok += ok
-        n_skipped += skipped
-        n_failed += failed
+            ok, skipped, failed, reports = simulate_catalog_entry(
+                stem,
+                entry.SYSTEM_CONFIG,
+                entry.PULSE_SPEC,
+                run;
+                skip_existing = entry_skip,
+            )
+
+            manifest[stem] = Dict{String, Any}(
+                "stem" => stem,
+                "family" => String(entry.PULSE_SPEC.family),
+                "run_rules_version" => RUN_RULES_VERSION,
+                "run_params" => run_params_fingerprint(run),
+                "ics" => reports,
+            )
+            save_manifest(manifest)
+            n_ok += ok
+            n_skipped += skipped
+            n_failed += failed
+        catch err
+            rethrow_interrupt(err)
+            msg = sprint(showerror, err)
+            println("[$stem] FAILED: ", msg)
+            n_failed += 1
+        end
         n_done += 1
-
-        manifest[stem] = Dict{String, Any}(
-            "stem" => stem,
-            "family" => String(entry.PULSE_SPEC.family),
-            "run_rules_version" => RUN_RULES_VERSION,
-            "run_params" => run_params_fingerprint(run),
-            "ics" => reports,
-        )
-        save_manifest(manifest)
     end
 
     println()

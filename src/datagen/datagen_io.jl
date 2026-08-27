@@ -176,13 +176,20 @@ function simulconfig_path(stem::AbstractString)
     return joinpath(DATAGEN_CONFIG_DIR, stem * "_simulconfig.jld2")
 end
 
-function result_path(stem::AbstractString, ic::Symbol; size_tag::Union{Nothing,AbstractString}=nothing)
-    fname = size_tag === nothing ? "$(stem)_$(ic).jld2" : "$(stem)_$(ic)_$(size_tag).jld2"
-    return joinpath(DATAGEN_RESULT_DIR, fname)
+function result_signature(ic::Symbol, M_delta, M_g, Nt_save)
+    ic in (:ground, :equator) || error("unknown initial condition $ic.")
+    md = Int(M_delta)
+    mg = Int(M_g)
+    nt = Int(Nt_save)
+    md >= 1 && mg >= 1 && nt > 1 || error(
+        "invalid result signature ic=$ic Md=$md Mg=$mg Nt=$nt."
+    )
+    return "$(ic)_Md$(md)_Mg$(mg)_Nt$(nt)"
 end
 
-function split_size_tag(split)
-    return "Md$(split.M_delta)_Mg$(split.M_g)"
+function result_target(stem::AbstractString, ic::Symbol, M_delta, M_g, Nt_save)
+    sig = result_signature(ic, M_delta, M_g, Nt_save)
+    return joinpath(DATAGEN_RESULT_DIR, "$(stem)_$(sig).jld2"), sig
 end
 
 function pulsemat_from_result(filename::AbstractString)
@@ -190,8 +197,12 @@ function pulsemat_from_result(filename::AbstractString)
     return filename[1:end-length(".jld2")] * "_pulsemat.csv"
 end
 
+function _nonzero_file(path::AbstractString)
+    return isfile(path) && filesize(path) > 0
+end
+
 function result_is_complete(filename::AbstractString)
-    return isfile(filename) && isfile(pulsemat_from_result(filename))
+    return _nonzero_file(filename) && _nonzero_file(pulsemat_from_result(filename))
 end
 
 function stem_from_simulconfig_path(path)
@@ -202,10 +213,16 @@ end
 
 function load_manifest()
     isfile(DATAGEN_MANIFEST) || return Dict{String, Any}()
-    return Dict{String, Any}(
-        String(k) => v
-        for (k, v) in JSON3.read(read(DATAGEN_MANIFEST, String))
-    )
+    try
+        return Dict{String, Any}(
+            String(k) => v
+            for (k, v) in JSON3.read(read(DATAGEN_MANIFEST, String))
+        )
+    catch err
+        rethrow_interrupt(err)
+        @warn "manifest unreadable; continuing with empty manifest" exception = err
+        return Dict{String, Any}()
+    end
 end
 
 function manifest_run_rules_version(entry)
@@ -215,8 +232,15 @@ end
 
 function save_manifest(manifest)
     ensure_datagen_dirs()
-    open(DATAGEN_MANIFEST, "w") do io
-        JSON3.write(io, manifest)
+    tmp = DATAGEN_MANIFEST * ".part"
+    try
+        open(tmp, "w") do io
+            JSON3.write(io, manifest)
+        end
+        mv(tmp, DATAGEN_MANIFEST; force=true)
+    catch
+        isfile(tmp) && rm(tmp; force=true)
+        rethrow()
     end
     return nothing
 end
@@ -227,13 +251,22 @@ function save_simulconfig(path, SYSTEM_CONFIG, PULSE_SPEC)
     return path
 end
 
+function _jld_get(raw, name::AbstractString)
+    haskey(raw, name) && return raw[name]
+    s = Symbol(name)
+    haskey(raw, s) && return raw[s]
+    return nothing
+end
+
 function load_simulconfig(path)
     raw = JLD2.load(path)
-    haskey(raw, "SYSTEM_CONFIG") && haskey(raw, "PULSE_SPEC") || error(
+    sys = _jld_get(raw, "SYSTEM_CONFIG")
+    spec = _jld_get(raw, "PULSE_SPEC")
+    (sys === nothing || spec === nothing) && error(
         "$path must contain SYSTEM_CONFIG and PULSE_SPEC."
     )
     return (
-        SYSTEM_CONFIG = raw["SYSTEM_CONFIG"],
-        PULSE_SPEC = raw["PULSE_SPEC"],
+        SYSTEM_CONFIG = sys,
+        PULSE_SPEC = spec,
     )
 end
