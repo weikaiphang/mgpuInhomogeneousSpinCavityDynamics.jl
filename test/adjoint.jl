@@ -294,3 +294,66 @@ end
         u0, pulse, FAKE_D_ODE, cost_kwargs; grad_mode=:nope
     )
 end
+
+@testset "pulse_cost_grad_adjoint vs _pulse_cost_grad_threaded: independent backends agree" begin
+    # Two INDEPENDENTLY implemented exact differentiation methods (discrete
+    # reverse-mode adjoint vs forward-mode Dual AD) of the SAME pulse_cost --
+    # unlike every other adjoint test here, this is not checked against a
+    # finite-difference approximation (limited to ~1e-4 by FD truncation
+    # error) but directly against the OTHER production gradient backend, so
+    # it can assert much tighter agreement. cost/inversion/silencing/duration/
+    # coherence are expected to match EXACTLY (not just approximately): both
+    # backends solve the identical ODE (rhs_1st_order!, Tsit5, same
+    # tolerances) for the primal, and ForwardDiff.Dual's own value component
+    # is ordinary floating-point arithmetic mirroring the primal computation
+    # exactly, not a perturbed one. Only the GRADIENT itself, computed via
+    # genuinely different algorithms, is expected to differ -- at the
+    # Float64 roundoff floor, not at any looser tolerance.
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    θ = seed_canonical(pulse, :hs1)
+    for kw in ((w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0),
+               (w_tmax=0.0, w_power=0.0, w_time=0.0, target_F=1.0),
+               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0))
+        g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, FAKE_D_ODE; kw...)
+        g_thr, cost_thr, inv_t, sil_t, dur_t, coh_t = _pulse_cost_grad_threaded(θ, pulse, FAKE_D_ODE; kw...)
+        @test cost_adj == cost_thr
+        @test inv_a == inv_t
+        @test sil_a == sil_t
+        @test dur_a == dur_t
+        @test coh_a == coh_t
+        @test _relmax(g_adj, g_thr) < 1e-9
+    end
+end
+
+@testset "run_local_adam grad_mode=:adjoint + anneal_direct_weights=true" begin
+    # Coverage gap otherwise: anneal_direct_weights=true is exercised
+    # elsewhere only under the default (:forwarddiff) grad_mode. The
+    # schedule/reconstitution logic in run_local_adam is grad_mode-agnostic
+    # by construction (it only touches epoch_cost_kwargs/dyn_cost, whichever
+    # of the three branches produced them), but that wiring deserves its own
+    # direct check, not just an inference from the other two branches'
+    # coverage.
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    u0 = seed_canonical(pulse, :hs1)
+    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
+    adj = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal]",
+        grad_mode=:adjoint, threaded_grad=false, compute=:cpu,
+        anneal_direct_weights=true, x_tune=-3.0)
+    @test length(adj[1]) == n_params(pulse)
+    @test isfinite(adj[2])
+    @test length(adj[6]) >= 1
+
+    # Epoch 1 starts from the SAME worst-case schedule state (no accepted
+    # point yet -> factor=0) regardless of grad_mode, so it must reproduce
+    # the SAME reconstituted cost as the :forwarddiff backend exactly (both
+    # backends solve the identical primal ODE at epoch 1 -- see the
+    # cross-backend testset above for why cost, as opposed to gradient,
+    # matches exactly rather than approximately).
+    fwd = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=1, patience=1, learning_rate=0.05, label="[fwd-anneal]",
+        threaded_grad=false, anneal_direct_weights=true, x_tune=-3.0)
+    @test adj[6][1].cost == fwd[6][1].cost
+    @test adj[6][1].inversion == fwd[6][1].inversion
+    @test adj[6][1].silencing == fwd[6][1].silencing
+end

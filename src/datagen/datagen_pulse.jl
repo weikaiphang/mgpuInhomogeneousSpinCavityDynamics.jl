@@ -20,16 +20,12 @@ const WURST_EDGE_FRAC = 1e-4
 # Physical helpers from SYSTEM_CONFIG
 # ============================================================
 
-function system_kappa_t(sys)
-    return sys.kappa_e + sys.kappa_i
-end
-
 function system_fwhm(sys)
     return sys.freq_inhomogeneity.FWHM
 end
 
 function composite_dummy_d(sys, T_max::Float64)
-    kappa_t = system_kappa_t(sys)
+    kappa_t = kappa_t_of(sys)
     g_mean = physical_g_mean(sys)
     return (
         timespan = (0.0, T_max),
@@ -42,7 +38,7 @@ function composite_dummy_d(sys, T_max::Float64)
 end
 
 function default_3arp_omega_max(sys)
-    kappa_t = system_kappa_t(sys)
+    kappa_t = kappa_t_of(sys)
     g_mean = physical_g_mean(sys)
     return pi * kappa_t / (4 * g_mean * sqrt(sys.kappa_e)) * system_fwhm(sys)
 end
@@ -114,9 +110,7 @@ function pulse_echo_end(family::Symbol, segments)
 end
 
 function t_settle(sys)
-    kappa_t = system_kappa_t(sys)
-    FWHM = system_fwhm(sys)
-    return max(SETTLE_N_KAPPA / kappa_t, SETTLE_N_FWHM / FWHM, SETTLE_MIN)
+    return max(SETTLE_N_KAPPA / kappa_t_of(sys), SETTLE_N_FWHM / system_fwhm(sys), SETTLE_MIN)
 end
 
 function derive_ttotal(sys, PULSE_SPEC)
@@ -213,6 +207,20 @@ function bind_rase_wurst(design, sys)
     )
 end
 
+function rose_wurst(name, t_center, design, sys)
+    return wurst_segment(;
+        name = name,
+        t_center = t_center,
+        duration = design.wurst_duration,
+        amp = paper_wurst_amp(sys, design.wurst_amp_mult),
+        bandwidth = design.bw_fwhm_mult * system_fwhm(sys),
+        n = design.n,
+        omega0 = design.omega0_over_fwhm * system_fwhm(sys),
+        chirp_sign = design.chirp_sign,
+        phase0 = design.phase0,
+    )
+end
+
 function bind_rose(design, sys)
     t0 = design.t0
     sigma = design.sigma
@@ -220,8 +228,7 @@ function bind_rose(design, sys)
     sig_tail = t0 + N_SIGMA_SUPPORT * sigma
     w1_start = sig_tail + design.gap_after_signal
     t_center1 = w1_start + dur / 2
-    w1_end = w1_start + dur
-    w2_start = w1_end + design.gap_between
+    w2_start = w1_start + dur + design.gap_between
     t_center2 = w2_start + dur / 2
 
     sig = gaussian_segment(;
@@ -232,28 +239,8 @@ function bind_rose(design, sys)
         omega = design.signal_omega_over_fwhm * system_fwhm(sys),
         phase = design.signal_phase,
     )
-    w1 = wurst_segment(;
-        name = "First WURST pulse",
-        t_center = t_center1,
-        duration = dur,
-        amp = paper_wurst_amp(sys, design.wurst_amp_mult),
-        bandwidth = design.bw_fwhm_mult * system_fwhm(sys),
-        n = design.n,
-        omega0 = design.omega0_over_fwhm * system_fwhm(sys),
-        chirp_sign = design.chirp_sign,
-        phase0 = design.phase0,
-    )
-    w2 = wurst_segment(;
-        name = "Second WURST pulse",
-        t_center = t_center2,
-        duration = dur,
-        amp = paper_wurst_amp(sys, design.wurst_amp_mult),
-        bandwidth = design.bw_fwhm_mult * system_fwhm(sys),
-        n = design.n,
-        omega0 = design.omega0_over_fwhm * system_fwhm(sys),
-        chirp_sign = design.chirp_sign,
-        phase0 = design.phase0,
-    )
+    w1 = rose_wurst("First WURST pulse", t_center1, design, sys)
+    w2 = rose_wurst("Second WURST pulse", t_center2, design, sys)
     return make_pulse_spec(;
         family = :rose,
         canonical = design.canonical,
@@ -405,20 +392,16 @@ end
 function bind_canonical_composite(design, sys)
     d = composite_dummy_d(sys, design.T_max)
     nA = design.n_coeff
-    nf = design.n_coeff
     k = ISC.k_of_seed_kind(design.seed_kind)
-    pulse = ISC.CompositePulse(k, nA, nf, d; taper_frac = design.taper_frac)
+    pulse = ISC.CompositePulse(k, nA, nA, d; taper_frac = design.taper_frac)
     kwargs = (; Omega_max = design.omega_mult * pulse.amp_scale)
-    if design.seed_kind === :hs1 && design.beta !== nothing
-        kwargs = merge(kwargs, (; beta = design.beta))
-    end
-    if design.seed_kind === :hs1 && design.mu !== nothing
-        kwargs = merge(kwargs, (; mu = design.mu))
+    if design.seed_kind === :hs1
+        design.beta === nothing || (kwargs = merge(kwargs, (; beta = design.beta)))
+        design.mu === nothing || (kwargs = merge(kwargs, (; mu = design.mu)))
     end
     u = ISC.seed_canonical(pulse, design.seed_kind; kwargs...)
-    family = design.seed_kind
     return composite_record_from(
-        pulse, u, String(design.seed_kind), design.canonical, family, design,
+        pulse, u, String(design.seed_kind), design.canonical, design.seed_kind, design,
     )
 end
 
@@ -493,6 +476,7 @@ function pulse_config_is_valid(PULSE_CONFIG)
         ISC.validate_pulse_config(PULSE_CONFIG)
         return true, ""
     catch err
+        rethrow_interrupt(err)
         return false, sprint(showerror, err)
     end
 end
@@ -575,6 +559,7 @@ function rose_designs()
     bw_mults = [5.0, 8.0]
     for t0 in t0s, sigma in sigmas, dur in durs, g1 in gaps_sig, g2 in gaps_12,
         sa in sig_amps, wa in w_amps, bw in bw_mults
+        t0 >= N_SIGMA_SUPPORT * sigma || continue
         push!(out, (
             family = :rose,
             canonical = false,

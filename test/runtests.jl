@@ -272,70 +272,343 @@ end
     )
 end
 
-@testset "_dynamic_w_time / _reconstitute_static_w_time_cost" begin
+@testset "_curriculum_fidelity_weight" begin
+    target_F = 1.0
+
+    # Boundary conditions: f(fidelity_phys=0)=0, f(fidelity_phys=1)=1, for
+    # several x_tune values (including negative, and the x_tune=0 linear
+    # special case).
+    for x in (-8.0, -0.5, 0.0, 0.5, 8.0)
+        @test _curriculum_fidelity_weight(NaN, NaN, target_F, x) == 0.0  # no accepted point -> worst case
+        @test _curriculum_fidelity_weight(1.0, target_F, target_F, x) ≈ 1.0  # perfect fidelity
+    end
+
+    # x_tune=0 is exactly linear (the removable-singularity limit).
+    @test _curriculum_fidelity_weight(0.5, 1.0, target_F, 0.0) ≈ 0.5 * 1.0  # fidelity_phys = 0.5*1 = 0.5
+    @test _curriculum_fidelity_weight(0.3, target_F, target_F, 0.0) ≈ 0.3
+
+    # Monotone in fidelity_phys, for both signs of x_tune.
+    for x in (-5.0, 5.0)
+        lo = _curriculum_fidelity_weight(0.2, target_F, target_F, x)
+        hi = _curriculum_fidelity_weight(0.9, target_F, target_F, x)
+        @test hi > lo
+    end
+
+    # Front-loaded (x<0) vs back-loaded (x>0): at the SAME low fidelity,
+    # negative x_tune must give strictly more weight than positive x_tune,
+    # and both must bracket the linear (x=0) curve -- this is the whole
+    # point of switching away from the old physics_loss-gated schedule.
+    f_neg = _curriculum_fidelity_weight(0.1, target_F, target_F, -5.0)
+    f_lin = _curriculum_fidelity_weight(0.1, target_F, target_F, 0.0)
+    f_pos = _curriculum_fidelity_weight(0.1, target_F, target_F, 5.0)
+    @test f_neg > f_lin > f_pos
+
+    # inv/sil are clamped to [0,1] defensively (tiny float overshoot).
+    @test _curriculum_fidelity_weight(1.0 + 1e-14, target_F, target_F, 0.0) ≈ 1.0
+
+    # Validation: non-finite or too-large x_tune must error, not silently NaN/Inf.
+    @test_throws ErrorException _curriculum_fidelity_weight(0.5, 0.5, target_F, NaN)
+    @test_throws ErrorException _curriculum_fidelity_weight(0.5, 0.5, target_F, Inf)
+    @test_throws ErrorException _curriculum_fidelity_weight(0.5, 0.5, target_F, 700.0)
+    @test_throws ErrorException _curriculum_fidelity_weight(0.5, 0.5, target_F, -700.0)
+end
+
+@testset "solve_optimal_x_start" begin
+
+    @testset "_schedule_shape matches _curriculum_fidelity_weight" begin
+        # _curriculum_fidelity_weight(inv, sil, target_F, x) computes
+        # fidelity_phys = inv*(1-(sil-target_F)^2) internally; sil=target_F=1
+        # makes silencing_success=1, so fidelity_phys=inv exactly -- i.e.
+        # _curriculum_fidelity_weight(F_0, 1.0, 1.0, x) reproduces
+        # _schedule_shape(x, F_0) exactly.
+        for F_0 in (0.001, 0.05, 0.1, 0.3, 0.6, 0.9, 0.999)
+            for x in (-50.0, -5.0, -1.0, -1e-5, 0.0, 1e-5, 1.0, 5.0, 50.0)
+                @test _schedule_shape(x, F_0) ≈ _curriculum_fidelity_weight(F_0, 1.0, 1.0, x) atol=1e-12
+            end
+        end
+    end
+
+    @testset "_schedule_shape: global monotonicity and limits (the fact solve_optimal_x_start relies on)" begin
+        F_0 = 0.1
+        xs = collect(-50.0:1.0:50.0)
+        vals = [_schedule_shape(x, F_0) for x in xs]
+        @test issorted(vals; rev=true)  # strictly decreasing across the WHOLE real line
+        @test _schedule_shape(-50.0, F_0) > 0.99   # -> 1 as x -> -inf
+        @test _schedule_shape(50.0, F_0) < 1e-15   # -> 0 as x -> +inf
+        @test _schedule_shape(0.0, F_0) == F_0     # exactly F_0 at x=0 (linear point)
+    end
+
+    @testset "positive-x branch (alpha < F_0)" begin
+        for (F_0, alpha) in ((0.5, 0.1), (0.8, 0.05), (0.3, 0.01), (0.95, 0.5))
+            x = solve_optimal_x_start(F_0, alpha)
+            @test x > 0
+            @test _schedule_shape(x, F_0) ≈ alpha atol=1e-5
+        end
+    end
+
+    @testset "negative-x branch (alpha > F_0) -- the front-loaded, low-starting-fidelity regime" begin
+        for (F_0, alpha) in ((0.02, 0.3), (0.0002, 0.01), (0.1, 0.5), (0.4, 0.99), (0.05, 0.9))
+            x = solve_optimal_x_start(F_0, alpha)
+            @test x < 0
+            @test _schedule_shape(x, F_0) ≈ alpha atol=1e-5
+        end
+    end
+
+    @testset "the specific pathological case from the real run" begin
+        # F_0=0.0002 (silencing stuck near 0), wanting alpha=0.01 (1% weight
+        # even at that near-zero fidelity).
+        F_0, alpha = 0.0002, 0.01
+        x = solve_optimal_x_start(F_0, alpha)
+        @test x < -1.0  # a genuinely strongly front-loaded curvature, not near-zero
+        @test _schedule_shape(x, F_0) ≈ alpha atol=1e-5
+        @test _curriculum_fidelity_weight(F_0, 1.0, 1.0, x) ≈ alpha atol=1e-5
+    end
+
+    @testset "alpha ≈ F_0 -> linear sentinel" begin
+        @test solve_optimal_x_start(0.3, 0.3) == 1e-4
+        @test solve_optimal_x_start(0.3, 0.3 + 1e-8) == 1e-4  # within default tol
+    end
+
+    @testset "degenerate F_0 (0 or 1): factor has no x-dependence, no crash" begin
+        @test solve_optimal_x_start(0.0, 0.5) == 1e-4
+        @test solve_optimal_x_start(1.0, 0.5) == 1e-4
+        @test solve_optimal_x_start(0.0, 0.0) == 1e-4
+        @test solve_optimal_x_start(1.0, 1.0) == 1e-4
+    end
+
+    @testset "alpha at the unreachable open endpoint: graceful degradation, no crash" begin
+        # alpha=1 with F_0<1 strictly needs x->-inf; no finite root exists.
+        x = solve_optimal_x_start(0.1, 1.0; x_max=50.0)
+        @test isfinite(x)
+        @test x < 0
+        @test _schedule_shape(x, 0.1) > 0.9  # close to alpha=1, even if not exact
+
+        # Symmetric case: alpha=0 with F_0>0 strictly needs x->+inf.
+        x2 = solve_optimal_x_start(0.9, 0.0; x_max=50.0)
+        @test isfinite(x2)
+        @test x2 > 0
+        @test _schedule_shape(x2, 0.9) < 0.1
+    end
+
+    @testset "input validation" begin
+        @test_throws ErrorException solve_optimal_x_start(-0.1, 0.5)
+        @test_throws ErrorException solve_optimal_x_start(1.1, 0.5)
+        @test_throws ErrorException solve_optimal_x_start(0.5, -0.1)
+        @test_throws ErrorException solve_optimal_x_start(0.5, 1.1)
+        @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; x_max=0.0)
+        @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; x_max=-1.0)
+        @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; tol=0.0)
+        @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; tol=-1e-6)
+    end
+
+    @testset "round-trip over a grid: every (F_0, alpha) pair recovers alpha" begin
+        for F_0 in (0.001, 0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99)
+            for alpha in (0.001, 0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.99)
+                x = solve_optimal_x_start(F_0, alpha)
+                @test isfinite(x)
+                got = _schedule_shape(x, F_0)
+                # Loose-ish tolerance: some (F_0,alpha) pairs near the open
+                # endpoints (e.g. F_0=0.001,alpha=0.99) are only reachable
+                # in the x->-inf limit and won't hit the tight bisection
+                # tol within x_max -- in that case at least confirm x
+                # landed in the CORRECT half (alpha>F_0 needs x<0,
+                # alpha<F_0 needs x>0 -- opposite sign from (alpha-F_0)).
+                @test abs(got - alpha) < 1e-3 || sign(x) == -sign(alpha - F_0)
+            end
+        end
+    end
+end
+
+@testset "_tmax_power_components / _reconstitute_static_direct_cost" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
 
-    # _dynamic_w_time: bounded in (0, base_w_time], monotone in physics_loss,
-    # NaN inv/sil (no accepted point yet) treated as worst-case loss=1.
-    base_w_time = 0.2
-    target_F = 1.0
-    w_decay = 0.05
-    @test _dynamic_w_time(base_w_time, NaN, NaN, target_F, w_decay) ≈ base_w_time * exp(-1.0 / w_decay)
-    @test _dynamic_w_time(base_w_time, 1.0, target_F, target_F, w_decay) ≈ base_w_time  # perfect fidelity -> loss=0
-    @test 0 < _dynamic_w_time(base_w_time, 0.5, 0.5, target_F, w_decay) <= base_w_time
-    w_hi = _dynamic_w_time(base_w_time, 0.2, 0.2, target_F, w_decay)
-    w_lo = _dynamic_w_time(base_w_time, 0.9, 0.9, target_F, w_decay)
-    @test w_lo > w_hi  # better fidelity (0.9) -> less suppression than worse fidelity (0.2)
-    @test_throws ErrorException _dynamic_w_time(base_w_time, 0.5, 0.5, target_F, 0.0)
-    @test_throws ErrorException _dynamic_w_time(base_w_time, 0.5, 0.5, target_F, -1.0)
+    # Fast, ODE-free exactness check: _direct_cost_term IS w_time*(dur/T_max)
+    # + w_tmax*tmax_frac_sq + w_power*power_mean, so evaluating it at two
+    # different (w_time, w_tmax, w_power) triples on the SAME u and
+    # comparing against _reconstitute_static_direct_cost exercises the
+    # exact same linear algebra pulse_cost's own ODE-dependent physics_cost
+    # term never touches, without paying for a solve.
+    dur = pulse_duration(pulse, u0)
+    tmax_frac_sq, power_mean = _tmax_power_components(u0, pulse)
+    w_time1, w_tmax1, w_power1 = 0.15, 1.0, 0.05
+    w_time2, w_tmax2, w_power2 = 0.6, 3.0, 0.4
+    direct1 = _direct_cost_term(u0, pulse, w_time1, w_power1, w_tmax1)
+    direct2 = _direct_cost_term(u0, pulse, w_time2, w_power2, w_tmax2)
+    reconstructed = _reconstitute_static_direct_cost(
+        direct1, w_time2, w_time1, w_tmax2, w_tmax1, w_power2, w_power1, dur, tmax_frac_sq, power_mean, pulse.T_max,
+    )
+    @test reconstructed ≈ direct2 atol=1e-12
+    @test _reconstitute_static_direct_cost(
+        direct2, w_time1, w_time2, w_tmax1, w_tmax2, w_power1, w_power2, dur, tmax_frac_sq, power_mean, pulse.T_max,
+    ) ≈ direct1 atol=1e-12
 
-    # _reconstitute_static_w_time_cost: verified against a REAL second ODE
-    # solve (not just the algebra) -- pulse_cost at two different w_time
-    # values on the SAME u must differ by exactly (w2-w1)*(duration/T_max),
-    # since w_time enters pulse_cost through exactly that one linear term.
-    w1, w2 = 0.15, 0.6
-    cost1, inv1, sil1, dur1, coh1 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w1)
-    cost2, inv2, sil2, dur2, coh2 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w2)
-    @test dur1 == dur2  # duration is w_time-independent
-    @test inv1 == inv2 && sil1 == sil2 && coh1 == coh2  # so is everything else
-    reconstructed = _reconstitute_static_w_time_cost(cost1, w2, w1, dur1, pulse.T_max)
-    @test reconstructed ≈ cost2 atol=1e-12
-    # And the inverse direction, for good measure.
-    @test _reconstitute_static_w_time_cost(cost2, w1, w2, dur2, pulse.T_max) ≈ cost1 atol=1e-12
+    # Cross-checked against a REAL second ODE solve too (pulse_cost, not
+    # just _direct_cost_term in isolation) -- physics_cost must cancel
+    # exactly since it never depends on w_time/w_tmax/w_power.
+    cost1, inv1, sil1, dur1, coh1 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w_time1, w_tmax=w_tmax1, w_power=w_power1)
+    cost2, inv2, sil2, dur2, coh2 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w_time2, w_tmax=w_tmax2, w_power=w_power2)
+    @test dur1 == dur2 && inv1 == inv2 && sil1 == sil2 && coh1 == coh2
+    reconstructed_full = _reconstitute_static_direct_cost(
+        cost1, w_time2, w_time1, w_tmax2, w_tmax1, w_power2, w_power1, dur1, tmax_frac_sq, power_mean, pulse.T_max,
+    )
+    @test reconstructed_full ≈ cost2 atol=1e-10
 
     # Inf (failed-solve) sentinel passes through unchanged.
-    @test _reconstitute_static_w_time_cost(Inf, w2, w1, dur1, pulse.T_max) == Inf
+    @test _reconstitute_static_direct_cost(
+        Inf, w_time2, w_time1, w_tmax2, w_tmax1, w_power2, w_power1, dur, tmax_frac_sq, power_mean, pulse.T_max,
+    ) == Inf
 end
 
-@testset "run_local_adam dynamic_w_time=true: smoke + no-regression when off" begin
+@testset "run_local_adam anneal_direct_weights=true: smoke + no-regression when off" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
     cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
 
-    # dynamic_w_time=false (the default) must reproduce the EXACT baseline --
-    # bit-for-bit, not just "close" -- confirming the new code path is
-    # provably a no-op unless a caller explicitly opts in.
+    # anneal_direct_weights=false (the default) must reproduce the EXACT
+    # baseline -- bit-for-bit, not just "close" -- confirming the new code
+    # path is provably a no-op unless a caller explicitly opts in.
     baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[dwt-off]")
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-off]")
     off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[dwt-off2]", dynamic_w_time=false)
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-off2]", anneal_direct_weights=false)
     @test baseline[1] == off[1]  # best_u
     @test baseline[2] == off[2]  # best_cost
     @test baseline[6] == off[6]  # history
 
-    # dynamic_w_time=true smoke: runs, finite, and diverges from the
-    # baseline once the schedule actually suppresses w_time (it cannot
-    # regress silently into being a no-op).
+    # anneal_direct_weights=true smoke: runs, finite, and diverges from the
+    # baseline once the schedule actually suppresses the direct weights (it
+    # cannot regress silently into being a no-op).
     on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[dwt-on]",
-        dynamic_w_time=true, w_time_decay=0.05)
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-on]",
+        anneal_direct_weights=true, x_tune=-3.0)
     @test length(on[1]) == n_params(pulse)
     @test isfinite(on[2])
     @test length(on[6]) >= 1
+
+    # history now records x_tune/schedule_factor per epoch (x_tune=-3.0,
+    # no x_tune_alpha, so x_tune_eff is constant across every row).
+    @test all(h.x_tune == -3.0 for h in on[6])
+    # Epoch 1's factor comes from last_good_aux still at its NaN/NaN
+    # sentinel (no accepted point yet) -- _curriculum_fidelity_weight
+    # treats that as worst-case fidelity_phys=0, giving factor==0 exactly.
+    @test on[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, -3.0)
+    # Every later epoch's factor must reproduce _curriculum_fidelity_weight
+    # applied to the PREVIOUS row's own (inversion, silencing) -- i.e. the
+    # last ACCEPTED point, not the epoch about to run.
+    for i in 2:length(on[6])
+        expected = _curriculum_fidelity_weight(on[6][i-1].inversion, on[6][i-1].silencing, 1.0, -3.0)
+        @test on[6][i].schedule_factor == expected
+    end
+    # anneal_direct_weights=false rows always carry the identity factor.
+    @test all(h.schedule_factor == 1.0 for h in baseline[6])
+
+    # x_tune=0.0 (default, plain linear) also smoke-tests cleanly.
+    on_linear = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[adw-on-linear]", anneal_direct_weights=true)
+    @test isfinite(on_linear[2])
+
     @test_throws ErrorException run_local_adam(
-        u0, pulse, FAKE_D_ODE, cost_kwargs; dynamic_w_time=true, w_time_decay=0.0,
+        u0, pulse, FAKE_D_ODE, cost_kwargs; anneal_direct_weights=true, x_tune=NaN,
     )
+    @test_throws ErrorException run_local_adam(
+        u0, pulse, FAKE_D_ODE, cost_kwargs; anneal_direct_weights=true, x_tune=800.0,
+    )
+end
+
+@testset "run_local_adam x_tune_alpha auto-calibration" begin
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    u0 = seed_canonical(pulse, :hs1)
+    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
+
+    # x_tune_alpha=nothing (the default) must reproduce the EXACT
+    # anneal_direct_weights=true baseline bit-for-bit -- this new keyword is
+    # provably a no-op unless a caller explicitly sets it.
+    baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[xta-off]",
+        anneal_direct_weights=true, x_tune=-3.0)
+    off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[xta-off2]",
+        anneal_direct_weights=true, x_tune=-3.0, x_tune_alpha=nothing)
+    @test baseline[1] == off[1]  # best_u
+    @test baseline[2] == off[2]  # best_cost
+    @test baseline[6] == off[6]  # history
+
+    # x_tune_alpha set: calibrates x_tune from the measured starting
+    # fidelity at u0 instead of using the passed x_tune directly, so this
+    # must smoke-test cleanly and diverge from a run with the SAME x_tune
+    # left uncalibrated (the calibration must actually take effect, not
+    # silently fall through to the caller's x_tune).
+    on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[xta-on]",
+        anneal_direct_weights=true, x_tune=0.0, x_tune_alpha=0.9)
+    @test length(on[1]) == n_params(pulse)
+    @test isfinite(on[2])
+    @test length(on[6]) >= 1
+    @test on[6] != baseline[6]  # calibrated x_tune != -3.0 -> different per-epoch trajectory
+
+    # history's x_tune field must carry the CALIBRATED value (constant
+    # across every row, since calibration runs once before the epoch
+    # loop), not the raw x_tune=0.0 passed in -- and it must match
+    # solve_optimal_x_start applied to u0's own measured fidelity exactly.
+    _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
+    F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
+    x_tune_expected = solve_optimal_x_start(F_0, 0.9)
+    @test all(h.x_tune == x_tune_expected for h in on[6])
+    @test x_tune_expected != 0.0
+
+    # x_tune_alpha without anneal_direct_weights=true has nothing to
+    # calibrate x_tune for -- must error, not silently ignore it.
+    @test_throws ErrorException run_local_adam(
+        u0, pulse, FAKE_D_ODE, cost_kwargs; anneal_direct_weights=false, x_tune_alpha=0.5,
+    )
+end
+
+@testset "optimise_composite_pulse: mandatory upfront x_tune_alpha calibration + recalibrate_optima_x" begin
+    common = (n_hops=2, num_epochs=2, patience=2, tol=1e-3, learning_rate=0.05,
+              hop_step_size=0.5, seed=7, threaded_grad=false)
+
+    # x_tune_alpha=nothing (the default) must reproduce the EXACT
+    # anneal_direct_weights=true baseline bit-for-bit -- both this keyword
+    # AND recalibrate_optima_x are provable no-ops unless x_tune_alpha is
+    # explicitly set.
+    baseline = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[ocp-off] ", anneal_direct_weights=true, x_tune=-3.0)
+    off = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[ocp-off2] ", anneal_direct_weights=true, x_tune=-3.0,
+        x_tune_alpha=nothing, recalibrate_optima_x=false)
+    @test baseline[1] == off[1]  # best_u
+    @test baseline[2] == off[2]  # best_cost
+    @test baseline[6] == off[6]  # history
+
+    # x_tune_alpha set, recalibrate_optima_x=true (default): every hop
+    # (including hop 0) calibrates its own x_tune from its own starting
+    # point -- identical to what run_local_adam already did per-hop before
+    # this pipeline-level feature existed, since hop 0's starting point IS
+    # the seed pulse u0. Smoke-tests cleanly and diverges from x_tune=-3.0.
+    recal_true = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[ocp-recal-true] ", anneal_direct_weights=true,
+        x_tune=0.0, x_tune_alpha=0.9, recalibrate_optima_x=true)
+    @test length(recal_true[1]) == n_params(CompositePulse(1, 4, 4, FAKE_D_ODE))
+    @test isfinite(recal_true[2])
+    @test recal_true[6] != baseline[6]
+
+    # x_tune_alpha set, recalibrate_optima_x=false: the SAME single
+    # seed-calibrated x_tune (from u0, hop 0's starting point) is reused
+    # for every hop, so hop 0 itself must be UNCHANGED vs recalibrate=true
+    # (both calibrate identically from u0), while later hops differ (no
+    # per-hop recalibration).
+    recal_false = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[ocp-recal-false] ", anneal_direct_weights=true,
+        x_tune=0.0, x_tune_alpha=0.9, recalibrate_optima_x=false)
+    @test isfinite(recal_false[2])
+    n_hop0 = count(h -> h.hop == 0, recal_true[6])
+    @test recal_true[6][1:n_hop0] == recal_false[6][1:n_hop0]  # hop 0 identical either way
+
+    # x_tune_alpha without anneal_direct_weights=true has nothing to
+    # calibrate x_tune for -- must error, not silently ignore it.
+    @test_throws ErrorException optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., anneal_direct_weights=false, x_tune_alpha=0.5)
 end
 
 include(joinpath(@__DIR__, "adjoint.jl"))

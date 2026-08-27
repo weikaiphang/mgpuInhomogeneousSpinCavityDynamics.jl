@@ -7,8 +7,6 @@
 # microwave-cavity gate below.
 # ============================================================
 
-const TWO_PI = 2 * pi
-
 const G_OVER_KAPPA_MAX = 1e-2
 const G_OVER_FWHM_MAX = 1e-2
 const FWHM_OVER_KAPPA_RANGE = (0.2, 5.0)
@@ -48,16 +46,6 @@ function physical_g2_avg(sys)
         return abs2(Float64(g.mean)) + abs2(Float64(g.std))
     else
         error("datagen supports only :constant and :gaussian g, got $(g.kind).")
-    end
-end
-
-function freq_span_field(freq)
-    if freq.kind === :lorentzian
-        return (span_gamma = freq.span_gamma, renormalize = freq.renormalize)
-    elseif freq.kind === :gaussian
-        return (span_sigma = freq.span_sigma, renormalize = freq.renormalize)
-    else
-        error("datagen supports only :lorentzian and :gaussian freq, got $(freq.kind).")
     end
 end
 
@@ -132,12 +120,12 @@ end
 function physics_gate_reason(sys)::Union{Nothing,String}
     kappa_e = sys.kappa_e
     kappa_i = sys.kappa_i
-    kappa_t = kappa_e + kappa_i
+    kappa_t = kappa_t_of(sys)
     C_ens = sys.C_ens
-    FWHM = sys.freq_inhomogeneity.FWHM
-    g_mean = physical_g_mean(sys)
     freq = sys.freq_inhomogeneity
     gcfg = sys.g_inhomogeneity
+    FWHM = freq.FWHM
+    g_mean = physical_g_mean(sys)
 
     kappa_e > 0 || return "kappa_e must be positive."
     kappa_i >= 0 || return "kappa_i must be non-negative."
@@ -156,9 +144,9 @@ function physics_gate_reason(sys)::Union{Nothing,String}
     OVERCOUPLING_RANGE[1] <= r <= OVERCOUPLING_RANGE[2] ||
         return "overcoupling r=$r outside $(OVERCOUPLING_RANGE)."
 
-    ratio_g = FWHM / kappa_t
-    FWHM_OVER_KAPPA_RANGE[1] <= ratio_g <= FWHM_OVER_KAPPA_RANGE[2] ||
-        return "FWHM/kappa_t=$ratio_g outside $(FWHM_OVER_KAPPA_RANGE)."
+    ratio_fwhm = FWHM / kappa_t
+    FWHM_OVER_KAPPA_RANGE[1] <= ratio_fwhm <= FWHM_OVER_KAPPA_RANGE[2] ||
+        return "FWHM/kappa_t=$ratio_fwhm outside $(FWHM_OVER_KAPPA_RANGE)."
 
     g_mean / kappa_t <= G_OVER_KAPPA_MAX ||
         return "g/kappa_t=$(g_mean / kappa_t) exceeds $G_OVER_KAPPA_MAX."
@@ -171,12 +159,7 @@ function physics_gate_reason(sys)::Union{Nothing,String}
     if gcfg.kind === :gaussian
         gcfg.std >= 0 || return "gaussian g std must be non-negative."
         g_low = gcfg.mean - gcfg.span_sigma * gcfg.std
-        if g_low <= 0 && gcfg.renormalize !== true
-            return "gaussian g support reaches g<=0 without renormalize=true."
-        end
-        if g_low <= 0
-            return "gaussian g truncated onto g=0 (mean - span_sigma*std <= 0)."
-        end
+        g_low > 0 || return "gaussian g truncated onto g<=0 (mean - span_sigma*std <= 0)."
     end
 
     g2 = physical_g2_avg(sys)
@@ -186,19 +169,20 @@ function physics_gate_reason(sys)::Union{Nothing,String}
 
     dummy = merge(
         (
-            simulation_order = :order1,
+            simulation_order = RULE_SIMULATION_ORDER,
             M_delta = 8,
             M_g = gcfg.kind === :constant ? 1 : 8,
             Ttotal = 1e-6,
             Nt_save = 8,
-            reltol = 1e-8,
-            abstol = 1e-8,
+            reltol = RULE_RELTOL,
+            abstol = RULE_ABSTOL,
         ),
         sys,
     )
     try
         ISC.validate_config(dummy)
     catch err
+        rethrow_interrupt(err)
         return "validate_config: $(sprint(showerror, err))"
     end
 
@@ -235,8 +219,8 @@ end
 function push_unique_system!(out, seen, sys)
     admit_system(sys) || return false
     k = system_key(sys)
-    haskey(seen, k) && return false
-    seen[k] = true
+    k in seen && return false
+    push!(seen, k)
     push!(out, sys)
     return true
 end
@@ -275,68 +259,51 @@ const G_HZ_GRID = [50.0, 100.0, 250.0]
 
 function enumerate_system_catalog()
     out = Any[]
-    seen = Dict{Any,Bool}()
+    seen = Set{Any}()
 
     # (1) C_ens × line shape × g-spec × FWHM/κ  at canonical cavity.
-    for C_ens in C_ENS_GRID
-        for freq_kind in FREQ_KIND_GRID
-            for (g_kind, eta) in G_SPEC_GRID
-                for gamma in GAMMA_GRID
-                    sys = system_from_physical(;
-                        kappa_t_hz = CANONICAL_KAPPA_T_HZ,
-                        r = CANONICAL_R,
-                        gamma = gamma,
-                        C_ens = C_ens,
-                        g_hz = CANONICAL_G_HZ,
-                        delta0_over_kt = CANONICAL_DELTA0_OVER_KT,
-                        freq_kind = freq_kind,
-                        g_kind = g_kind,
-                        eta = eta,
-                    )
-                    push_unique_system!(out, seen, sys)
-                end
-            end
-        end
+    for C_ens in C_ENS_GRID, freq_kind in FREQ_KIND_GRID, (g_kind, eta) in G_SPEC_GRID, gamma in GAMMA_GRID
+        push_unique_system!(out, seen, system_from_physical(;
+            kappa_t_hz = CANONICAL_KAPPA_T_HZ,
+            r = CANONICAL_R,
+            gamma = gamma,
+            C_ens = C_ens,
+            g_hz = CANONICAL_G_HZ,
+            delta0_over_kt = CANONICAL_DELTA0_OVER_KT,
+            freq_kind = freq_kind,
+            g_kind = g_kind,
+            eta = eta,
+        ))
     end
 
     # (2) κ_t × overcoupling × detuning at the canonical ensemble.
-    for kappa_t_hz in KAPPA_T_HZ_GRID
-        for r in R_GRID
-            for dlt in DELTA0_OVER_KT_GRID
-                sys = system_from_physical(;
-                    kappa_t_hz = kappa_t_hz,
-                    r = r,
-                    gamma = CANONICAL_GAMMA,
-                    C_ens = CANONICAL_C_ENS,
-                    g_hz = CANONICAL_G_HZ,
-                    delta0_over_kt = dlt,
-                    freq_kind = :lorentzian,
-                    g_kind = :constant,
-                    eta = 0.0,
-                )
-                push_unique_system!(out, seen, sys)
-            end
-        end
+    for kappa_t_hz in KAPPA_T_HZ_GRID, r in R_GRID, dlt in DELTA0_OVER_KT_GRID
+        push_unique_system!(out, seen, system_from_physical(;
+            kappa_t_hz = kappa_t_hz,
+            r = r,
+            gamma = CANONICAL_GAMMA,
+            C_ens = CANONICAL_C_ENS,
+            g_hz = CANONICAL_G_HZ,
+            delta0_over_kt = dlt,
+            freq_kind = :lorentzian,
+            g_kind = :constant,
+            eta = 0.0,
+        ))
     end
 
     # (3) g × C_ens × line shape at canonical cavity (constant g).
-    for g_hz in G_HZ_GRID
-        for C_ens in C_ENS_GRID
-            for freq_kind in FREQ_KIND_GRID
-                sys = system_from_physical(;
-                    kappa_t_hz = CANONICAL_KAPPA_T_HZ,
-                    r = CANONICAL_R,
-                    gamma = CANONICAL_GAMMA,
-                    C_ens = C_ens,
-                    g_hz = g_hz,
-                    delta0_over_kt = CANONICAL_DELTA0_OVER_KT,
-                    freq_kind = freq_kind,
-                    g_kind = :constant,
-                    eta = 0.0,
-                )
-                push_unique_system!(out, seen, sys)
-            end
-        end
+    for g_hz in G_HZ_GRID, C_ens in C_ENS_GRID, freq_kind in FREQ_KIND_GRID
+        push_unique_system!(out, seen, system_from_physical(;
+            kappa_t_hz = CANONICAL_KAPPA_T_HZ,
+            r = CANONICAL_R,
+            gamma = CANONICAL_GAMMA,
+            C_ens = C_ens,
+            g_hz = g_hz,
+            delta0_over_kt = CANONICAL_DELTA0_OVER_KT,
+            freq_kind = freq_kind,
+            g_kind = :constant,
+            eta = 0.0,
+        ))
     end
 
     return out

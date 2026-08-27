@@ -11,12 +11,13 @@
 function try_bound_pulse(design, sys)
     try
         spec = bind_pulse(design, sys)
-        Ttotal = derive_ttotal(sys, spec)
+        derive_ttotal(sys, spec)
         pc = materialize_pulse_config(spec)
         ok, msg = pulse_config_is_valid(pc)
         ok || return nothing, "pulse invalid: $msg"
         return spec, ""
     catch err
+        rethrow_interrupt(err)
         return nothing, sprint(showerror, err)
     end
 end
@@ -41,15 +42,19 @@ function enumerate_pairs(systems, designs)
     canon_pulses = canonical_designs_by_family(designs)
     isempty(canon_pulses) && error("No canonical pulse designs found.")
 
-    seen = Dict{Any,Bool}()
+    seen = Set{Any}()
     pairs = NamedTuple[]
+    n_reject = 0
 
     function consider!(sys, design, layer::String)
         k = pair_key(sys, design)
-        haskey(seen, k) && return
-        spec, err = try_bound_pulse(design, sys)
-        spec === nothing && return
-        seen[k] = true
+        k in seen && return
+        push!(seen, k)
+        spec, _ = try_bound_pulse(design, sys)
+        if spec === nothing
+            n_reject += 1
+            return
+        end
         push!(pairs, (
             SYSTEM_CONFIG = sys,
             PULSE_SPEC = spec,
@@ -60,8 +65,11 @@ function enumerate_pairs(systems, designs)
     end
 
     # Layer 1 / 3: all systems × canonical pulse of each family.
+    # Sort families so catalog order (and --limit) is reproducible;
+    # Dict iteration order is not.
     for sys in systems
-        for (fam, design) in canon_pulses
+        for fam in sort!(collect(keys(canon_pulses)))
+            design = canon_pulses[fam]
             layer = fam in (:rase_wurst, :rose, :arp3) ? "core+physics" : "core"
             consider!(sys, design, layer)
         end
@@ -72,11 +80,11 @@ function enumerate_pairs(systems, designs)
         consider!(canon_sys, design, "pulse_depth")
     end
 
-    return pairs
+    return pairs, n_reject
 end
 
 function write_catalog!(pairs; dry_run::Bool = false, limit::Int = 0)
-    ensure_datagen_dirs()
+    dry_run || ensure_datagen_dirs()
     n = 0
     n_write = 0
     used = Set{String}()
@@ -99,6 +107,7 @@ function write_catalog!(pairs; dry_run::Bool = false, limit::Int = 0)
 end
 
 function clear_existing_configs!()
+    isdir(DATAGEN_CONFIG_DIR) || return nothing
     for fname in readdir(DATAGEN_CONFIG_DIR)
         endswith(fname, "_simulconfig.jld2") || continue
         rm(joinpath(DATAGEN_CONFIG_DIR, fname); force=true)
@@ -118,9 +127,10 @@ function phase_configs(; dry_run::Bool = false, limit::Int = 0)
     println("  canonical families: $(sort(collect(keys(canon))))")
 
     println("Pairing (core + pulse-depth)...")
-    pairs = enumerate_pairs(systems, designs)
+    pairs, n_reject = enumerate_pairs(systems, designs)
     println("  unique validated (system, pulse) pairs: $(length(pairs))")
-    println("  simulations if executed: $(2 * length(pairs))  (ground + equator)")
+    println("  rejected at bind/Ttotal/pulse-validate: $n_reject")
+    println("  ICs at simulate time: --default-conditions ground|equatorial|both")
 
     if !dry_run
         clear_existing_configs!()
@@ -128,19 +138,14 @@ function phase_configs(; dry_run::Bool = false, limit::Int = 0)
     n, n_write, stems = write_catalog!(pairs; dry_run = dry_run, limit = limit)
     if dry_run
         println("Dry run: would write $n simulconfig files under $(DATAGEN_CONFIG_DIR).")
-        if !isempty(stems)
-            println("  example stem: $(stems[1])")
-        end
     else
         println("Wrote $n_write simulconfig files under $(DATAGEN_CONFIG_DIR).")
-        if !isempty(stems)
-            println("  example stem: $(stems[1])")
-        end
     end
+    isempty(stems) || println("  example stem: $(stems[1])")
     return n
 end
 
-function phase_simulate(; skip_existing::Bool = true, start_id::Int = 1, stop_id::Int = 0)
+function phase_simulate(run; skip_existing::Bool = true, start_id::Int = 1, stop_id::Int = 0, limit::Int = 0)
     ensure_datagen_dirs()
     files = sort(filter(f -> endswith(f, "_simulconfig.jld2"), readdir(DATAGEN_CONFIG_DIR)))
     isempty(files) && error(
@@ -154,10 +159,23 @@ function phase_simulate(; skip_existing::Bool = true, start_id::Int = 1, stop_id
     n_done = 0
 
     for (idx, fname) in enumerate(files)
+        idx < start_id && continue
+        stop_id > 0 && idx > stop_id && break
+        limit > 0 && n_done >= limit && break
+
         entry = load_simulconfig(joinpath(DATAGEN_CONFIG_DIR, fname))
         stem = stem_from_simulconfig_path(fname)
-        idx < start_id && continue
-        stop_id > 0 && idx > stop_id && continue
+
+        entry_skip = skip_existing
+        if skip_existing && haskey(manifest, stem)
+            prev = manifest[stem]
+            ver = manifest_run_rules_version(prev)
+            params_ok = run_params_match_manifest(prev, run)
+            if (ver !== nothing && ver != RUN_RULES_VERSION) || !params_ok
+                entry_skip = false
+                println("[$stem] re-running: run_rules/params changed")
+            end
+        end
 
         println()
         println("=" ^ 60)
@@ -176,8 +194,9 @@ function phase_simulate(; skip_existing::Bool = true, start_id::Int = 1, stop_id
         ok, skipped, failed, reports = simulate_catalog_entry(
             stem,
             entry.SYSTEM_CONFIG,
-            entry.PULSE_SPEC;
-            skip_existing = skip_existing,
+            entry.PULSE_SPEC,
+            run;
+            skip_existing = entry_skip,
         )
         n_ok += ok
         n_skipped += skipped
@@ -188,16 +207,25 @@ function phase_simulate(; skip_existing::Bool = true, start_id::Int = 1, stop_id
             "stem" => stem,
             "family" => String(entry.PULSE_SPEC.family),
             "run_rules_version" => RUN_RULES_VERSION,
+            "run_params" => run_params_fingerprint(run),
             "ics" => reports,
         )
         save_manifest(manifest)
     end
 
     println()
-    println(
-        "Simulate finished: $n_ok ok, $n_skipped skipped, $n_failed failed " *
-        "($n_done catalog entries visited)."
-    )
+    if n_done == 0
+        println(
+            "Simulate finished: no catalog entries in range " *
+            "(start=$start_id stop=$(stop_id == 0 ? "end" : stop_id) " *
+            "limit=$(limit == 0 ? "none" : limit), $(length(files)) files on disk)."
+        )
+    else
+        println(
+            "Simulate finished: $n_ok ok, $n_skipped skipped, $n_failed failed " *
+            "($n_done catalog entries visited)."
+        )
+    end
     println("Manifest: $DATAGEN_MANIFEST")
     return nothing
 end
