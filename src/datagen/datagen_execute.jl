@@ -14,7 +14,15 @@
 # Caps, ICs, Nt_save, and n_sizes come from simulate-time run params.
 # Result files are named {stem}_{ic}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2;
 # skip if that path and its pulsemat csv both exist and are non-empty.
+#
+# Trajectories are dispatched one-per-functional-CUDA-device (CPU if none).
+# Concurrent GPU occupancy needs julia -t N with N >= number of GPUs.
+# After every job the owning worker synchronizes, GC.gc(false), and
+# CUDA.reclaim()s that device; the pool reclaims every device on exit.
 # ============================================================
+
+const _DATAGEN_IO_LOCK = ReentrantLock()
+const _DATAGEN_MANIFEST_LOCK = ReentrantLock()
 
 function frequency_bandwidth(freq_inhomogeneity)
     kind = freq_inhomogeneity.kind
@@ -258,7 +266,7 @@ function reduce_trajectory(t, a, Sp, Sz, d, E_of_t)
         idelta_res = idelta_res,
         delta_res = delta_res,
         keep_bins = keep_bins,
-        g_keep = collect(d.g_b_1d),
+        g_keep = collect(d.g_b_1d),  # 1-D g grid, length M_g (not the flat M-vector)
         delta_keep = fill(delta_res, M_g),
         Sp_keep = Sp_keep,
         Sz_keep = Sz_keep,
@@ -274,6 +282,8 @@ function save_datagen_result(filename, data, E_of_t)
     csv_path = pulsemat_from_result(filename)
     jld_tmp = filename * ".part"
     csv_tmp = csv_path * ".part"
+    committed_jld = false
+    committed_csv = false
     try
         isfile(jld_tmp) && rm(jld_tmp; force=true)
         isfile(csv_tmp) && rm(csv_tmp; force=true)
@@ -285,13 +295,23 @@ function save_datagen_result(filename, data, E_of_t)
             savepath = csv_tmp,
         )
         mv(jld_tmp, filename; force=true)
+        committed_jld = true
         mv(csv_tmp, csv_path; force=true)
+        committed_csv = true
         result_is_complete(filename) || error(
             "save did not produce a complete result pair at $filename."
         )
     catch
         isfile(jld_tmp) && rm(jld_tmp; force=true)
         isfile(csv_tmp) && rm(csv_tmp; force=true)
+        # A half-written dest pair must not look skippable, and must not
+        # linger as a jld2 without its pulsemat sibling.
+        if committed_jld && !committed_csv
+            isfile(filename) && rm(filename; force=true)
+        elseif committed_jld && committed_csv
+            isfile(filename) && rm(filename; force=true)
+            isfile(csv_path) && rm(csv_path; force=true)
+        end
         rethrow()
     end
     return filename
@@ -353,7 +373,7 @@ function run_params_fingerprint(run)
     )
 end
 
-function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString, split, run, Ttotal::Float64)
+function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString, split, run, Ttotal::Float64; compute::Symbol=:auto)
     SIM_SETTING = build_sim_setting(Ttotal, ic, saved_file_name, split, run)
     CONFIG = merge(SIM_SETTING, sys)
     ISC.validate_config(CONFIG)
@@ -371,11 +391,18 @@ function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString
         initial_condition = ic,
         reltol = RULE_RELTOL,
         abstol = RULE_ABSTOL,
-        compute = :auto,
+        compute = compute,
     )
     elapsed = (time_ns() - t0) / 1e9
 
     reduced = reduce_trajectory(t, a, Sp, Sz, d, E_of_t)
+    # Host trajectories are Nt × M; drop them before the JLD2 write so the
+    # peak RSS is the reduced payload, not reduced + raw.
+    t = nothing
+    a = nothing
+    Sp = nothing
+    Sz = nothing
+    d = nothing
     data = merge(
         reduced,
         (
@@ -383,6 +410,11 @@ function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString
             SYSTEM_CONFIG = sys,
             PULSE_CONFIG = PULSE_SPEC.segments,
             PULSE_SPEC = PULSE_SPEC,
+            # Analytic WURST/Gaussian segments are package-legal PULSE_CONFIG.
+            # Composite records are not: rebuild with materialize_pulse_config(PULSE_SPEC)
+            # or use the sibling _pulsemat.csv (jld2 loader load_mode=:csv).
+            pulse_rebuild = any(seg -> seg.kind === :composite_record, PULSE_SPEC.segments) ?
+                "pulse_spec" : "pulse_config",
             elapsed_seconds = elapsed,
             run_rules_version = RUN_RULES_VERSION,
             run_params = run_params_fingerprint(run),
@@ -395,24 +427,87 @@ function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString
     return elapsed
 end
 
-function simulate_catalog_entry(stem::AbstractString, sys, PULSE_SPEC, run; skip_existing::Bool = true)
-    n_ok = 0
-    n_skipped = 0
-    n_failed = 0
-    reports = Dict{String, Any}()
+function _datagen_println(io_args...)
+    lock(_DATAGEN_IO_LOCK) do
+        println(io_args...)
+    end
+    return nothing
+end
 
+"""
+Functional CUDA devices for datagen. Empty if CUDA is missing or unusable.
+Uses every device (no 8-GPU pulse-optimizer cap).
+"""
+function datagen_cuda_devices()
+    try
+        CUDA.functional() || return Any[]
+        return collect(CUDA.devices())
+    catch
+        return Any[]
+    end
+end
+
+function datagen_gpu_count()
+    return length(datagen_cuda_devices())
+end
+
+function describe_datagen_compute(n_jobs::Integer=0; n_gpu::Union{Nothing,Int}=nothing)
+    n_gpu_eff = n_gpu === nothing ? datagen_gpu_count() : Int(n_gpu)
+    n_th = max(1, Threads.nthreads())
+    if n_gpu_eff < 1
+        n_workers = n_jobs > 0 ? min(n_jobs, n_th) : n_th
+        return "CPU  julia_threads=$n_th  workers=$(n_workers)"
+    end
+    n_workers = n_jobs > 0 ? min(n_jobs, n_gpu_eff, n_th) : min(n_gpu_eff, n_th)
+    return "$n_gpu_eff CUDA GPU(s)  julia_threads=$n_th  concurrent=$(n_workers)"
+end
+
+"""
+Idle the current CUDA device, drop unreachable `CuArray`s, and return the
+CUDA.jl cached-free pool to the driver. No-op without a functional device.
+Never throws. Call only from the worker that owns this device.
+"""
+function datagen_reclaim_current_gpu!()
+    try
+        CUDA.functional() || return nothing
+        CUDA.synchronize()
+        GC.gc(false)
+        CUDA.reclaim()
+    catch
+    end
+    return nothing
+end
+
+"""
+`synchronize` + `reclaim` on every listed device. Restores the caller's
+current device. Call only when no datagen ODE is in flight.
+"""
+function datagen_reclaim_all_gpus!(devices)
+    isempty(devices) && return nothing
+    try
+        CUDA.functional() || return nothing
+        prev = CUDA.device()
+        try
+            GC.gc(false)
+            for dev in devices
+                CUDA.device!(dev)
+                CUDA.synchronize()
+                CUDA.reclaim()
+            end
+        finally
+            CUDA.device!(prev)
+        end
+    catch
+    end
+    return nothing
+end
+
+function plan_catalog_jobs(stem::AbstractString, sys, PULSE_SPEC, run; skip_existing::Bool=true)
     Ttotal = derive_ttotal(sys, PULSE_SPEC)
     splits = splits_for_run(sys, Ttotal, run)
-    println("  Ttotal=$(Ttotal * 1e6) us  n_splits=$(length(splits))")
-    for split in splits
-        println(
-            @sprintf(
-                "  split  M_delta=%d  M_g=%d  M=%d  safety=%.3g  target=%.3g",
-                split.M_delta, split.M_g, split.M_total, split.safety_factor, split.target_safety,
-            )
-        )
-    end
-
+    reports = Dict{String, Any}()
+    jobs = Any[]
+    n_skipped = 0
     for ic in run.ics
         for split in splits
             outpath, key = result_target(stem, ic, split.M_delta, split.M_g, run.Nt_save)
@@ -421,31 +516,248 @@ function simulate_catalog_entry(stem::AbstractString, sys, PULSE_SPEC, run; skip
                 n_skipped += 1
                 continue
             end
-            try
-                elapsed = run_one_ic(sys, PULSE_SPEC, ic, outpath, split, run, Ttotal)
-                reports[key] = Dict(
-                    "status" => "ok",
-                    "path" => outpath,
-                    "elapsed_seconds" => elapsed,
-                    "M_delta" => split.M_delta,
-                    "M_g" => split.M_g,
-                    "safety_factor" => split.safety_factor,
-                )
-                n_ok += 1
-            catch err
-                rethrow_interrupt(err)
-                msg = sprint(showerror, err)
-                reports[key] = Dict(
-                    "status" => "failed",
-                    "path" => outpath,
-                    "error" => msg,
-                )
-                n_failed += 1
-                println("[$stem $key] FAILED: ", msg)
-            end
-            GC.gc()
+            push!(jobs, (
+                stem = String(stem),
+                sys = sys,
+                PULSE_SPEC = PULSE_SPEC,
+                ic = ic,
+                split = split,
+                run = run,
+                Ttotal = Ttotal,
+                outpath = outpath,
+                key = key,
+            ))
         end
     end
+    return Ttotal, splits, jobs, reports, n_skipped
+end
 
+function _job_outcome_ok(job, worker_tag, elapsed)
+    return (
+        stem = job.stem,
+        key = job.key,
+        status = "ok",
+        path = job.outpath,
+        elapsed_seconds = elapsed,
+        M_delta = job.split.M_delta,
+        M_g = job.split.M_g,
+        safety_factor = job.split.safety_factor,
+        worker = String(worker_tag),
+    )
+end
+
+function _job_outcome_failed(job, worker_tag, msg)
+    return (
+        stem = job.stem,
+        key = job.key,
+        status = "failed",
+        path = job.outpath,
+        error = String(msg),
+        worker = String(worker_tag),
+    )
+end
+
+function _fill_unassigned_outcomes!(outcomes, jobs, msg::AbstractString)
+    for i in eachindex(outcomes)
+        if !isassigned(outcomes, i)
+            outcomes[i] = _job_outcome_failed(jobs[i], "unassigned", msg)
+        end
+    end
+    return outcomes
+end
+
+function _notify_datagen_complete(on_complete, job, st)
+    on_complete === nothing && return nothing
+    try
+        on_complete(job, st)
+    catch err
+        rethrow_interrupt(err)
+        @error "datagen on_complete callback failed" exception=err
+    end
+    return nothing
+end
+
+function _execute_datagen_job(job, compute::Symbol, worker_tag::AbstractString)
+    try
+        elapsed = run_one_ic(
+            job.sys, job.PULSE_SPEC, job.ic, job.outpath, job.split, job.run, job.Ttotal;
+            compute = compute,
+        )
+        return _job_outcome_ok(job, worker_tag, elapsed)
+    catch err
+        rethrow_interrupt(err)
+        msg = sprint(showerror, err)
+        _datagen_println("[$(worker_tag)] [$(job.stem) $(job.key)] FAILED: ", msg)
+        return _job_outcome_failed(job, worker_tag, msg)
+    finally
+        # Solver already reclaimed primal GPU buffers; this catches host
+        # arrays and any leftover cached pool on *this* worker's device.
+        datagen_reclaim_current_gpu!()
+    end
+end
+
+"""
+Run independent trajectories concurrently: one in-flight ODE per CUDA
+device. Falls back to CPU thread workers when no GPU is available.
+
+Every index of the returned vector is assigned, including jobs that never
+started (marked `failed` with an explanatory `error`). `InterruptException`
+is rethrown after that fill and after reclaiming every device.
+
+`executor` and `on_complete` are for the self-test and for crash-safe
+in-memory report updates; production simulate uses the defaults.
+"""
+function run_datagen_jobs!(jobs; executor=_execute_datagen_job, on_complete=nothing)
+    n = length(jobs)
+    n == 0 && return NamedTuple[]
+    devices = datagen_cuda_devices()
+    n_gpu = length(devices)
+    compute = n_gpu > 0 ? :gpu : :cpu
+    n_th = max(1, Threads.nthreads())
+    n_workers = min(n, n_gpu > 0 ? n_gpu : n_th, n_th)
+
+    if n_gpu > 1 && n_th < n_gpu
+        @warn "Julia has $n_th thread(s) but $n_gpu GPUs; only $n_workers GPU(s) will run at once. Start with `julia -t $n_gpu` or `julia -t auto`."
+    end
+
+    println("Dispatching $n trajectory job(s) on $(describe_datagen_compute(n; n_gpu=n_gpu))")
+
+    outcomes = Vector{Any}(undef, n)
+    stop = Threads.Atomic{Bool}(false)
+    jobq = Channel{Int}(n)
+    for i in 1:n
+        put!(jobq, i)
+    end
+    close(jobq)
+
+    function worker(wid::Int)
+        if n_gpu > 0
+            CUDA.device!(devices[wid])
+        end
+        worker_tag = n_gpu > 0 ? "gpu $(wid - 1)" : "cpu $(wid)"
+        try
+            for i in jobq
+                stop[] && break
+                job = jobs[i]
+                try
+                    _datagen_println("[$(worker_tag)] $(job.stem) $(job.key) start  M=$(job.split.M_total)")
+                    st = executor(job, compute, worker_tag)
+                    outcomes[i] = st
+                    if st.status == "ok"
+                        _datagen_println(
+                            @sprintf("[%s] %s %s ok  %.1fs", worker_tag, job.stem, job.key, st.elapsed_seconds)
+                        )
+                    end
+                    _notify_datagen_complete(on_complete, job, st)
+                catch err
+                    if !isassigned(outcomes, i)
+                        outcomes[i] = _job_outcome_failed(
+                            job, worker_tag, sprint(showerror, unwrap_task_failure(err)),
+                        )
+                    end
+                    _notify_datagen_complete(on_complete, job, outcomes[i])
+                    if is_interrupt(err)
+                        stop[] = true
+                        throw(unwrap_task_failure(err))
+                    end
+                    @error "datagen worker $worker_tag died on $(job.stem) $(job.key)" exception=err
+                end
+                datagen_reclaim_current_gpu!()
+            end
+        finally
+            datagen_reclaim_current_gpu!()
+        end
+        return nothing
+    end
+
+    pool_err = nothing
+    try
+        if n_workers == 1
+            worker(1)
+        else
+            blas_n = BLAS.get_num_threads()
+            try
+                BLAS.set_num_threads(1)
+                @sync for w in 1:n_workers
+                    Threads.@spawn worker(w)
+                end
+            finally
+                BLAS.set_num_threads(blas_n)
+            end
+        end
+    catch err
+        pool_err = err
+        if is_interrupt(err)
+            stop[] = true
+        else
+            @error "datagen worker pool failed" exception=err
+        end
+    finally
+        _fill_unassigned_outcomes!(
+            outcomes, jobs, "job was not started (worker pool stopped)",
+        )
+        datagen_reclaim_all_gpus!(devices)
+    end
+    pool_err !== nothing && rethrow_interrupt(pool_err)
+    return outcomes
+end
+
+function merge_job_outcomes!(reports, outcomes)
+    n_ok = 0
+    n_failed = 0
+    for st in outcomes
+        if st.status == "ok"
+            reports[st.key] = Dict(
+                "status" => "ok",
+                "path" => st.path,
+                "elapsed_seconds" => st.elapsed_seconds,
+                "M_delta" => st.M_delta,
+                "M_g" => st.M_g,
+                "safety_factor" => st.safety_factor,
+                "worker" => st.worker,
+            )
+            n_ok += 1
+        else
+            reports[st.key] = Dict(
+                "status" => "failed",
+                "path" => st.path,
+                "error" => st.error,
+                "worker" => st.worker,
+            )
+            n_failed += 1
+        end
+    end
+    return n_ok, n_failed
+end
+
+function count_job_report_statuses(reports)
+    n_ok = 0
+    n_failed = 0
+    for (_, rep) in reports
+        st = string(json_get(rep, "status"))
+        if st == "ok"
+            n_ok += 1
+        elseif st == "failed"
+            n_failed += 1
+        end
+    end
+    return n_ok, n_failed
+end
+
+function simulate_catalog_entry(stem::AbstractString, sys, PULSE_SPEC, run; skip_existing::Bool=true)
+    Ttotal, splits, jobs, reports, n_skipped = plan_catalog_jobs(
+        stem, sys, PULSE_SPEC, run; skip_existing = skip_existing,
+    )
+    println("  Ttotal=$(Ttotal * 1e6) us  n_splits=$(length(splits))  pending=$(length(jobs))")
+    for split in splits
+        println(
+            @sprintf(
+                "  split  M_delta=%d  M_g=%d  M=%d  safety=%.3g  target=%.3g",
+                split.M_delta, split.M_g, split.M_total, split.safety_factor, split.target_safety,
+            )
+        )
+    end
+    outcomes = run_datagen_jobs!(jobs)
+    n_ok, n_failed = merge_job_outcomes!(reports, outcomes)
     return n_ok, n_skipped, n_failed, reports
 end

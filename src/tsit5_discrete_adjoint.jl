@@ -111,6 +111,18 @@ struct Tsit5DiscAdjWorkspace
     λu::Vector{Float64}
     λy::Vector{Float64}
     λk::NTuple{6,Vector{Float64}}
+    # Cache for _accumulate_drive_grad!'s ForwardDiff.GradientConfig -- see
+    # that function's own comment for why this is safe to reuse across
+    # calls/stages despite each call building a fresh closure. Keyed by `n`
+    # (Base.RefValue, not a Dict) since a single workspace is only ever used
+    # by ONE pulse/n_params at a time within a track's reverse sweep; `n`
+    # only actually changes across an RJMCMC k-hop reusing the same cached
+    # (M-keyed) workspace, in which case the mismatch is detected and the
+    # config is rebuilt once. `Any`-typed so this struct's own type doesn't
+    # have to encode ForwardDiff's tag/chunk type parameters.
+    drive_grad_n::Base.RefValue{Int}
+    drive_grad_cfg::Base.RefValue{Any}
+    drive_grad_result::Base.RefValue{Vector{Float64}}
 end
 
 function Tsit5DiscAdjWorkspace(M::Integer)
@@ -124,11 +136,12 @@ function Tsit5DiscAdjWorkspace(M::Integer)
     λu = Vector{Float64}(undef, nR)
     λy = Vector{Float64}(undef, nR)
     λk = ntuple(_ -> Vector{Float64}(undef, nR), 6)
-    return Tsit5DiscAdjWorkspace(k, y, u_np1, x, x̄, λu, λy, λk)
+    return Tsit5DiscAdjWorkspace(k, y, u_np1, x, x̄, λu, λy, λk,
+                                  Ref(-1), Ref{Any}(nothing), Ref(Float64[]))
 end
 
 # ============================================================
-# THREAD-LOCAL WORKSPACE CACHE
+# TASK-LOCAL WORKSPACE CACHE
 #
 # _adjoint_one_track (pulse_adjoint.jl) builds a fresh Tsit5DiscAdjWorkspace
 # on every call -- once per initial-condition TRACK, once per OPTIMISER
@@ -136,60 +149,43 @@ end
 # each time (~15MB at a real M=20000 ensemble). None of that is needed
 # fresh: every field is fully overwritten (never read-before-write) on
 # each use inside tsit5_step_vjp!, so reusing the SAME buffers across
-# calls is exactly the same "cache scratch space, always return a fresh
-# COPY of any caller-visible result" pattern bspline.jl's own
-# _bspline_scratch_pair already uses -- and for the identical reason:
-# repeated allocate-then-GC of a mid-sized buffer many times per
-# optimisation run is real, avoidable churn.
+# calls avoids that repeated allocate-then-GC churn.
 #
-# Keyed by (Threads.threadid(), M), ONE Dict PER THREAD (never shared),
-# for the same reason bspline.jl's own pool is per-thread: two concurrent
-# calls on different threads (this package's own Threads.@threads usage,
-# e.g. optimise_composite_pulse_over_k dispatching multiple grad_mode=
-# :adjoint runs across k's) must never share a workspace, which would be
-# a silent data race. Within ONE thread, pulse_cost_grad_adjoint calls
-# :ground then :equator SEQUENTIALLY (this file has no concurrency of its
-# own), so reusing one cached instance for both tracks, one after another,
-# is safe -- each track's own use fully completes (all reads and writes)
-# before the next begins.
-#
-# Built LAZILY on first use, not as a top-level `const`, for the same
-# reason bspline.jl's pool is: a `const` sized from `Threads.maxthreadid()`
-# at PRECOMPILE time would go stale if this package is later loaded in a
-# session started with a different `-t N` than whatever process
-# precompiled it.
-mutable struct _Tsit5AdjWorkspacePool
-    caches::Vector{Dict{Int,Tsit5DiscAdjWorkspace}}
-end
-const _TSIT5_ADJ_WS_POOL = Ref{Union{Nothing,_Tsit5AdjWorkspacePool}}(nothing)
-const _TSIT5_ADJ_WS_POOL_LOCK = ReentrantLock()
-
+# Keyed by (current Task, M), via `task_local_storage` -- NOT by
+# `Threads.threadid()` (an EARLIER version of this cache used that keying
+# and had a real, silent-corruption bug: under Julia's default `:dynamic`
+# `Threads.@threads` scheduling, a Task can migrate to a DIFFERENT OS
+# thread at any yield point -- including the `GC.gc(false)` calls this
+# same reverse sweep already makes once per checkpoint window
+# (pulse_adjoint.jl) -- so `threadid()` is not a stable per-task identity
+# for the DURATION of one gradient call. Two concurrent tasks (e.g. two
+# `k`'s in `optimise_composite_pulse_over_k`'s own `Threads.@threads`, both
+# using `grad_mode=:adjoint` on the SAME ensemble `M`) could transiently
+# report the SAME `threadid()` at different moments and be handed the
+# SAME cached workspace while both are still mid-flight through it,
+# interleaving writes into `ws.k`/`ws.y`/... with no synchronization --
+# silently wrong gradients, not a crash. `task_local_storage` has no such
+# gap: it is bound to the TASK object itself, which the Julia runtime
+# guarantees stays associated with that storage regardless of which OS
+# thread is currently executing it, and needs no locking at all (each
+# task owns its own storage exclusively) -- simpler AND correct, unlike
+# the `Threads.threadid()`-keyed version this replaced.
 """
     _tsit5_adj_workspace(M) -> Tsit5DiscAdjWorkspace
 
-Thread-local cached [`Tsit5DiscAdjWorkspace`](@ref), reused across calls
-for the same `M` on the same thread instead of allocating a fresh one
+Task-local cached [`Tsit5DiscAdjWorkspace`](@ref), reused across calls for
+the same `M` within the SAME `Task` instead of allocating a fresh one
 every time -- see this section's own module comment for the full safety
 reasoning (every field is fully overwritten before being read on each use,
-and the cache is keyed per-thread so concurrent callers never share an
-instance).
+and the cache is keyed per-`Task` via `task_local_storage`, which stays
+valid even if that task migrates between OS threads mid-call, unlike
+`Threads.threadid()`).
 """
 function _tsit5_adj_workspace(M::Integer)
-    pool = _TSIT5_ADJ_WS_POOL[]
-    tid = Threads.threadid()
-    if pool === nothing || tid > length(pool.caches)
-        lock(_TSIT5_ADJ_WS_POOL_LOCK) do
-            pool2 = _TSIT5_ADJ_WS_POOL[]
-            needed = Threads.maxthreadid()
-            if pool2 === nothing || length(pool2.caches) < needed
-                _TSIT5_ADJ_WS_POOL[] = _Tsit5AdjWorkspacePool(
-                    [Dict{Int,Tsit5DiscAdjWorkspace}() for _ in 1:needed]
-                )
-            end
-        end
-        pool = _TSIT5_ADJ_WS_POOL[]
-    end
-    cache = @inbounds pool.caches[tid]
+    tls = task_local_storage()
+    cache = get!(tls, :InhomogeneousSpinCavityDynamics_tsit5_adj_ws_cache) do
+        Dict{Int,Tsit5DiscAdjWorkspace}()
+    end::Dict{Int,Tsit5DiscAdjWorkspace}
     return get!(() -> Tsit5DiscAdjWorkspace(Int(M)), cache, Int(M))
 end
 
@@ -278,19 +274,50 @@ function tsit5_forced_step!(u_np1, k, y_scratch, u, p, t, dt,
     return u_np1
 end
 
+"""
+    _accumulate_drive_grad!(gθ, λx, t, pulse, u_pulse, sqrt_κe, ws)
+
+`gθ .+= ∇_θ[sqrt_κe*(λar*real(E(t,θ)) + λai*imag(E(t,θ)))]` via ForwardDiff,
+called once per RK stage (6x per accepted adjoint step). The
+`ForwardDiff.GradientConfig` and output buffer are cached on `ws`
+(`ws.drive_grad_cfg`/`ws.drive_grad_result`, keyed by `ws.drive_grad_n`)
+rather than rebuilt on every call -- building a fresh `Chunk`+closure+
+`GradientConfig` per stage was previously the dominant allocation/setup
+cost of the whole `:adjoint` backend, paid 6x per step for no reason: the
+closure `s` defined below has the SAME TYPE on every call (a nested
+function's type is fixed at compile time of the ENCLOSING method, not
+per-invocation -- only its captured field VALUES, i.e. `t`/`pulse`/
+`u_pulse`/`sqrt_κe`/`λar`/`λai`, differ), so a `GradientConfig` built
+against one instance of `s` remains valid for `ForwardDiff.gradient!` calls
+against any later instance of `s` with the same `n = length(u_pulse)` --
+reused via `ForwardDiff.gradient!(result, s, u_pulse, cfg)` (in place, no
+per-call allocation of the output vector either). Rebuilt only when `n`
+itself changes (an RJMCMC k-hop changing `n_params(pulse)` on a workspace
+whose `M`-keyed cache slot was already warm from a previous `k`) --
+detected via the `ws.drive_grad_n[] != n` check, so this is correctness-
+preserving for every caller, not merely typical-case-preserving.
+"""
 function _accumulate_drive_grad!(gθ::AbstractVector, λx::AbstractVector, t,
-                                 pulse::CompositePulse, u_pulse::AbstractVector, sqrt_κe)
+                                 pulse::CompositePulse, u_pulse::AbstractVector, sqrt_κe,
+                                 ws::Tsit5DiscAdjWorkspace)
     λar = λx[1]
     λai = λx[2]
     (λar == 0 && λai == 0) && return nothing
     n = length(u_pulse)
-    chunk = ForwardDiff.Chunk{min(60, n)}()
     function s(uu)
         E = build_E_of_t(pulse, uu)(t)
         return sqrt_κe * (λar * real(E) + λai * imag(E))
     end
-    cfg = ForwardDiff.GradientConfig(s, u_pulse, chunk)
-    gθ .+= ForwardDiff.gradient(s, u_pulse, cfg)
+    if ws.drive_grad_n[] != n
+        chunk = ForwardDiff.Chunk{min(60, n)}()
+        ws.drive_grad_cfg[] = ForwardDiff.GradientConfig(s, u_pulse, chunk)
+        ws.drive_grad_result[] = Vector{Float64}(undef, n)
+        ws.drive_grad_n[] = n
+    end
+    cfg = ws.drive_grad_cfg[]
+    result = ws.drive_grad_result[]
+    ForwardDiff.gradient!(result, s, u_pulse, cfg)
+    gθ .+= result
     return nothing
 end
 
@@ -335,7 +362,7 @@ function tsit5_step_vjp!(
         pack_state_real!(ws.x, ws.y[s], M)
         rhs_1st_order_vjp!(ws.λy, ws.λk[s], ws.x, p, _tsit5_stage_time(tab, t, dt, s))
         _accumulate_drive_grad!(gθ, ws.λk[s], _tsit5_stage_time(tab, t, dt, s),
-                                pulse, u_pulse, sqrt_κe)
+                                pulse, u_pulse, sqrt_κe, ws)
         @inbounds for i in 1:nR
             ws.λu[i] += ws.λy[i]
         end
@@ -372,8 +399,35 @@ end
     return zero(tab.a21)
 end
 
+"""
+    _host_ode_p(d, E_of_t) -> p
+
+Adjoint-side ODE parameter tuple. `delta_b`/`g_b` are asserted real before
+truncation: every OTHER backend (`rhs_1st_order!`'s own forward solves via
+`run_sim_1st_order_pure`, `_pulse_cost_grad_threaded`'s Dual ODEs) consumes
+`d.delta_b`/`d.g_b` as given, complex or not, while this function has
+always silently discarded any imaginary part via `real.(...)` -- currently
+a no-op (every ensemble this package builds via `ensemble.jl` produces
+real-valued `delta_b`/`g_b`), but a silent one: if a future ensemble
+construction path ever produced complex detunings/couplings,
+`pulse_cost_grad_adjoint` would differentiate a DIFFERENT (real-truncated)
+ODE than `pulse_cost`/`_pulse_cost_grad_threaded` actually evaluate, with
+no error to flag the mismatch. The assertion converts that into a loud,
+immediate failure instead, and is exact-no-op on every currently-tested
+input (all real).
+"""
 function _host_ode_p(d, E_of_t)
     M = Int(d.M)
+    all(iszero, imag.(d.delta_b)) || error(
+        "_host_ode_p: d.delta_b has nonzero imaginary part(s) -- the adjoint " *
+        "backend (pulse_cost_grad_adjoint) only supports real detunings; " *
+        "grad_mode=:forwarddiff/threaded_grad=true handle complex delta_b correctly."
+    )
+    all(iszero, imag.(d.g_b)) || error(
+        "_host_ode_p: d.g_b has nonzero imaginary part(s) -- the adjoint " *
+        "backend (pulse_cost_grad_adjoint) only supports real couplings; " *
+        "grad_mode=:forwarddiff/threaded_grad=true handle complex g_b correctly."
+    )
     delta_b = collect(Float64, real.(d.delta_b))
     g_b = collect(Float64, real.(d.g_b))
     return (Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i), delta_b, g_b, M, E_of_t)

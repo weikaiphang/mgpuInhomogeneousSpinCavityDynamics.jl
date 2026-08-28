@@ -1,25 +1,22 @@
 # PINN first-order datagen orchestrator.
-# Does not modify package physics. Run with:
+# Does not modify package physics. Full documentation: src/datagen/README.md
 #
-#   julia --project=. src/datagen/datagen_run.jl --phase configs
+#   julia --project=. src/datagen/datagen_run.jl --help
 #   julia --project=. src/datagen/datagen_run.jl --phase configs --dry-run
-#   julia --project=. src/datagen/datagen_run.jl --phase simulate
-#   julia --project=. src/datagen/datagen_run.jl --phase all
+#   julia --project=. src/datagen/datagen_run.jl --phase configs
+#   julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate
 #
-# Configs:  --dry-run   --limit N
-# Simulate: --start IDX --stop IDX --limit N --no-skip
-#   --default-conditions ground|equatorial|both   (default both)
-#   --M-cap N          (default 60000)
-#   --M-g-cap N        (default 30)
-#   --M-sizing default|N
-#   --NT-save N        (default 5001)
-# (--start/--stop are 1-based indices into the sorted configs listing)
+# --phase is required (configs|simulate|all).
+# Resume a crashed simulate with --phase simulate, never --phase configs.
+# Self-test: julia --project=. src/datagen/datagen_selftest.jl
 
 module DataGen
 
 using InhomogeneousSpinCavityDynamics
+using CUDA
 using JLD2
 using JSON3
+using LinearAlgebra
 using Printf
 
 const ISC = InhomogeneousSpinCavityDynamics
@@ -42,7 +39,7 @@ function _parse_int(val, flag)
 end
 
 function parse_args(args)
-    phase = "configs"
+    phase = nothing
     dry_run = false
     limit = 0
     start_id = 1
@@ -57,7 +54,9 @@ function parse_args(args)
     i = 1
     while i <= length(args)
         a = args[i]
-        if a == "--phase"
+        if a == "--help" || a == "-h"
+            return (help = true,)
+        elseif a == "--phase"
             phase, i = _need_value(args, i, a)
         elseif a == "--dry-run"
             dry_run = true
@@ -92,6 +91,7 @@ function parse_args(args)
         end
     end
 
+    phase === nothing && error("required: --phase configs|simulate|all  (see --help)")
     phase in ("configs", "simulate", "all") || error(
         "--phase must be configs, simulate, or all, got $(phase)."
     )
@@ -105,6 +105,7 @@ function parse_args(args)
         "--stop=$stop_id is before --start=$start_id."
     )
     return (
+        help = false,
         phase = phase,
         dry_run = dry_run,
         limit = limit,
@@ -121,8 +122,45 @@ function parse_args(args)
     )
 end
 
+function print_usage()
+    println(
+        """
+        Datagen — first-order PINN trajectory catalog
+        Documentation: src/datagen/README.md
+
+          julia --project=. src/datagen/datagen_run.jl --phase configs [--dry-run] [--limit N]
+          julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate [options]
+          julia -t auto --project=. src/datagen/datagen_run.jl --phase all [options]
+
+        --phase is required (configs|simulate|all). No arguments is an error.
+
+        configs  replaces data/datagen/configs/ with a new simulconfig catalog.
+                 Do not use it to resume a simulate.
+        simulate loads that catalog and runs pending (IC, split) jobs.
+                 Exits 1 if any entry or trajectory failed.
+                 Resume with the same flags; skip is filename-based.
+        all      configs then simulate. --limit applies to both (it is not
+                 “simulate N of the existing catalog”).
+
+        Simulate options:
+          --start IDX --stop IDX   1-based window into the sorted configs listing
+          --limit N --no-skip
+          --default-conditions ground|equatorial|both     (default both)
+          --M-cap N --M-g-cap N --M-sizing default|N --NT-save N
+
+        Default --M-cap 60000 and --NT-save 5001 need on the order of 10 GB
+        host RAM per job. Smoke with a smaller cap before a full campaign.
+        """
+    )
+    return nothing
+end
+
 function main(args)
     opt = parse_args(args)
+    if hasproperty(opt, :help) && opt.help
+        print_usage()
+        return nothing
+    end
     println("PINN datagen  run_rules_version=$(RUN_RULES_VERSION)")
     println("Output root: $DATAGEN_ROOT")
     if opt.phase in ("simulate", "all") && !(opt.dry_run && opt.phase == "all")
@@ -133,18 +171,24 @@ function main(args)
         )
     end
 
+    n_failed = 0
     if opt.phase in ("configs", "all")
         phase_configs(; dry_run = opt.dry_run, limit = opt.limit)
     end
     if opt.phase in ("simulate", "all")
-        opt.dry_run && return
-        phase_simulate(
+        opt.dry_run && return nothing
+        stats = phase_simulate(
             opt.run;
             skip_existing = opt.skip_existing,
             start_id = opt.start_id,
             stop_id = opt.stop_id,
             limit = opt.limit,
         )
+        n_failed = stats.n_failed
+    end
+    if n_failed > 0
+        println("datagen: $n_failed failed job(s) or catalog entries.")
+        Base.exit(1)
     end
     return nothing
 end

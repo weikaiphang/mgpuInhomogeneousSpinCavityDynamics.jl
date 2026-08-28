@@ -27,8 +27,43 @@ function ensure_datagen_dirs()
     return nothing
 end
 
+"""
+Unwrap `TaskFailedException` / `CompositeException` so Ctrl-C from a
+`Threads.@spawn` worker is visible as `InterruptException`. Prefers an
+interrupt if several tasks failed. Cycle-safe.
+"""
+function unwrap_task_failure(err)
+    seen = IdDict{Any, Nothing}()
+    while true
+        haskey(seen, err) && return err
+        seen[err] = nothing
+        if err isa TaskFailedException
+            ex = try
+                err.task.exception
+            catch
+                return err
+            end
+            ex === nothing && return err
+            err = ex
+        elseif err isa CompositeException && !isempty(err.exceptions)
+            for e in err.exceptions
+                u = unwrap_task_failure(e)
+                u isa InterruptException && return u
+            end
+            err = err.exceptions[1]
+        else
+            return err
+        end
+    end
+end
+
+function is_interrupt(err)
+    return unwrap_task_failure(err) isa InterruptException
+end
+
 function rethrow_interrupt(err)
-    err isa InterruptException && rethrow()
+    u = unwrap_task_failure(err)
+    u isa InterruptException && throw(u)
     return err
 end
 
@@ -56,6 +91,7 @@ end
 # Filename tokens match data/data_1st_order: 0p05, 1em06, units glued on.
 function fmt_plain(x::Real)
     x = Float64(x)
+    isfinite(x) || error("fmt_plain requires a finite number, got $x.")
     iszero(x) && return "0"
     ax = abs(x)
     signc = x < 0 ? "m" : ""
@@ -106,7 +142,7 @@ function pulse_slug(spec)
         return s
     elseif fam === :rose
         if hasproperty(d, :t_center1)
-            return "ROSE_t0$(fmt_us(d.t0))_sig$(fmt_us(d.sigma))_w$(fmt_us(d.wurst_duration))"
+            return "ROSE_t0$(fmt_us(d.t0))_sig$(fmt_us(d.sigma))_w$(fmt_us(d.wurst_duration))_c1$(fmt_us(d.t_center1))_c2$(fmt_us(d.t_center2))"
         end
         s = "ROSE_t0$(fmt_us(d.t0))_sig$(fmt_us(d.sigma))_w$(fmt_us(d.wurst_duration))_g1$(fmt_us(d.gap_after_signal))_g2$(fmt_us(d.gap_between))"
         d.signal_amp_mult != 1.0 && (s *= "_samp$(fmt_plain(d.signal_amp_mult))")
@@ -117,7 +153,13 @@ function pulse_slug(spec)
         return s
     elseif fam === :arp3 || fam === :arp3_signal
         prefix = fam === :arp3_signal ? "3ARPsig" : "3ARP"
-        return "$(prefix)_T$(fmt_us(d.T_budget))_t$(fmt_us(d.t_start))_bw$(fmt_plain(d.bw_fwhm_mult))_om$(fmt_plain(d.omega_mult))"
+        s = "$(prefix)_T$(fmt_us(d.T_budget))_t$(fmt_us(d.t_start))_bw$(fmt_plain(d.bw_fwhm_mult))_om$(fmt_plain(d.omega_mult))"
+        if fam === :arp3_signal
+            d.signal_amp_mult != 1.0 && (s *= "_samp$(fmt_plain(d.signal_amp_mult))")
+            hasproperty(d, :signal_t0) && d.signal_t0 != 15e-6 && (s *= "_st$(fmt_us(d.signal_t0))")
+            hasproperty(d, :signal_sigma) && d.signal_sigma != 3e-6 && (s *= "_ss$(fmt_us(d.signal_sigma))")
+        end
+        return s
     elseif fam in (:hs1, :corpse, :bb1)
         tag = fam === :hs1 ? "HS1" : fam === :corpse ? "CORPSE" : "BB1"
         s = "$(tag)_T$(fmt_us(d.T_max))_om$(fmt_plain(d.omega_mult))"
@@ -155,7 +197,7 @@ end
 
 function datagen_stem(sys, spec)
     stem = sanitize_stem(system_slug(sys) * "_" * pulse_slug(spec))
-    if length(stem) > DATAGEN_STEM_MAXLEN
+    if ncodeunits(stem) > DATAGEN_STEM_MAXLEN
         stem = sanitize_stem(stem[1:DATAGEN_STEM_MAXLEN] * "_" * stable_stem_tag(stem))
     end
     return stem
@@ -172,8 +214,8 @@ function uniquify_stem(base::AbstractString, used::Set{String})
     return stem
 end
 
-function simulconfig_path(stem::AbstractString)
-    return joinpath(DATAGEN_CONFIG_DIR, stem * "_simulconfig.jld2")
+function simulconfig_path(stem::AbstractString, dir::AbstractString=DATAGEN_CONFIG_DIR)
+    return joinpath(dir, stem * "_simulconfig.jld2")
 end
 
 function result_signature(ic::Symbol, M_delta, M_g, Nt_save)
@@ -211,16 +253,16 @@ function stem_from_simulconfig_path(path)
     return fname[1:end-length("_simulconfig.jld2")]
 end
 
-function load_manifest()
-    isfile(DATAGEN_MANIFEST) || return Dict{String, Any}()
+function load_manifest(path::AbstractString=DATAGEN_MANIFEST)
+    isfile(path) || return Dict{String, Any}()
     try
         return Dict{String, Any}(
             String(k) => v
-            for (k, v) in JSON3.read(read(DATAGEN_MANIFEST, String))
+            for (k, v) in JSON3.read(read(path, String))
         )
     catch err
         rethrow_interrupt(err)
-        @warn "manifest unreadable; continuing with empty manifest" exception = err
+        @warn "manifest unreadable; continuing with empty manifest" path=path exception=err
         return Dict{String, Any}()
     end
 end
@@ -230,14 +272,15 @@ function manifest_run_rules_version(entry)
     return v === nothing ? nothing : string(v)
 end
 
-function save_manifest(manifest)
-    ensure_datagen_dirs()
-    tmp = DATAGEN_MANIFEST * ".part"
+function save_manifest(manifest, path::AbstractString=DATAGEN_MANIFEST)
+    dir = dirname(path)
+    isempty(dir) || mkpath(dir)
+    tmp = path * ".part"
     try
         open(tmp, "w") do io
             JSON3.write(io, manifest)
         end
-        mv(tmp, DATAGEN_MANIFEST; force=true)
+        mv(tmp, path; force=true)
     catch
         isfile(tmp) && rm(tmp; force=true)
         rethrow()
@@ -246,8 +289,17 @@ function save_manifest(manifest)
 end
 
 function save_simulconfig(path, SYSTEM_CONFIG, PULSE_SPEC)
-    ensure_datagen_dirs()
-    JLD2.jldsave(path; SYSTEM_CONFIG = SYSTEM_CONFIG, PULSE_SPEC = PULSE_SPEC)
+    dir = dirname(path)
+    isempty(dir) || mkpath(dir)
+    tmp = path * ".part"
+    try
+        isfile(tmp) && rm(tmp; force=true)
+        JLD2.jldsave(tmp; SYSTEM_CONFIG = SYSTEM_CONFIG, PULSE_SPEC = PULSE_SPEC)
+        mv(tmp, path; force=true)
+    catch
+        isfile(tmp) && rm(tmp; force=true)
+        rethrow()
+    end
     return path
 end
 

@@ -615,6 +615,18 @@ corruption, not a clean failure). Summing the raw (non-unit-normalised)
 `Sp_j` first and normalising the WHOLE sum by a constant afterward has
 no such singularity anywhere: the only division is by a fixed number
 that never depends on `u`.
+
+NOTE on physical interpretation: this is a COOPERATIVITY-weighted (`Nj g²`)
+collective overlap, matching `g2_avg` in ensemble.jl -- it is NOT directly
+proportional to the instantaneous field amplitude the cavity mode actually
+radiates, which is a LINEAR-in-`g` quantity (`ȧ ⊃ -i Σ_j g_j Sp_j^*` in
+`rhs_1st_order!`). For a wide `g`-inhomogeneity the two can rank pulses
+differently, since this metric over-weights strongly-coupled, high-`Nj`
+bins quadratically relative to their actual contribution to the emitted
+field. See [`_weighted_field_amplitude`](@ref) for the linearly-weighted,
+field-proportional diagnostic counterpart -- computed alongside this one
+wherever it's available, but never substituted into the optimised
+objective (`pulse_cost` continues to use THIS metric, unchanged).
 """
 function _weighted_silencing_factor(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector, ::Type{T}) where {T}
     length(Sp) == length(g_b) == length(Nj) || error(
@@ -628,7 +640,46 @@ function _weighted_silencing_factor(Sp::AbstractVector, g_b::AbstractVector, Nj:
 end
 
 """
-    pulse_metrics(u, pulse, d; kwargs...) -> (inversion, silencing, coherence)
+    _weighted_field_amplitude(Sp, g_b, Nj, ::Type{T}) -> T
+
+DIAGNOSTIC-ONLY companion to [`_weighted_silencing_factor`](@ref): weights
+the collective sum by `g_j` ALONE (not `Nj_j g_j`) -- `Sp_j` is already
+EXTENSIVE (bounded by `Nj_j/2`, not by `1`), so `Σ_j g_j Sp_j` (this
+function's numerator) is exactly, term-for-term, the Maxwell-Bloch cavity
+source `Σ_j g_j Sp_j` in `rhs_1st_order!` (`ȧ ⊃ -i Σ_j g_j conj(Sp_j)`) --
+no extra `Nj_j` factor belongs in the weight, since `Sp_j` itself already
+carries its bin's own population scaling. (An earlier version of this
+function used `weight = Nj_j g_j`, i.e. `Σ_j Nj_j g_j Sp_j = Σ_j Nj_j² g_j
+s_j` for intensive per-bin coherence `s_j = Sp_j/Nj_j` -- quadratic in
+`Nj_j`, not linear, so it did NOT actually mirror the source term despite
+the docstring's claim at the time: verified directly, e.g. two bins with
+equal `g` and `Nj=[10,1000]` give a source-term ratio of exactly `100`
+between "only the small bin coherent" and "only the large bin coherent",
+but the old `Nj_j g_j`-weighted metric gave `10000` for the same
+comparison -- corrected here.)
+
+Normalised to `[0, 1]` by the triangle-inequality bound `|Σ_j g_j Sp_j| <=
+Σ_j |g_j| |Sp_j| <= Σ_j |g_j| (Nj_j/2)` (the denominator, using `|g_j|`
+since a signed/complex coupling's SIGN cannot help the bound), same
+`1e-30` epsilon pattern for `Sp==0`/`g==0` degenerate cases.
+
+Never fed into [`pulse_cost`](@ref)'s optimised objective or its gradient
+backends -- recorded purely so callers/logs can compare it against the
+collective `|F|` actually being optimised, exactly the same role
+`_weighted_coherence` already plays relative to `_weighted_silencing_factor`.
+"""
+function _weighted_field_amplitude(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector, ::Type{T}) where {T}
+    length(Sp) == length(g_b) == length(Nj) || error(
+        "_weighted_field_amplitude: Sp/g_b/Nj lengths $(length(Sp))/$(length(g_b))/$(length(Nj)) must match."
+    )
+    max_field_sum = sum(abs.(g_b) .* Nj) / 2
+    E_complex = sum(g_b .* Sp) / (max_field_sum + 1e-30)
+    abs_E = sqrt(abs2(E_complex) + 1e-30)
+    return clamp(abs_E, zero(T), one(T))
+end
+
+"""
+    pulse_metrics(u, pulse, d; kwargs...) -> (inversion, silencing, coherence, field_amp)
 
 Dual-trajectory metrics used by [`pulse_cost`](@ref). `inversion` and
 `silencing` are both in `[0, 1]`, higher = better, and are NOT two
@@ -652,6 +703,11 @@ coordinates of one Bloch vector:
   never fed into [`pulse_cost`](@ref)'s optimised objective, recorded
   purely so callers/logs can compare it against the collective `|F|`
   actually being optimised.
+- `field_amp`: the linearly-`g`-weighted counterpart of `silencing` (see
+  [`_weighted_field_amplitude`](@ref)), from the SAME `:equator` solve (no
+  extra ODE solve). DIAGNOSTIC ONLY -- proportional to the actual emitted
+  cavity field amplitude, unlike `silencing`'s cooperativity weighting;
+  never fed into [`pulse_cost`](@ref)'s optimised objective.
 
 `Nj`-weighting for `inversion` (`Nj ./ sum(Nj)`, rather than the 1D
 `p_delta` this package's `prepare_derived` also returns) is used so this
@@ -668,12 +724,129 @@ function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; compute::Sym
     _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:equator)
     silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
     coherence = _weighted_coherence(Sp, Nj_eq, T)
-    return inversion, silencing, coherence
+    field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
+    return inversion, silencing, coherence, field_amp
+end
+
+# ============================================================
+# Dynamic barrier exponents (p_exp/q_exp): generalises the cost's
+# fidelity_phys = inversion*silencing_success to
+# fidelity_phys = inversion^p_exp * silencing_success^q_exp, a per-epoch
+# repulsive barrier (see _dynamic_barrier_exponent below) that discourages
+# the optimizer from sacrificing inversion/silencing_success below a floor
+# to buy cheap gains elsewhere. p_exp=q_exp=1 (the default for every
+# function below) is EXACTLY today's formula -- not approximately: see
+# _pow_or_identity's identity branch. This formula/chain-rule pair is
+# shared by FOUR independent consumers (pulse_cost, _pulse_cost_grad_threaded,
+# pulse_cost_grad_adjoint, pulse_cost_on_frozen_mesh) that would otherwise
+# each hand-copy it -- exactly the kind of drift risk _schedule_shape was
+# factored out to avoid for the x_tune schedule.
+# ============================================================
+
+"""
+    _pow_or_identity(x, e), _pow_derivative(x, e)
+
+`x^e` and its derivative `e*x^(e-1)`, EXCEPT at `e == 1` where each takes
+an exact identity branch (`x`, `one(x)`) -- never evaluating `x^1`/`x^0` at
+all, so `p_exp == q_exp == 1` (the default everywhere) reproduces the
+legacy `inversion*silencing_success` formula BIT-FOR-BIT regardless of
+`x`'s sign, not merely `≈`.
+
+At `e != 1`, `x` is floored to `max(x, 0)` before exponentiating --
+`inversion`/`silencing` are themselves always clamped to `[0,1]` by
+[`_weighted_inversion`](@ref)/[`_weighted_silencing_factor`](@ref), so
+`silencing_success = 1-(silencing-target_F)^2` is PROVABLY `>= 0` too for
+any documented `target_F ∈ [0,1]` (`|silencing-target_F| <= 1` there) --
+this floor is therefore a genuine no-op on the entire documented/tested
+domain, not a silent behaviour change. It exists purely so a caller who
+passes `target_F` outside `[0,1]` (never validated -- see `pulse_cost`'s
+own docstring, which only documents `target_F ∈ {0.0, 1.0}` but does not
+forbid other values) gets a real, finite, if unusual, cost under a
+non-integer `dynamic_barrier` exponent, instead of Julia's `x^e` throwing
+`DomainError` for a negative base and non-integer real `e` -- a genuine
+regression risk from generalising `^1` (safe for any sign) to arbitrary
+real `e >= 1` (undefined in `Reals` for a negative base and fractional
+`e`). Confirmed reproducible without this floor:
+`_fidelity_physics_cost(0.5, 0.0, 2.0, 1.0, 2.5)` (`target_F=2.0`, clearly
+out of range) throws `DomainError` on `silencing_success = 1-(0-2)^2 = -3`
+raised to `q_exp=2.5`.
+"""
+_pow_or_identity(x, e) = e == one(e) ? x : max(x, zero(x))^e
+_pow_derivative(x, e) = e == one(e) ? one(x) : e * max(x, zero(x))^(e - one(e))
+
+"""
+    _assert_barrier_exponents(p_exp, q_exp)
+
+Validates `p_exp`/`q_exp` are both finite and `>= 1`. `inversion` is
+provably in `[0,1]` already (`_weighted_inversion` clamps per-bin), and so
+is `silencing_success = 1-(silencing-target_F)^2` for any DOCUMENTED
+`target_F ∈ [0,1]` (`silencing` itself clamped to `[0,1]` by
+`_weighted_silencing_factor`, so `|silencing-target_F| <= 1` there) -- an
+UNvalidated `target_F` outside `[0,1]` can still make `silencing_success`
+negative, which `_pow_or_identity`/`_pow_derivative`'s own `max(x,0)` floor
+handles separately (see their docstring) so that even that out-of-contract
+case stays finite rather than throwing. With `e >= 1` and a floored,
+non-negative base, no `DomainError`/NaN from `0^(negative or non-integer)`
+is reachable -- `_dynamic_barrier_exponent` below only ever emits `>= 1`,
+so this constraint is never user-visible in the default flow, only a
+defensive contract against a caller passing `p_exp`/`q_exp` directly.
+"""
+function _assert_barrier_exponents(p_exp, q_exp)
+    (isfinite(p_exp) && p_exp >= 1) || error(
+        "_assert_barrier_exponents: p_exp must be finite and >= 1, got $p_exp."
+    )
+    (isfinite(q_exp) && q_exp >= 1) || error(
+        "_assert_barrier_exponents: q_exp must be finite and >= 1, got $q_exp."
+    )
+end
+
+"""
+    _fidelity_physics_cost(inversion::T, silencing::T, target_F, p_exp, q_exp) where {T}
+        -> (physics_cost::T, fidelity_phys::T, silencing_success::T)
+
+    silencing_success = 1 - (silencing - target_F)^2
+    fidelity_phys     = inversion^p_exp * silencing_success^q_exp
+    physics_cost      = (1 - fidelity_phys)^2
+
+`p_exp == q_exp == 1` reproduces the legacy `inversion*silencing_success`
+formula BIT-FOR-BIT (via `_pow_or_identity`'s identity branch, not merely
+`≈`). Generic in `T` so the SAME code serves [`pulse_cost`](@ref)'s
+`ForwardDiff.Dual` primal (ForwardDiff differentiates `Dual^Float64` via the
+ordinary power rule automatically, so the primal's gradient stays exact
+without any manual chain rule) AND the two gradient backends'
+(`_pulse_cost_grad_threaded`/`pulse_cost_grad_adjoint`) plain-`Float64`
+analytical chain rule via [`_fidelity_partials`](@ref) below.
+"""
+function _fidelity_physics_cost(inversion::T, silencing::T, target_F, p_exp, q_exp) where {T}
+    _assert_barrier_exponents(p_exp, q_exp)
+    ss = one(T) - (silencing - convert(T, target_F))^2
+    fid = _pow_or_identity(inversion, p_exp) * _pow_or_identity(ss, q_exp)
+    return (one(T) - fid)^2, fid, ss
+end
+
+"""
+    _fidelity_partials(inversion, silencing_success, p_exp, q_exp) -> (term_I, term_S)
+
+`∂fidelity_phys/∂inversion` and `∂fidelity_phys/∂silencing_success` for
+[`_fidelity_physics_cost`](@ref)'s `fidelity_phys = inversion^p_exp *
+silencing_success^q_exp` (ordinary power rule on each factor, the other held
+fixed). At `p_exp == q_exp == 1` these reduce EXACTLY to `(silencing_success,
+inversion)` -- the legacy chain rule's own coefficients, unchanged. Never
+branches on whether `inversion`/`silencing_success` are `0` (a `0^0`-style
+guard would be WRONG at `p_exp==1`/`q_exp==1`, where the correct partial is
+simply the other factor, not `0`) -- branches only on the EXPONENT being `1`
+via `_pow_derivative`, which is correct by construction for any `p_exp,
+q_exp >= 1` (validated by [`_assert_barrier_exponents`](@ref)).
+"""
+function _fidelity_partials(inversion, silencing_success, p_exp, q_exp)
+    _assert_barrier_exponents(p_exp, q_exp)
+    return (_pow_derivative(inversion, p_exp) * _pow_or_identity(silencing_success, q_exp),
+            _pow_or_identity(inversion, p_exp) * _pow_derivative(silencing_success, q_exp))
 end
 
 """
     pulse_cost(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
-        -> (cost, inversion, silencing, duration, coherence)
+        -> (cost, inversion, silencing, duration, coherence, field_amp)
 
 Scalar cost to be minimised. Inversion and silencing are scored on
 **two independent ODE solves** of the same pulse `u` (see
@@ -684,7 +857,7 @@ preserving collective coherence (RASE-style revival); `target_F=0.0`
 rewards destroying it (ROSE-style echo silencing).
 
     silencing_success = 1 - (silencing - target_F)²
-    fidelity_phys = inversion * silencing_success
+    fidelity_phys = inversion^p_exp * silencing_success^q_exp
     physics_cost = (1 - fidelity_phys)²
 
     J = physics_cost + w_time*(duration/T_max) + w_tmax*max(t_end[end]-T_max, 0)²/T_max²
@@ -699,6 +872,14 @@ cost down on its own, since `fidelity_phys` is their PRODUCT, not their
 weighted sum. There is accordingly no `w_inv`/`w_sil` knob any more: both
 tracks are always solved, unconditionally.
 
+`p_exp`/`q_exp` (both default `1.0`, reproducing the plain product exactly
+via [`_fidelity_physics_cost`](@ref)) are the dynamic barrier exponents --
+see [`_dynamic_barrier_exponent`](@ref)/[`run_local_adam`](@ref)'s
+`dynamic_barrier` for how [`run_local_adam`](@ref) computes and passes
+non-default values per epoch. A direct `pulse_cost` call (e.g.
+`initial_metrics`/`final_metrics`) that doesn't pass them gets today's exact
+math.
+
 `w_power` is an L2 penalty on the decoded, scale-normalised amplitude
 coefficients (i.e. `softplus.(raw_cA)`). Failed solves return `Inf`.
 Do not pass `initial_condition`.
@@ -708,9 +889,18 @@ Do not pass `initial_condition`.
 computed from the SAME `:equator` solve as `silencing` (no extra ODE
 solve). It is DIAGNOSTIC ONLY -- recorded for comparison, never part of
 `cost`, which depends only on `inversion` and `silencing`.
+
+`field_amp` (see [`_weighted_field_amplitude`](@ref)) is likewise
+DIAGNOSTIC ONLY, from the SAME `:equator` solve -- the linearly-`g`-weighted,
+field-amplitude-proportional counterpart of the cooperativity-weighted
+`silencing`; never part of `cost`. Appended at the END of the return tuple
+specifically so existing positional-unpacking callers (`cost, inv, sil,
+dur, coh = pulse_cost(...)`) keep working unchanged (Julia's tuple
+destructuring ignores extra trailing values).
 """
 function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
                      target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
+                     p_exp::Real=1.0, q_exp::Real=1.0,
                      compute::Symbol=:auto, kwargs...)
     _forbid_initial_condition(kwargs)
     T = eltype(u)
@@ -729,6 +919,7 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
     inversion = zero(T)
     silencing = zero(T)
     coherence = zero(T)
+    field_amp = zero(T)
 
     try
         # Both tracks must be simulated to compute the multiplicative physical fidelity
@@ -738,19 +929,18 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
         _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:equator)
         silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
         coherence = _weighted_coherence(Sp, Nj_eq, T)
+        field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
     catch e
         e isa PulseSolveFailed || rethrow()
         infT = convert(T, Inf)
         nanT = convert(T, NaN)
-        return infT, nanT, nanT, duration, nanT
+        return infT, nanT, nanT, duration, nanT, nanT
     end
 
-    silencing_success = one(T) - (silencing - convert(T, target_F))^2
-    fidelity_phys = inversion * silencing_success
-    physics_cost = (one(T) - fidelity_phys)^2
+    physics_cost, _, _ = _fidelity_physics_cost(inversion, silencing, target_F, p_exp, q_exp)
 
     cost = physics_cost + w_time * (duration / pulse.T_max) + tmax_penalty + power_penalty
-    return cost, inversion, silencing, duration, coherence
+    return cost, inversion, silencing, duration, coherence, field_amp
 end
 
 # ============================================================
@@ -1897,25 +2087,26 @@ function _direct_cost_term(uu, pulse::CompositePulse, w_time, w_power, w_tmax)
 end
 
 # ============================================================
-# CURRICULUM ANNEALING OF THE THREE DIRECT (non-ODE) COST WEIGHTS
+# CURRICULUM ANNEALING OF w_time (the direct, non-ODE cost weight)
 # (run_local_adam(anneal_direct_weights=true))
 #
-# Optional curriculum schedule: suppress w_time/w_tmax/w_power TOGETHER
-# (one shared factor, not three independent schedules) while the pulse is
-# still physically bad, so early epochs' gradient descends mostly on
-# inversion/silencing rather than being pulled toward "just make it short/
-# cheap/in-bounds" before it even inverts anything, then let all three
-# penalties ramp back up toward the caller's own configured weights as
-# physics_cost improves. Detached from the epoch's own AD tape (built from
-# the PREVIOUS accepted point's plain-Float64 metrics, never from the
-# Dual/adjoint state being differentiated THIS epoch), and reconstructed
-# back to the exact static cost afterward (see
-# `_reconstitute_static_direct_cost`) so every comparison outside this one
-# epoch's own gradient step -- `best_cost`/`improved`/early stopping here,
-# and basin-hopping/final reporting one level up in
-# `optimise_composite_pulse`/`optimise_composite_pulse_rjmcmc` -- stays on
-# the SAME fixed objective the caller actually asked for, never a moving
-# target.
+# Optional curriculum schedule: suppress w_time ONLY (w_tmax/w_power are
+# NEVER annealed -- always the caller's own base weight) while the pulse
+# is still physically bad, so early epochs' gradient descends mostly on
+# inversion/silencing rather than being pulled toward "just make it
+# short" before it even inverts anything, then let w_time ramp back up
+# toward the caller's own configured weight as physics_cost improves.
+# NEVER applies to hop==0 (factor pinned at 0.0 there; annealing only
+# starts from hop 1 onwards -- see run_local_adam's own docstring).
+# Detached from the epoch's own AD tape (built from the PREVIOUS accepted
+# point's plain-Float64 metrics, never from the Dual/adjoint state being
+# differentiated THIS epoch), and reconstructed back to the exact static
+# cost afterward (see `_reconstitute_static_direct_cost`) so every
+# comparison outside this one epoch's own gradient step --
+# `best_cost`/`improved`/early stopping here, and basin-hopping/final
+# reporting one level up in `optimise_composite_pulse`/
+# `optimise_composite_pulse_rjmcmc` -- stays on the SAME fixed objective
+# the caller actually asked for, never a moving target.
 # ============================================================
 
 """
@@ -1943,9 +2134,11 @@ end
     _curriculum_fidelity_weight(inv, sil, target_F, x_tune) -> Float64
 
 Normalised `[0, 1]` annealing FACTOR for [`run_local_adam`](@ref)'s
-`anneal_direct_weights=true` schedule -- the SAME factor multiplies
-`w_time`, `w_tmax`, and `w_power` (a single shared curve, not three
-independent ones): `f(fidelity_phys) = (exp(x_tune*fidelity_phys) - 1) /
+`anneal_direct_weights=true` schedule -- multiplies `w_time` ONLY
+(`w_tmax`/`w_power` are never annealed; this function itself is a general
+`[0,1]` schedule curve, agnostic to what its one caller applies it to --
+see `run_local_adam`'s own docstring for the current w_time-only scope):
+`f(fidelity_phys) = (exp(x_tune*fidelity_phys) - 1) /
 (exp(x_tune) - 1)`, where `fidelity_phys = inv*(1-(sil-target_F)^2)` is
 [`pulse_cost`](@ref)'s own `fidelity_phys` formula evaluated at the
 supplied `(inv, sil)` (the LAST ACCEPTED point's metrics, plain `Float64`
@@ -1991,14 +2184,93 @@ end
 
 Default calibration target for [`run_local_adam`](@ref)'s mandatory
 `x_tune_alpha` auto-calibration (used whenever `anneal_direct_weights=true`
-and no explicit `x_tune_alpha` is passed): a small guaranteed floor of
-`w_time`/`w_tmax`/`w_power` weight even from a near-zero starting
+and no explicit `x_tune_alpha` is passed, from hop 1 onwards -- annealing
+never applies to hop 0, see `run_local_adam`'s own docstring): a small
+guaranteed floor of `w_time` weight even from a near-zero starting
 fidelity, protecting the physics-fidelity objective early without letting
-the schedule collapse the direct weights to zero -- see
+the schedule collapse `w_time` to zero -- see
 [`solve_optimal_x_start`](@ref)'s own docstring for the pathological
 near-zero-fidelity case this guards against.
 """
 const _DEFAULT_X_TUNE_ALPHA = 0.025
+
+"""
+    _DEFAULT_BARRIER_SAFE, _DEFAULT_BARRIER_MIN, _DEFAULT_BARRIER_LAMBDA, _DEFAULT_BARRIER_MAX_EXP
+
+Default thresholds for [`run_local_adam`](@ref)'s `dynamic_barrier` feature
+(see [`_dynamic_barrier_exponent`](@ref)): `safe=0.95` (no barrier at/above
+this), `min_val=0.85` (the floor, capped at `max_exp=8.0` at/below it),
+`lambda=5.0` (curve steepness in between). Shared by BOTH the inversion
+barrier (`p_exp`, via [`_dynamic_barrier_p`](@ref)) and the silencing
+barrier (`q_exp`, via [`_dynamic_barrier_q`](@ref)) -- `silencing_success`
+is already a `[0,1]` "closeness to target" scalar directly analogous to
+`inversion`'s own role, so one shared threshold set applies to both by
+design, not oversight.
+"""
+const _DEFAULT_BARRIER_SAFE = 0.95
+const _DEFAULT_BARRIER_MIN = 0.85
+const _DEFAULT_BARRIER_LAMBDA = 5.0
+const _DEFAULT_BARRIER_MAX_EXP = 8.0
+
+"""
+    _dynamic_barrier_exponent(x; safe=_DEFAULT_BARRIER_SAFE, min_val=_DEFAULT_BARRIER_MIN,
+        lambda=_DEFAULT_BARRIER_LAMBDA, max_exp=_DEFAULT_BARRIER_MAX_EXP) -> Float64
+
+Continuous repulsive barrier exponent on a `[0,1]` quality metric `x`:
+`1.0` at/above `safe` (no barrier -- reduces to the plain product term at
+that exponent, see [`_pow_or_identity`](@ref)); rising as
+`1 + lambda*((safe-x)/(x-min_val))^2` for `x` strictly between `min_val` and
+`safe`; saturating at `max_exp` at/below `min_val` (a FINITE, tunable cap --
+NOT literally the unbounded blow-up a naive `1/(x-min_val)` would give as
+`x -> min_val`, which would zero out `x^exponent` for any `x<1` and kill the
+very gradient the barrier exists to provide; `max_exp=8.0` keeps
+`0.8^8 ≈ 0.17` and its derivative `8*0.8^7 ≈ 1.68` both meaningfully
+nonzero). `NaN` (no accepted point measured yet) maps to `1.0`, i.e. NO
+barrier -- the conservative choice for THIS role, deliberately the OPPOSITE
+convention from [`_curriculum_fidelity_weight`](@ref)'s own `NaN -> 0`
+(worst-case fidelity): that function's schedule wants to suppress direct
+weights when nothing is known yet, while a barrier that fired on unmeasured
+data would be applying a penalty to a metric it has no evidence for.
+Validates `0 <= min_val < safe <= 1`, `lambda >= 0`, `max_exp >= 1`.
+"""
+function _dynamic_barrier_exponent(x::Real; safe::Real=_DEFAULT_BARRIER_SAFE, min_val::Real=_DEFAULT_BARRIER_MIN,
+                                    lambda::Real=_DEFAULT_BARRIER_LAMBDA, max_exp::Real=_DEFAULT_BARRIER_MAX_EXP)::Float64
+    0.0 <= min_val < safe <= 1.0 || error(
+        "_dynamic_barrier_exponent: requires 0 <= min_val < safe <= 1, got min_val=$min_val, safe=$safe."
+    )
+    lambda >= 0.0 || error("_dynamic_barrier_exponent: lambda must be >= 0, got $lambda.")
+    max_exp >= 1.0 || error("_dynamic_barrier_exponent: max_exp must be >= 1, got $max_exp.")
+    isnan(x) && return 1.0
+    x_val = clamp(Float64(x), 0.0, 1.0)
+    x_val >= safe && return 1.0
+    x_val <= min_val && return Float64(max_exp)
+    p = 1.0 + Float64(lambda) * ((safe - x_val) / (x_val - min_val))^2
+    return min(p, Float64(max_exp))
+end
+
+"""
+    _dynamic_barrier_p(inversion; safe, min_val, lambda, max_exp) -> Float64
+
+The inversion barrier exponent `p_exp` -- [`_dynamic_barrier_exponent`](@ref)
+applied directly to `inversion` (already a `[0,1]` scalar).
+"""
+_dynamic_barrier_p(inversion::Real; safe::Real=_DEFAULT_BARRIER_SAFE, min_val::Real=_DEFAULT_BARRIER_MIN,
+                    lambda::Real=_DEFAULT_BARRIER_LAMBDA, max_exp::Real=_DEFAULT_BARRIER_MAX_EXP) =
+    _dynamic_barrier_exponent(inversion; safe=safe, min_val=min_val, lambda=lambda, max_exp=max_exp)
+
+"""
+    _dynamic_barrier_q(silencing, target_F; safe, min_val, lambda, max_exp) -> Float64
+
+The silencing barrier exponent `q_exp` -- [`_dynamic_barrier_exponent`](@ref)
+applied to `silencing_success = 1-(silencing-target_F)^2`, NOT to `silencing`
+itself (mirroring exactly what [`_fidelity_physics_cost`](@ref) actually
+barriers). `silencing=NaN` (no accepted point yet) maps to `q_exp=1.0`
+directly, without computing a NaN `silencing_success` first.
+"""
+_dynamic_barrier_q(silencing::Real, target_F::Real; safe::Real=_DEFAULT_BARRIER_SAFE, min_val::Real=_DEFAULT_BARRIER_MIN,
+                    lambda::Real=_DEFAULT_BARRIER_LAMBDA, max_exp::Real=_DEFAULT_BARRIER_MAX_EXP) =
+    isnan(silencing) ? 1.0 :
+    _dynamic_barrier_exponent(1.0 - (Float64(silencing) - Float64(target_F))^2; safe=safe, min_val=min_val, lambda=lambda, max_exp=max_exp)
 
 """
     solve_optimal_x_start(F_0, alpha; x_max=100.0, tol=1e-6, max_iter=200) -> Float64
@@ -2041,34 +2313,97 @@ strictly needs `x -> -∞`), no finite `x` reaches it exactly; the
 bisection still runs and returns the nearest boundary (`±x_max`) reached
 within `max_iter` -- the closest achievable curvature, not an exact
 root, since none exists at finite `x`.
+
+`x_max` must be `< 700` (`Float64`'s `exp` overflow threshold, the SAME
+bound [`_curriculum_fidelity_weight`](@ref) enforces on its own `x_tune`)
+-- above that, `_schedule_shape(x_max, F_0)` can silently evaluate
+`Inf/Inf = NaN` at the search boundary, which the bisection's `val >
+alpha` comparison would then treat as `false` (Julia's `NaN > x` is
+always `false`) rather than erroring, letting the search silently return
+a meaningless value instead of the intended boundary.
+
+For ANY `F_0, alpha ∈ (0,1)` a finite root exists SOMEWHERE on the real
+line (the strict-monotone-bijection argument above) -- so failing to
+converge within the CALLER-supplied `x_max` (the default `100.0` is a
+performance/typical-case choice, not a mathematical bound) means only
+that `x_max` itself was too small for this particular `(F_0, alpha)`
+pair, not that no root exists. An earlier version of this function
+returned that unconverged boundary value SILENTLY, with no way for a
+caller to distinguish "genuinely converged" from "clipped because x_max
+was too small" -- confirmed reachable in normal use: `F_0=0.99`,
+`alpha=_DEFAULT_X_TUNE_ALPHA=0.025` (the package's own default) needs
+`x≈369`, so the default `x_max=100.0` silently returned `x=100.0` with
+`_schedule_shape(100.0,0.99)≈0.37`, a `0.34`-off `factor` at that hop's
+FIRST epoch -- nowhere near the intended `alpha=0.025` floor, and no
+error or warning to flag it. Fixed here by auto-widening the search
+bracket (geometric doubling, capped just under the hard `700` overflow
+limit) whenever the bisection fails to converge within `tol` at the
+current bound -- so the CALLER's `x_max` is only ever a performance
+hint (skip searching wider than typically needed), never a silent
+accuracy ceiling. Only a genuinely UNREACHABLE `alpha` (at/beyond the
+open endpoint `0`/`1` on its side, needing `x -> ±∞` exactly) still
+returns the nearest boundary after exhausting the full `(-700,700)`
+range -- that case has no finite root to converge to, unlike the
+too-small-`x_max` case this fixes.
 """
 function solve_optimal_x_start(F_0::Real, alpha::Real; x_max::Real=100.0, tol::Real=1e-6, max_iter::Integer=200)
     0.0 <= F_0 <= 1.0 || error("solve_optimal_x_start: F_0 must be in [0,1], got $F_0.")
     0.0 <= alpha <= 1.0 || error("solve_optimal_x_start: alpha must be in [0,1], got $alpha.")
     x_max > 0 || error("solve_optimal_x_start: x_max must be > 0, got $x_max.")
+    x_max < 700 || error(
+        "solve_optimal_x_start: x_max must be < 700 (Float64 exp overflow, matching " *
+        "_curriculum_fidelity_weight's own |x_tune|<700 contract), got $x_max. Above " *
+        "this, _schedule_shape(x_max, F_0) can silently evaluate Inf/Inf=NaN inside " *
+        "the bisection loop -- caught here rather than left to a stuck/NaN search."
+    )
     tol > 0 || error("solve_optimal_x_start: tol must be > 0, got $tol.")
 
     F_0 <= 0.0 && return 1e-4   # factor ≡ 0 for every x -- nothing to solve
     F_0 >= 1.0 && return 1e-4   # factor ≡ 1 for every x -- nothing to solve
     abs(alpha - F_0) < tol && return 1e-4   # linear point (x≈0) already achieves this alpha
 
-    left, right = alpha < F_0 ? (1e-4, Float64(x_max)) : (-Float64(x_max), -1e-4)
-    for _ in 1:max_iter
-        mid = (left + right) / 2.0
-        val = _schedule_shape(mid, F_0)
-        abs(val - alpha) < tol && return mid
-        # _schedule_shape(., F_0) decreases monotonically in x across the
-        # WHOLE real line (see docstring), so the comparison direction is
-        # identical on both halves: too much relief (val > alpha) means x
-        # needs to go UP; too little (val < alpha) means x needs to come
-        # DOWN -- regardless of which half we started in.
-        if val > alpha
-            left = mid
-        else
-            right = mid
+    hard_cap = 699.999   # strictly < 700, the exp-overflow contract shared with _curriculum_fidelity_weight
+    bound = min(Float64(x_max), hard_cap)
+    while true
+        left, right = alpha < F_0 ? (1e-4, bound) : (-bound, -1e-4)
+        for _ in 1:max_iter
+            mid = (left + right) / 2.0
+            val = _schedule_shape(mid, F_0)
+            abs(val - alpha) < tol && return mid
+            # _schedule_shape(., F_0) decreases monotonically in x across the
+            # WHOLE real line (see docstring), so the comparison direction is
+            # identical on both halves: too much relief (val > alpha) means x
+            # needs to go UP; too little (val < alpha) means x needs to come
+            # DOWN -- regardless of which half we started in.
+            if val > alpha
+                left = mid
+            else
+                right = mid
+            end
         end
+        # Did not converge within `bound` -- if we haven't yet searched out
+        # to the hard cap, this pair's true root simply lies further out
+        # than `bound` (see docstring: guaranteed to exist somewhere in
+        # (-700,700) for any interior alpha), so widen and retry rather
+        # than silently returning this bracket's midpoint. Once `bound`
+        # itself has reached the hard cap, no further widening is possible
+        # under the shared exp-overflow contract -- return the boundary as
+        # the closest achievable value, exactly like the true "alpha at an
+        # unreachable open endpoint" case already documented above.
+        if bound >= hard_cap
+            result = (left + right) / 2.0
+            achieved = _schedule_shape(result, F_0)
+            if abs(achieved - alpha) >= tol
+                @warn "solve_optimal_x_start: no finite x_tune within the (-700,700) exp-overflow " *
+                      "range reaches alpha=$alpha at F_0=$F_0 (this pair's true root lies beyond the " *
+                      "representable domain, not merely beyond x_max) -- returning the closest " *
+                      "achievable boundary x=$result (achieved factor=$(round(achieved, sigdigits=4)), " *
+                      "target=$alpha). Only occurs for F_0/alpha extremely close to 0 or 1."
+            end
+            return result
+        end
+        bound = min(bound * 4.0, hard_cap)
     end
-    return (left + right) / 2.0
 end
 
 """
@@ -2133,7 +2468,7 @@ end
 
 """
     _pulse_cost_grad_threaded(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, compute=:auto, kwargs...)
-        -> (grad::Vector{Float64}, cost, inversion, silencing, duration, coherence)
+        -> (grad::Vector{Float64}, cost, inversion, silencing, duration, coherence, field_amp)
 
 Task-parallel drop-in for `ForwardDiff.gradient(uu -> pulse_cost(uu, pulse,
 d; kwargs...)[1], u)` plus `pulse_cost`'s own aux outputs -- mathematically
@@ -2152,9 +2487,16 @@ for `physics_cost` ANALYTICALLY afterward, on the host, to combine
 `grad_I = ∇inversion` and `grad_F = ∇silencing` into `∇physics_cost`:
 
     silencing_success = 1 - (silencing - target_F)^2
-    fidelity_phys     = inversion * silencing_success
+    fidelity_phys     = inversion^p_exp * silencing_success^q_exp
+    (term_I, term_S)  = _fidelity_partials(inversion, silencing_success, p_exp, q_exp)
     grad_Ssucc        = -2*(silencing - target_F) * grad_F
-    ∇physics_cost     = -2*(1 - fidelity_phys) * (silencing_success*grad_I + inversion*grad_Ssucc)
+    ∇physics_cost     = -2*(1 - fidelity_phys) * (term_I*grad_I + term_S*grad_Ssucc)
+
+`p_exp`/`q_exp` (both default `1.0`, reproducing the plain product exactly)
+are the dynamic barrier exponents -- see [`_fidelity_physics_cost`](@ref)/
+[`_fidelity_partials`](@ref), the SAME helpers [`pulse_cost`](@ref) and
+[`pulse_cost_grad_adjoint`](@ref) use, so this stays the analytically exact
+gradient of `pulse_cost`'s own formula regardless of `p_exp`/`q_exp`.
 
 `∇cost = ∇physics_cost + ∇[direct term]` (the `w_time`/`tmax`/`power`
 pieces, which never touch either ODE solve and are still handed to their
@@ -2177,6 +2519,7 @@ failure contract: `(fill(NaN, n), Inf, NaN, NaN, duration, NaN)`.
 """
 function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                                     target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
+                                    p_exp::Real=1.0, q_exp::Real=1.0,
                                     compute::Symbol=:auto, kwargs...)
     _forbid_initial_condition(kwargs)
     sk = _solver_kwargs(kwargs)
@@ -2213,7 +2556,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
     direct_val = direct_only(u)
 
     aux_ground = Ref{Float64}(0.0)
-    aux_equator = Ref{NTuple{2,Float64}}((0.0, 0.0))
+    aux_equator = Ref{NTuple{3,Float64}}((0.0, 0.0, 0.0))
 
     if !use_gpu_pool
         grads = Vector{Vector{Float64}}(undef, 2)
@@ -2240,7 +2583,8 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         Tu = eltype(uu)
                         sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
                         coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
-                        aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)))
+                        famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
+                        aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
                         return sil_
                     end
                     grads[2] = ForwardDiff.gradient(equator_only, u, ForwardDiff.GradientConfig(equator_only, u, chunk))
@@ -2250,10 +2594,10 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                 failed[i] = true
             end
         end
-        any(failed) && return fill(NaN, n), Inf, NaN, NaN, duration, NaN
+        any(failed) && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN
 
         inversion = aux_ground[]
-        silencing, coherence = aux_equator[]
+        silencing, coherence, field_amp = aux_equator[]
         grad_I = grads[1]
         grad_F = grads[2]
 
@@ -2307,8 +2651,9 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         Tu = eltype(uu)
                         sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
                         coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
+                        famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
                         if first(job.idxs) == 1
-                            aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)))
+                            aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
                         end
                         return sil_
                     end
@@ -2327,22 +2672,22 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
         end)
         _reclaim_gpu_memory()
 
-        failed[] && return fill(NaN, n), Inf, NaN, NaN, duration, NaN
+        failed[] && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN
         inversion = aux_ground[]
-        silencing, coherence = aux_equator[]
+        silencing, coherence, field_amp = aux_equator[]
     end
 
     # Explicit analytical application of the non-linear chain rule coupling the two tracks
-    silencing_success = 1.0 - (silencing - target_F)^2
-    fidelity_phys = inversion * silencing_success
-    physics_cost = (1.0 - fidelity_phys)^2
+    physics_cost, fidelity_phys, silencing_success =
+        _fidelity_physics_cost(inversion, silencing, Float64(target_F), p_exp, q_exp)
+    term_I, term_S = _fidelity_partials(inversion, silencing_success, p_exp, q_exp)
 
-    grad_S = -2.0 * (silencing - target_F) .* grad_F
-    grad_physics = -2.0 * (1.0 - fidelity_phys) .* (silencing_success .* grad_I .+ inversion .* grad_S)
+    grad_S = -2.0 * (silencing - Float64(target_F)) .* grad_F
+    grad_physics = -2.0 * (1.0 - fidelity_phys) .* (term_I .* grad_I .+ term_S .* grad_S)
 
     grad = grad_physics .+ grad_direct
     cost = physics_cost + direct_val
-    return grad, cost, inversion, silencing, duration, coherence
+    return grad, cost, inversion, silencing, duration, coherence, field_amp
 end
 
 # ============================================================
@@ -2358,7 +2703,9 @@ end
     run_local_adam(u_start, pulse, d, cost_kwargs; hop=0, num_epochs=30, patience=5, tol=1e-3,
         learning_rate=0.05, cf_lr_scale=1.0, label="", threaded_grad=false, compute=:auto,
         grad_mode=:forwarddiff, anneal_direct_weights=true,
-        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, kwargs...)
+        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, dynamic_barrier=true,
+        barrier_safe=_DEFAULT_BARRIER_SAFE, barrier_min=_DEFAULT_BARRIER_MIN,
+        barrier_lambda=_DEFAULT_BARRIER_LAMBDA, barrier_max_exp=_DEFAULT_BARRIER_MAX_EXP, kwargs...)
         -> (best_u, best_cost, best_inversion, best_silencing, best_duration, history)
 
 One basin's local descent: Adam from `u_start`, stopped either after
@@ -2412,25 +2759,28 @@ basins (a basin's local best is not necessarily better than a previous
 basin's) -- plus `history`, a `Vector{<:NamedTuple}` with one entry per
 epoch actually run
 (`hop, epoch, k, cost, inversion, silencing, duration, coherence,
-improved, x_tune, schedule_factor`), tagged with the caller-supplied `hop`
-index so a caller accumulating history across many basins can tell which
-hop each row came from. `k` (the sub-pulse count, from `pulse.k`) is
-recorded on every row too, even though it's constant within a single
-call, so history rows stay self-describing if ever concatenated across
-runs with a different `k` (e.g. a later warm-started continuation using a
-different `CompositePulse` shape). `coherence` is [`pulse_cost`](@ref)'s
-DIAGNOSTIC-ONLY per-bin `|Sp|/(Nj/2)` average from the same `:equator`
-solve as `silencing` (see [`_weighted_coherence`](@ref)) -- recorded for
-comparison alongside the collective `|F|` actually being optimised, never
-part of `cost` itself. `x_tune` is `x_tune_eff` (the possibly-calibrated
-value actually driving THIS epoch's schedule -- see `x_tune_alpha` below)
-and `schedule_factor` is `f(x_tune, fidelity_phys)` itself, i.e. the
+improved, x_tune, schedule_factor, p_exp, q_exp`), tagged with the
+caller-supplied `hop` index so a caller accumulating history across many
+basins can tell which hop each row came from. `k` (the sub-pulse count,
+from `pulse.k`) is recorded on every row too, even though it's constant
+within a single call, so history rows stay self-describing if ever
+concatenated across runs with a different `k` (e.g. a later warm-started
+continuation using a different `CompositePulse` shape). `coherence` is
+[`pulse_cost`](@ref)'s DIAGNOSTIC-ONLY per-bin `|Sp|/(Nj/2)` average from
+the same `:equator` solve as `silencing` (see [`_weighted_coherence`](@ref))
+-- recorded for comparison alongside the collective `|F|` actually being
+optimised, never part of `cost` itself. `x_tune` is `x_tune_eff` (the
+possibly-calibrated value actually driving THIS epoch's schedule -- see
+`x_tune_alpha` below; always `0.0` on hop 0, see there too) and
+`schedule_factor` is `f(x_tune, fidelity_phys)` itself, i.e. the
 [`_curriculum_fidelity_weight`](@ref) value computed from the LAST
-ACCEPTED point (`1.0` whenever `anneal_direct_weights=false`, since the
-factor is computed unconditionally every epoch regardless -- see the
-comment at its computation site) -- both recorded on every row so a
+ACCEPTED point (`0.0` whenever `anneal_direct_weights=false` OR `hop==0`,
+since the factor is computed unconditionally every epoch regardless -- see
+the comment at its computation site) -- both recorded on every row so a
 caller can see exactly what shaped that epoch's gradient without
-recomputing it.
+recomputing it. `p_exp`/`q_exp` are the dynamic-barrier exponents actually
+used that epoch -- see `dynamic_barrier` below (`1.0`/`1.0` whenever
+`dynamic_barrier=false`).
 
 `grad_mode` (default `:forwarddiff`) selects the ODE gradient. `:forwarddiff`
 is the production Dual-Tsit5 path (`threaded_grad` applies here only).
@@ -2463,20 +2813,19 @@ non-`1.0` value is asserted as a universal default here -- watch
 large-swing) epoch-to-epoch behaviour as the signal that a smaller
 `cf_lr_scale` is worth trying.
 
-`anneal_direct_weights` (default `true`) anneals `w_time`, `w_tmax`, AND
-`w_power` TOGETHER (one shared factor -- not three independent schedules)
-via [`_curriculum_fidelity_weight`](@ref): each epoch's GRADIENT is
-computed under `(w_time, w_tmax, w_power) = factor .* (base_w_time,
-base_w_tmax, base_w_power)`, where `factor =
-(exp(x_tune*fidelity_phys)-1)/(exp(x_tune)-1) ∈ [0,1]` and
+`anneal_direct_weights` (default `true`) anneals `w_time` (`w_tmax`/
+`w_power` are NEVER annealed -- they always run at the caller's own base
+weight, every epoch) via [`_curriculum_fidelity_weight`](@ref): each
+epoch's GRADIENT is computed under `w_time = factor * base_w_time`, where
+`factor = (exp(x_tune*fidelity_phys)-1)/(exp(x_tune)-1) ∈ [0,1]` and
 `fidelity_phys` is [`pulse_cost`](@ref)'s own fidelity from the LAST
 ACCEPTED point (detached from this epoch's own AD tape -- see that
 function's docstring). So early epochs -- where `fidelity_phys` starts
 near its worst case (`0`) -- descend mostly on inversion/silencing, only
-picking up the full duration/tmax/power penalties once fidelity is
-actually good (`factor=1` exactly at `fidelity_phys=1`). Pass
+picking up the full `w_time` duration penalty once fidelity is actually
+good (`factor=1` exactly at `fidelity_phys=1`). Pass
 `anneal_direct_weights=false` to disable this entirely and recover the
-original fixed-weight cost. `x_tune` (the curvature shaping that curve --
+original fixed-`w_time` cost. `x_tune` (the curvature shaping that curve --
 negative front-loads it, positive back-loads it; see
 [`_curriculum_fidelity_weight`](@ref) for the exact shape) is not a
 keyword here -- it is ALWAYS derived via mandatory calibration, see
@@ -2485,25 +2834,48 @@ keyword here -- it is ALWAYS derived via mandatory calibration, see
 [`optimise_composite_pulse`](@ref)/[`optimise_composite_pulse_rjmcmc`](@ref)
 does with the `run_local_adam`-returned cost one level up: basin-hopping's
 Metropolis test and `final_metrics`) is NOT the raw value that the
-annealed weights produced -- it is exactly reconstituted back to what it
-would have been under the caller's own static weights via
+annealed weight produced -- it is exactly reconstituted back to what it
+would have been under the caller's own static `w_time` via
 [`_reconstitute_static_direct_cost`](@ref), so every one of those
 comparisons still happens on the SAME fixed objective throughout, even
-though the GRADIENT driving `u` was shaped by moving ones. Only the
+though the GRADIENT driving `u` was shaped by a moving `w_time`. Only the
 descent direction is annealed; nothing that compares costs across epochs,
 hops, or calls ever sees a moving target.
 
+**`hop==0` ALWAYS pins `factor` at `0.0` -- an unconditional pipeline
+rule, not something `anneal_direct_weights=false` can override.** This is
+a DELIBERATE special case, confirmed explicitly: hop 0's `w_time`
+contribution to the gradient is fully suppressed (`dyn_w_time =
+base_w_time*0.0 = 0.0`, i.e. genuinely physics-only optimisation --
+duration ignored -- for the entire first hop) REGARDLESS of
+`anneal_direct_weights`'s own value -- unlike every other hop, where
+`anneal_direct_weights=false` means the ORIGINAL "disable annealing,
+`factor=1.0`, recover the full fixed `w_time`" contract exactly as before
+this feature existed. These are two genuinely different `factor` defaults
+(`0.0` vs `1.0`) for two different reasons -- do not conflate them. No
+calibration `pulse_cost` evaluation is spent on hop 0 either way (nothing
+to calibrate `x_tune` for when `factor` is pinned regardless of
+`x_tune_alpha`). Annealing (in the ordinary, `anneal_direct_weights`-gated
+sense) only starts from **hop 1 onwards**. `hop` is this function's own
+existing parameter (defaulting to `0`), so a **standalone call with no
+explicit `hop`** (e.g. `run_local_adam(u0, pulse, d, cost_kwargs)`) always
+has `w_time` suppressed to `0.0` this way -- pass `hop=1` (or any nonzero
+`hop`) explicitly to exercise ordinary annealing outside a basin-hopping
+pipeline. See
+[`optimise_composite_pulse`](@ref)/[`optimise_composite_pulse_rjmcmc`](@ref)
+for how hop 1 becomes their own calibration seed.
+
 `x_tune_alpha` (default [`_DEFAULT_X_TUNE_ALPHA`](@ref) -- so calibration
-is MANDATORY BY DEFAULT whenever `anneal_direct_weights=true`, which is
-itself the default) picks `x_tune` via [`solve_optimal_x_start`](@ref):
-before this basin's epoch loop starts, `u_start` is evaluated ONCE via
-[`pulse_cost`](@ref) (one extra ODE-solve pair, the same cost as
-evaluating any other epoch) to get this basin's OWN starting
-`fidelity_phys = F_0`, then `solve_optimal_x_start(F_0, x_tune_alpha)`
-picks the `x_tune` that makes the annealing factor equal `x_tune_alpha`
-AT THAT STARTING POINT specifically -- so the schedule is calibrated to
-what this basin actually starts from (which can differ hop to hop, e.g.
-across a `_grow_pulse`/`_shrink_pulse` k-change in
+is MANDATORY BY DEFAULT whenever `anneal_direct_weights=true` AND `hop !=
+0`) picks `x_tune` via [`solve_optimal_x_start`](@ref): before this basin's
+epoch loop starts, `u_start` is evaluated ONCE via [`pulse_cost`](@ref)
+(one extra ODE-solve pair, the same cost as evaluating any other epoch) to
+get this basin's OWN starting `fidelity_phys = F_0`, then
+`solve_optimal_x_start(F_0, x_tune_alpha)` picks the `x_tune` that makes
+the annealing factor equal `x_tune_alpha` AT THAT STARTING POINT
+specifically -- so the schedule is calibrated to what this basin actually
+starts from (which can differ hop to hop, e.g. across a
+`_grow_pulse`/`_shrink_pulse` k-change in
 [`optimise_composite_pulse_rjmcmc`](@ref)) rather than a single blind
 guess reused everywhere. This is logged via `label` before the epoch loop
 starts. Passing `x_tune_alpha=nothing` EXPLICITLY skips calibration and
@@ -2511,15 +2883,37 @@ uses the plain linear schedule (`x_tune=0`, i.e. `factor = fidelity_phys`
 exactly) instead -- the only way to run the annealed schedule
 uncalibrated; not something that happens by leaving arguments at their
 defaults. `x_tune_alpha` is a silent no-op whenever
-`anneal_direct_weights=false` (nothing to calibrate `x_tune` FOR in that
-case).
+`anneal_direct_weights=false` or `hop==0` (nothing to calibrate `x_tune`
+FOR in either case).
 
 `_precalibrated_x_tune` (default `nothing`, internal -- do not pass this
 directly) lets [`optimise_composite_pulse`](@ref)/
 [`optimise_composite_pulse_rjmcmc`](@ref) inject an already-calibrated
-`x_tune` (from an earlier hop's own `history`) for their own
-`recalibrate_optima_x=false` hops, bypassing calibration here entirely
-(takes priority over `x_tune_alpha`, which is ignored when this is set).
+`x_tune` (computed by them from hop 1's own starting point) for their own
+`recalibrate_optima_x=false` hops (hop 2 onwards), bypassing calibration
+here entirely (takes priority over `x_tune_alpha`, which is ignored when
+this is set).
+
+`dynamic_barrier` (default `true`) is a SEPARATE mechanism from
+`anneal_direct_weights`/`x_tune` -- it barriers the cost's own
+`fidelity_phys` formula (see [`_fidelity_physics_cost`](@ref)) rather than
+annealing a weight, and is NOT gated by `hop==0`; it applies identically
+on every hop, including hop 0. Each epoch, `p_exp`/`q_exp` (the barrier
+exponents on `inversion`/`silencing_success` respectively) are computed
+once from the LAST ACCEPTED point via [`_dynamic_barrier_p`](@ref)/
+[`_dynamic_barrier_q`](@ref) (`1.0`/`1.0`, i.e. no barrier, whenever no
+accepted point exists yet -- always true at any hop's own epoch 1) and
+passed to whichever `grad_mode` backend that epoch uses. `barrier_safe`/
+`barrier_min`/`barrier_lambda`/`barrier_max_exp` (defaults
+[`_DEFAULT_BARRIER_SAFE`](@ref)/[`_DEFAULT_BARRIER_MIN`](@ref)/
+[`_DEFAULT_BARRIER_LAMBDA`](@ref)/[`_DEFAULT_BARRIER_MAX_EXP`](@ref)) are
+the SAME threshold set applied to both `inversion` and `silencing_success`
+-- see [`_dynamic_barrier_exponent`](@ref) for the exact shape. As with
+`anneal_direct_weights`, `cost` is reconstituted back to `p_exp=q_exp=1`
+for reporting/comparison (`best_cost`/Metropolis/`_extract_physics_cost`),
+so only the descent direction is shaped by the barrier. Pass
+`dynamic_barrier=false` to disable entirely and recover `pulse_cost`'s
+plain `inversion*silencing_success` formula exactly.
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
@@ -2527,7 +2921,13 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
                          threaded_grad::Bool=false, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
                          anneal_direct_weights::Bool=true,
                          x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA,
-                         _precalibrated_x_tune::Union{Nothing,Real}=nothing, solve_kwargs...)
+                         _precalibrated_x_tune::Union{Nothing,Real}=nothing,
+                         dynamic_barrier::Bool=true,
+                         barrier_safe::Real=_DEFAULT_BARRIER_SAFE,
+                         barrier_min::Real=_DEFAULT_BARRIER_MIN,
+                         barrier_lambda::Real=_DEFAULT_BARRIER_LAMBDA,
+                         barrier_max_exp::Real=_DEFAULT_BARRIER_MAX_EXP,
+                         solve_kwargs...)
     _forbid_initial_condition(solve_kwargs)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
         "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
@@ -2539,29 +2939,35 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         pulse, ones(pulse.k), ones(pulse.k), ones(pulse.k), ones(pulse.n_coeff_A, pulse.k),
         fill(cf_lr_scale, pulse.n_coeff_f, pulse.k),
     )
-    aux = Ref{NTuple{5,Float64}}((NaN, NaN, NaN, NaN, NaN))
+    aux = Ref{NTuple{6,Float64}}((NaN, NaN, NaN, NaN, NaN, NaN))
     base_w_time = haskey(cost_kwargs, :w_time) ? Float64(cost_kwargs.w_time) : 0.15
     base_w_tmax = haskey(cost_kwargs, :w_tmax) ? Float64(cost_kwargs.w_tmax) : 1.0
     base_w_power = haskey(cost_kwargs, :w_power) ? Float64(cost_kwargs.w_power) : 0.05
     target_F_val = haskey(cost_kwargs, :target_F) ? Float64(cost_kwargs.target_F) : 1.0
 
     # x_tune is never a caller-supplied keyword -- it is ALWAYS one of:
-    # (1) an already-calibrated value injected by a pipeline caller
+    # (0) forced to the linear sentinel 0.0 on hop==0 -- annealing NEVER
+    # applies to hop 0 (see this function's own docstring), so no
+    # calibration pulse_cost evaluation is spent on it at all; (1) an
+    # already-calibrated value injected by a pipeline caller
     # (_precalibrated_x_tune, for optimise_composite_pulse/
     # optimise_composite_pulse_rjmcmc's own recalibrate_optima_x=false
-    # hops); (2) freshly calibrated here, from THIS basin's own starting
-    # fidelity, before the epoch loop starts (x_tune_alpha default
+    # hops, hop>=2); (2) freshly calibrated here, from THIS basin's own
+    # starting fidelity, before the epoch loop starts (x_tune_alpha default
     # _DEFAULT_X_TUNE_ALPHA, so this is MANDATORY whenever
-    # anneal_direct_weights=true); or (3) the plain linear sentinel 0.0,
-    # when x_tune_alpha is explicitly nothing or anneal_direct_weights is
-    # false. One extra pulse_cost evaluation at u_start for case (2), same
-    # cost as any other epoch; if u_start itself fails to solve,
-    # solve_optimal_x_start's own F_0∈[0,1] validation rejects the
-    # resulting NaN loudly rather than silently calibrating against garbage.
-    x_tune_eff = if _precalibrated_x_tune !== nothing
+    # anneal_direct_weights=true && hop!=0); or (3) the plain linear
+    # sentinel 0.0, when x_tune_alpha is explicitly nothing or
+    # anneal_direct_weights is false. One extra pulse_cost evaluation at
+    # u_start for case (2), same cost as any other epoch; if u_start itself
+    # fails to solve, solve_optimal_x_start's own F_0∈[0,1] validation
+    # rejects the resulting NaN loudly rather than silently calibrating
+    # against garbage.
+    x_tune_eff = if hop == 0
+        0.0
+    elseif _precalibrated_x_tune !== nothing
         Float64(_precalibrated_x_tune)
     elseif x_tune_alpha !== nothing && anneal_direct_weights
-        _, inv0, sil0, _, _ = pulse_cost(u_start, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
+        _, inv0, sil0, _, _, _ = pulse_cost(u_start, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
         silencing_success0 = 1.0 - (Float64(sil0) - target_F_val)^2
         F_0 = Float64(inv0) * silencing_success0
         val = solve_optimal_x_start(F_0, Float64(x_tune_alpha))
@@ -2580,7 +2986,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     history = NamedTuple[]
     last_good_u = copy(u_start)
     last_good_grad = zeros(n)
-    last_good_aux = (NaN, NaN, NaN, NaN, NaN)
+    last_good_aux = (NaN, NaN, NaN, NaN, NaN, NaN)
     adam_m0 = zeros(n)
     adam_v0 = zeros(n)
     adam_t0 = 0
@@ -2590,25 +2996,77 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     for epoch in 1:num_epochs
         t_wall = time()
 
-        # anneal_direct_weights: shape THIS epoch's gradient with
-        # w_time/w_tmax/w_power all annealed BY THE SAME FACTOR, computed
-        # from the LAST ACCEPTED point's own (plain-Float64, AD-detached)
-        # metrics -- see _curriculum_fidelity_weight's own docstring.
-        # Computing this unconditionally (even when
-        # anneal_direct_weights=false, or when just_reverted -- where it's
-        # dead, since that branch below never reads
-        # epoch_cost_kwargs/dyn_w_*/tmax_frac_sq/power_mean at all) is
-        # harmless: it's a few scalar ops plus one cheap decode() (no ODE
-        # solve), and dyn_w_* == base_w_* whenever anneal_direct_weights is
-        # false, so epoch_cost_kwargs reduces to cost_kwargs unchanged.
-        factor = anneal_direct_weights ?
-            _curriculum_fidelity_weight(last_good_aux[2], last_good_aux[3], target_F_val, x_tune_eff) : 1.0
+        # anneal_direct_weights: shape THIS epoch's gradient by annealing
+        # w_time ONLY (w_tmax/w_power are never annealed -- always base_w_*)
+        # via a factor computed from the LAST ACCEPTED point's own
+        # (plain-Float64, AD-detached) metrics -- see
+        # _curriculum_fidelity_weight's own docstring. TWO DIFFERENT
+        # defaults, not one: hop==0 ALWAYS pins factor at 0.0 (w_time fully
+        # suppressed for the entire first hop, regardless of
+        # anneal_direct_weights -- see this function's own docstring;
+        # annealing only starts from hop 1 onwards), whereas
+        # anneal_direct_weights=false at any hop!=0 is the ORIGINAL
+        # "disable annealing, recover the full fixed w_time" contract, i.e.
+        # factor=1.0 (NOT 0.0 -- these two "off" cases are NOT the same
+        # value and must not be conflated). Computing this unconditionally
+        # (even when just_reverted -- where it's dead, since that branch
+        # below never reads epoch_cost_kwargs/dyn_w_time/tmax_frac_sq/
+        # power_mean at all) is harmless: it's a few scalar ops plus one
+        # cheap decode() (no ODE solve).
+        factor = if hop == 0
+            0.0
+        elseif anneal_direct_weights
+            _curriculum_fidelity_weight(last_good_aux[2], last_good_aux[3], target_F_val, x_tune_eff)
+        else
+            1.0
+        end
         dyn_w_time = base_w_time * factor
-        dyn_w_tmax = base_w_tmax * factor
-        dyn_w_power = base_w_power * factor
-        epoch_cost_kwargs = anneal_direct_weights ?
-            merge(cost_kwargs, (w_time=dyn_w_time, w_tmax=dyn_w_tmax, w_power=dyn_w_power)) : cost_kwargs
+
+        # dynamic_barrier: a SEPARATE mechanism from anneal_direct_weights/
+        # x_tune -- barriers the cost's OWN fidelity_phys formula rather
+        # than annealing a weight, and is NOT gated by hop==0 (applies
+        # identically on every hop, including hop 0) -- see this function's
+        # own docstring. p_exp/q_exp computed once per epoch from the LAST
+        # ACCEPTED point, same detachment pattern as factor/x_tune above.
+        p_exp = dynamic_barrier ? _dynamic_barrier_p(last_good_aux[2]; safe=barrier_safe, min_val=barrier_min,
+                                                      lambda=barrier_lambda, max_exp=barrier_max_exp) : 1.0
+        q_exp = dynamic_barrier ? _dynamic_barrier_q(last_good_aux[3], target_F_val; safe=barrier_safe, min_val=barrier_min,
+                                                      lambda=barrier_lambda, max_exp=barrier_max_exp) : 1.0
+        barrier_on = !(p_exp == 1.0 && q_exp == 1.0)
+
+        # Override w_time whenever dyn_w_time could differ from base_w_time:
+        # hop==0 (factor forced to 0.0, always needs applying) OR
+        # anneal_direct_weights=true at hop!=0 (factor genuinely dynamic).
+        # The one case safely omitted is anneal_direct_weights=false at
+        # hop!=0, where factor=1.0 makes dyn_w_time==base_w_time already.
+        epoch_cost_kwargs = merge(cost_kwargs,
+            (hop == 0 || anneal_direct_weights) ? (w_time=dyn_w_time,) : NamedTuple(),
+            barrier_on                          ? (p_exp=p_exp, q_exp=q_exp) : NamedTuple())
         tmax_frac_sq, power_mean = _tmax_power_components(u, pulse)
+
+        # Reconstitutes a dynamically-annealed/barriered epoch's raw cost
+        # back to what it would have been under the caller's own static
+        # w_time AND p_exp=q_exp=1 -- so best_cost/improved/early-stopping
+        # here, and everything optimise_composite_pulse/_rjmcmc does one
+        # level up (Metropolis test, final_metrics, _extract_physics_cost),
+        # always compare the SAME fixed objective regardless of what shaped
+        # THIS epoch's gradient. w_tmax/w_power are fed base_w_tmax/
+        # base_w_power for BOTH the "static" and "dyn" argument to
+        # _reconstitute_static_direct_cost, since they are never annealed
+        # any more -- their contribution to the reconstitution difference
+        # is identically (base-base)=0, so that function needs no changes
+        # itself, only this caller's own inputs.
+        function _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
+            isfinite(dyn_cost) || return dyn_cost
+            c = (hop == 0 || anneal_direct_weights) ?
+                _reconstitute_static_direct_cost(dyn_cost, base_w_time, dyn_w_time, base_w_tmax, base_w_tmax,
+                                                  base_w_power, base_w_power, dur_, tmax_frac_sq, power_mean,
+                                                  pulse.T_max) : dyn_cost
+            barrier_on || return c
+            pc_dyn, _, _ = _fidelity_physics_cost(inv_, sil_, target_F_val, p_exp, q_exp)
+            pc_ref, _, _ = _fidelity_physics_cost(inv_, sil_, target_F_val, 1.0, 1.0)
+            return c - pc_dyn + pc_ref
+        end
 
         # After a revert, `u` is exactly `last_good_u` -- a point already
         # fully evaluated (one ODE solve + AD gradient) the first time it
@@ -2628,50 +3086,42 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # computed under.
         if just_reverted
             grad = last_good_grad
-            cost, inv_, sil_, dur_, coh_ = last_good_aux
+            cost, inv_, sil_, dur_, coh_, famp_ = last_good_aux
             adam.m .= adam_m0
             adam.v .= adam_v0
             adam.t = adam_t0
         elseif grad_mode === :adjoint
-            grad, dyn_cost, inv_, sil_, dur_, coh_ = pulse_cost_grad_adjoint(
+            grad, dyn_cost, inv_, sil_, dur_, coh_, famp_ = pulse_cost_grad_adjoint(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
-            cost = anneal_direct_weights ?
-                _reconstitute_static_direct_cost(dyn_cost, base_w_time, dyn_w_time, base_w_tmax, dyn_w_tmax,
-                                                  base_w_power, dyn_w_power, dur_, tmax_frac_sq, power_mean,
-                                                  pulse.T_max) : dyn_cost
+            cost = _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
         elseif threaded_grad
-            grad, dyn_cost, inv_, sil_, dur_, coh_ = _pulse_cost_grad_threaded(
+            grad, dyn_cost, inv_, sil_, dur_, coh_, famp_ = _pulse_cost_grad_threaded(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
-            cost = anneal_direct_weights ?
-                _reconstitute_static_direct_cost(dyn_cost, base_w_time, dyn_w_time, base_w_tmax, dyn_w_tmax,
-                                                  base_w_power, dyn_w_power, dur_, tmax_frac_sq, power_mean,
-                                                  pulse.T_max) : dyn_cost
+            cost = _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
         else
             function cost_only(uu)
-                c, inv_2, sil_2, dur_2, coh_2 = pulse_cost(uu, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...)
+                c, inv_2, sil_2, dur_2, coh_2, famp_2 = pulse_cost(uu, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...)
                 aux[] = (
                     Float64(ForwardDiff.value(c)),
                     Float64(ForwardDiff.value(inv_2)),
                     Float64(ForwardDiff.value(sil_2)),
                     Float64(ForwardDiff.value(dur_2)),
                     Float64(ForwardDiff.value(coh_2)),
+                    Float64(ForwardDiff.value(famp_2)),
                 )
                 return c
             end
             grad = ForwardDiff.gradient(cost_only, u)
-            dyn_cost, inv_, sil_, dur_, coh_ = aux[]
-            cost = anneal_direct_weights ?
-                _reconstitute_static_direct_cost(dyn_cost, base_w_time, dyn_w_time, base_w_tmax, dyn_w_tmax,
-                                                  base_w_power, dyn_w_power, dur_, tmax_frac_sq, power_mean,
-                                                  pulse.T_max) : dyn_cost
+            dyn_cost, inv_, sil_, dur_, coh_, famp_ = aux[]
+            cost = _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
         end
         if !isfinite(cost)
             epochs_since_improve += 1
             push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
-                             silencing=sil_, duration=dur_, coherence=coh_, improved=false,
-                             x_tune=x_tune_eff, schedule_factor=factor))
+                             silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_, improved=false,
+                             x_tune=x_tune_eff, schedule_factor=factor, p_exp=p_exp, q_exp=q_exp))
             elapsed = time() - t_wall
             u .= last_good_u
             lr /= 2
@@ -2691,7 +3141,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         lr = min(lr * 1.5, learning_rate)
         last_good_u .= u
         last_good_grad .= grad
-        last_good_aux = (cost, inv_, sil_, dur_, coh_)
+        last_good_aux = (cost, inv_, sil_, dur_, coh_, famp_)
         adam_m0 .= adam.m
         adam_v0 .= adam.v
         adam_t0 = adam.t
@@ -2707,8 +3157,8 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         end
 
         push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
-                         silencing=sil_, duration=dur_, coherence=coh_, improved=improved,
-                         x_tune=x_tune_eff, schedule_factor=factor))
+                         silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_, improved=improved,
+                         x_tune=x_tune_eff, schedule_factor=factor, p_exp=p_exp, q_exp=q_exp))
 
         adam_step!(u, grad, adam; lr=lr, lr_scale=lr_scale)
 
@@ -2737,7 +3187,9 @@ end
         target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, label_prefix="", threaded_grad=true, compute=:auto,
         grad_mode=:forwarddiff, anneal_direct_weights=true,
-        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x=true, solve_kwargs...)
+        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x=true,
+        dynamic_barrier=true, barrier_safe=_DEFAULT_BARRIER_SAFE, barrier_min=_DEFAULT_BARRIER_MIN,
+        barrier_lambda=_DEFAULT_BARRIER_LAMBDA, barrier_max_exp=_DEFAULT_BARRIER_MAX_EXP, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Basin-hopping global search over composite-pulse solutions for THIS
@@ -2827,40 +3279,58 @@ function's own docstring for what it does and why.
 
 `anneal_direct_weights` (default `true`, forwarded unchanged to every
 `run_local_adam` call, hop 0 and every subsequent hop) anneals each hop's
-own `w_time`/`w_tmax`/`w_power` gradient TOGETHER (one shared factor)
-from near-zero as that hop's physics fidelity improves -- see
-[`run_local_adam`](@ref)'s own docstring and
+own `w_time` gradient (`w_tmax`/`w_power` are NEVER annealed -- always the
+caller's own base weight) from near-zero as that hop's physics fidelity
+improves -- see [`run_local_adam`](@ref)'s own docstring and
 [`_curriculum_fidelity_weight`](@ref) for the schedule and why the `cost`
 this function itself compares (basin-hopping's Metropolis test,
 `final_metrics`) is unaffected: `run_local_adam` already reconstitutes it
-back to the static, caller-configured-weight value before returning it.
-Pass `anneal_direct_weights=false` to disable annealing entirely and
-recover the original fixed-weight cost.
+back to the static, caller-configured `w_time` before returning it. Pass
+`anneal_direct_weights=false` to disable annealing entirely and recover
+the original fixed-`w_time` cost.
 
+**`hop==0` always has `w_time` suppressed to `0.0`** -- exactly mirroring
+[`run_local_adam`](@ref)'s own unconditional `hop==0` rule (physics-only
+optimisation for the entire first hop, REGARDLESS of
+`anneal_direct_weights`'s own value -- confirmed deliberate, not an
+oversight; see that function's own docstring for why this is a genuinely
+different `factor` default than the ordinary `anneal_direct_weights=false`
+one). No calibration `pulse_cost` evaluation spent on hop 0 either way.
+**Hop 1 is the first hop ORDINARY annealing (the `anneal_direct_weights`-
+gated kind) ever applies to**, and is therefore this function's own "seed"
+hop:
 `x_tune_alpha` (default [`_DEFAULT_X_TUNE_ALPHA`](@ref)) picks the
 schedule's curvature via [`solve_optimal_x_start`](@ref) -- there is no
 raw, manually-set curvature keyword; it is always either calibrated or
 the plain linear sentinel (see [`run_local_adam`](@ref)'s own docstring).
-Under the defaults, a SINGLE calibration MANDATORILY runs once, from `u0`
-(the seed pulse -- either a fresh `initial_guess` or `warm_start_u`,
-whichever hop 0 itself starts from) -- before hop 0's own
-`run_local_adam` call, i.e. before any actual optimisation begins,
-reusing `initial_metrics` (already computed at `u0`) rather than an extra
-`pulse_cost` evaluation -- hop 0's own `run_local_adam` call receives this
-calibrated value directly (via its internal `_precalibrated_x_tune`,
-bypassing that function's OWN calibration, which would otherwise
-needlessly re-evaluate `pulse_cost` at the very same point `u0`). That
-calibrated value is what hop 0 actually optimises with.
-`recalibrate_optima_x` (default `true`) controls every
-hop AFTER hop 0: `true` re-runs the SAME per-hop calibration
-`run_local_adam` already supports internally (against THAT hop's own
-starting point, e.g. after a perturbation moved it elsewhere); `false`
-instead reuses the single seed-calibrated value for every subsequent hop
-unchanged (injected via `run_local_adam`'s internal
-`_precalibrated_x_tune`), never recalibrating again. Passing
-`x_tune_alpha=nothing` EXPLICITLY bypasses calibration entirely -- the
-only way to run the annealed schedule uncalibrated (plain linear) -- and
-is a silent no-op whenever `anneal_direct_weights=false`.
+Under the defaults, hop 1's own `run_local_adam` call performs a SINGLE
+MANDATORY calibration from ITS OWN starting point (a perturbation of hop
+0's result), exactly as [`run_local_adam`](@ref) already does internally
+for any nonzero `hop` -- no separate calibration code is needed in this
+function for hop 1, unlike hop 0's now-moot upfront calibration (removed
+entirely, since hop 0 never anneals and therefore never needs a
+calibrated `x_tune` at all). `recalibrate_optima_x` (default `true`)
+controls every hop AFTER hop 1 (hop 2 onwards): `true` re-runs the SAME
+per-hop calibration `run_local_adam` already supports internally (against
+THAT hop's own starting point, e.g. after a perturbation moved it
+elsewhere); `false` instead reuses hop 1's own single calibrated value
+(captured from its returned `history`) for every subsequent hop unchanged
+(injected via `run_local_adam`'s internal `_precalibrated_x_tune`), never
+recalibrating again. Passing `x_tune_alpha=nothing` EXPLICITLY bypasses
+calibration entirely from hop 1 onwards -- the only way to run the
+annealed schedule uncalibrated (plain linear) -- and is a silent no-op
+whenever `anneal_direct_weights=false`. If `n_hops == 1` (no hop ever
+reaches hop 1), the entire run never anneals at all.
+
+`dynamic_barrier`/`barrier_safe`/`barrier_min`/`barrier_lambda`/
+`barrier_max_exp` (defaults `true`/[`_DEFAULT_BARRIER_SAFE`](@ref)/
+[`_DEFAULT_BARRIER_MIN`](@ref)/[`_DEFAULT_BARRIER_LAMBDA`](@ref)/
+[`_DEFAULT_BARRIER_MAX_EXP`](@ref), forwarded unchanged to every
+`run_local_adam` call, hop 0 and every subsequent hop) are
+[`run_local_adam`](@ref)'s own dynamic-barrier feature, forwarded
+through unchanged -- see that function's own docstring. Unlike annealing,
+`dynamic_barrier` is NOT gated by `hop==0`; it applies identically on
+every hop, including hop 0.
 """
 function optimise_composite_pulse(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
@@ -2871,7 +3341,13 @@ function optimise_composite_pulse(
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
     anneal_direct_weights::Bool=true,
-    x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true, solve_kwargs...,
+    x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
+    dynamic_barrier::Bool=true,
+    barrier_safe::Real=_DEFAULT_BARRIER_SAFE,
+    barrier_min::Real=_DEFAULT_BARRIER_MIN,
+    barrier_lambda::Real=_DEFAULT_BARRIER_LAMBDA,
+    barrier_max_exp::Real=_DEFAULT_BARRIER_MAX_EXP,
+    solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
@@ -2893,7 +3369,9 @@ function optimise_composite_pulse(
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
          threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count(),
          anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
-         recalibrate_optima_x=recalibrate_optima_x),
+         recalibrate_optima_x=recalibrate_optima_x,
+         dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
+         barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp),
         solve_settings,
     )
 
@@ -2916,57 +3394,56 @@ function optimise_composite_pulse(
     initial_metrics = pulse_cost(u0, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
     history = NamedTuple[]
 
-    # Calibrate ONCE here, reusing initial_metrics (already evaluated at
-    # u0), rather than let hop 0's own run_local_adam call redundantly
-    # re-evaluate pulse_cost at that SAME point to do its own internal
-    # calibration -- avoids a second ODE-solve pair. Mirrors
-    # run_local_adam's own calibration formula exactly (see its docstring).
-    # x_tune_seed is what hop 0 ALWAYS runs with (via _precalibrated_x_tune,
-    # bypassing run_local_adam's internal calibration entirely), and what
-    # every later hop reuses too when recalibrate_optima_x=false.
-    x_tune_seed = if x_tune_alpha !== nothing && anneal_direct_weights
-        silencing_success0 = 1.0 - (Float64(initial_metrics[3]) - target_F)^2
-        F_0_seed = Float64(initial_metrics[2]) * silencing_success0
-        val = solve_optimal_x_start(F_0_seed, Float64(x_tune_alpha))
-        println(
-            "$(label_prefix)x_tune_alpha=$(x_tune_alpha): seed calibration (u0) x_tune=" *
-            "$(round(val, sigdigits=4)) from F_0=$(round(F_0_seed, sigdigits=4))"
-        )
-        val
-    else
-        0.0
-    end
-
+    # Hop 0 NEVER anneals (see run_local_adam's own hop==0 rule), so it has
+    # nothing to calibrate x_tune for -- no seed-calibration block needed
+    # here any more; x_tune_alpha/_precalibrated_x_tune are simply not
+    # forwarded to hop 0's own call.
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
         label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, compute=compute,
         grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights,
-        x_tune_alpha=nothing, _precalibrated_x_tune=x_tune_seed,
+        dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
+        barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
         solve_kwargs...
     )
     append!(history, hop0_history)
     global_best_u, global_best_cost = current_u, current_cost
     hops_since_improve = 0
+    x_tune_seed = 0.0   # populated once hop 1 completes; used only if recalibrate_optima_x=false
 
     for hop in 1:(n_hops-1)
         perturbation = hop_step_size .* randn(rng, length(current_u))
         candidate_u0 = current_u .+ perturbation
 
-        # recalibrate_optima_x=true (default): let run_local_adam recalibrate
-        # x_tune again from THIS hop's own candidate_u0, exactly as before
-        # this feature existed. false: skip that, reusing the single
-        # seed-calibrated x_tune_seed for every remaining hop unchanged, via
+        # hop==1 is the first hop annealing ever applies to (see
+        # run_local_adam's own hop==0 rule) -- it ALWAYS calibrates fresh
+        # from its own starting point, exactly as run_local_adam's own
+        # mandatory calibration already does for any nonzero hop; there is
+        # no earlier annealed hop to reuse a value from yet. From hop 2
+        # onwards, recalibrate_optima_x=true (default) keeps recalibrating
+        # fresh each time; false reuses hop 1's own calibrated value
+        # (captured below) for every remaining hop unchanged, via
         # run_local_adam's internal _precalibrated_x_tune.
+        hop_x_tune_alpha, hop_precal = if hop == 1 || recalibrate_optima_x
+            (x_tune_alpha, nothing)
+        else
+            (nothing, x_tune_seed)
+        end
+
         cand_u, cand_cost, _, _, _, hop_history = run_local_adam(
             candidate_u0, pulse, d, cost_kwargs;
             hop, num_epochs, patience, tol, learning_rate, cf_lr_scale,
             label="$(label_prefix)[hop $hop]", threaded_grad=threaded_grad, compute=compute,
             grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights,
-            x_tune_alpha=(recalibrate_optima_x ? x_tune_alpha : nothing),
-            _precalibrated_x_tune=(recalibrate_optima_x ? nothing : x_tune_seed),
+            x_tune_alpha=hop_x_tune_alpha, _precalibrated_x_tune=hop_precal,
+            dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
+            barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
             solve_kwargs...,
         )
         append!(history, hop_history)
+        if hop == 1
+            x_tune_seed = isempty(hop_history) ? 0.0 : hop_history[1].x_tune
+        end
 
         if cand_cost < global_best_cost - tol
             global_best_u, global_best_cost = cand_u, cand_cost

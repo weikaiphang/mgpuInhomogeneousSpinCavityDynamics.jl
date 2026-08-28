@@ -219,11 +219,6 @@ end
     d = FAKE_D_ODE
     pulse = CompositePulse(1, 4, 4, d)
     θ = seed_canonical(pulse, :hs1)
-    cost_kw = (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0)
-    g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw...)
-    @test all(isfinite, g_adj)
-    @test isfinite(cost_adj)
-
     t_start, t_end, _, _, _ = decode(pulse, θ)
     tstops = collect(Float64, vcat(t_start, t_end))
     E = build_E_of_t(pulse, θ)
@@ -236,28 +231,42 @@ end
         build_u0_1st_order_cpu(Int(d.M), d.Nj, Float64, :equator), p, d.timespan;
         tstops=tstops,
     )
-    J0, = pulse_cost_on_frozen_mesh(θ, pulse, d, mesh_g, mesh_e; cost_kw...)
-    ε = 1e-7
-    fd = similar(g_adj)
-    for i in eachindex(θ)
-        up = copy(θ)
-        um = copy(θ)
-        up[i] += ε
-        um[i] -= ε
+
+    for cost_kw in ((target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0),
+                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, p_exp=3.0, q_exp=1.0),
+                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, p_exp=1.0, q_exp=3.0),
+                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, p_exp=2.5, q_exp=4.0))
+        # Both pulse_cost_grad_adjoint and pulse_cost_on_frozen_mesh get the
+        # SAME p_exp/q_exp -- this is the test that would go silently
+        # meaningless if pulse_cost_on_frozen_mesh had been forgotten when
+        # the dynamic-barrier exponents were added.
+        g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw...)
+        @test all(isfinite, g_adj)
+        @test isfinite(cost_adj)
+
+        J0, = pulse_cost_on_frozen_mesh(θ, pulse, d, mesh_g, mesh_e; cost_kw...)
+        ε = 1e-7
+        fd = similar(g_adj)
+        for i in eachindex(θ)
+            up = copy(θ)
+            um = copy(θ)
+            up[i] += ε
+            um[i] -= ε
+            Jp, = pulse_cost_on_frozen_mesh(up, pulse, d, mesh_g, mesh_e; cost_kw...)
+            Jm, = pulse_cost_on_frozen_mesh(um, pulse, d, mesh_g, mesh_e; cost_kw...)
+            fd[i] = (Jp - Jm) / (2ε)
+        end
+        @test _relmax(g_adj, fd) < 1e-4
+
+        # Richardson on raw_gap (index 1): shrinking ε should not explode.
+        ε2 = ε / 2
+        up = copy(θ); um = copy(θ); up[1] += ε2; um[1] -= ε2
         Jp, = pulse_cost_on_frozen_mesh(up, pulse, d, mesh_g, mesh_e; cost_kw...)
         Jm, = pulse_cost_on_frozen_mesh(um, pulse, d, mesh_g, mesh_e; cost_kw...)
-        fd[i] = (Jp - Jm) / (2ε)
+        fd2 = (Jp - Jm) / (2ε2)
+        @test isfinite(fd2)
+        @test abs(g_adj[1] - fd2) / max(abs(g_adj[1]), abs(fd2), 1e-8) < 1e-3
     end
-    @test _relmax(g_adj, fd) < 1e-4
-
-    # Richardson on raw_gap (index 1): shrinking ε should not explode.
-    ε2 = ε / 2
-    up = copy(θ); um = copy(θ); up[1] += ε2; um[1] -= ε2
-    Jp, = pulse_cost_on_frozen_mesh(up, pulse, d, mesh_g, mesh_e; cost_kw...)
-    Jm, = pulse_cost_on_frozen_mesh(um, pulse, d, mesh_g, mesh_e; cost_kw...)
-    fd2 = (Jp - Jm) / (2ε2)
-    @test isfinite(fd2)
-    @test abs(g_adj[1] - fd2) / max(abs(g_adj[1]), abs(fd2), 1e-8) < 1e-3
 end
 
 @testset "checkpoint windows match full store" begin
@@ -320,7 +329,11 @@ end
     θ = seed_canonical(pulse, :hs1)
     for kw in ((w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0),
                (w_tmax=0.0, w_power=0.0, w_time=0.0, target_F=1.0),
-               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0))
+               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0),
+               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, p_exp=3.0, q_exp=1.0),
+               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, p_exp=1.0, q_exp=3.0),
+               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, p_exp=2.5, q_exp=4.0),
+               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, p_exp=6.0, q_exp=2.0))
         g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, FAKE_D_ODE; kw...)
         g_thr, cost_thr, inv_t, sil_t, dur_t, coh_t = _pulse_cost_grad_threaded(θ, pulse, FAKE_D_ODE; kw...)
         @test cost_adj == cost_thr
@@ -339,28 +352,47 @@ end
     # by construction (it only touches epoch_cost_kwargs/dyn_cost, whichever
     # of the three branches produced them), but that wiring deserves its own
     # direct check, not just an inference from the other two branches'
-    # coverage.
+    # coverage. hop=1 is REQUIRED here -- hop=0 (the default) never anneals,
+    # so this would silently stop testing anneal_direct_weights at all
+    # without it.
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
     cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
     adj = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal]",
+        hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal]",
         grad_mode=:adjoint, threaded_grad=false, compute=:cpu,
-        anneal_direct_weights=true)
+        anneal_direct_weights=true, dynamic_barrier=true)
     @test length(adj[1]) == n_params(pulse)
     @test isfinite(adj[2])
     @test length(adj[6]) >= 1
+    @test any(h.schedule_factor != 0.0 for h in adj[6])  # annealing genuinely active at hop=1
 
     # Epoch 1 starts from the SAME worst-case schedule state (no accepted
-    # point yet -> factor=0) regardless of grad_mode, so it must reproduce
-    # the SAME reconstituted cost as the :forwarddiff backend exactly (both
-    # backends solve the identical primal ODE at epoch 1 -- see the
-    # cross-backend testset above for why cost, as opposed to gradient,
-    # matches exactly rather than approximately).
+    # point yet -> factor=0, p_exp=q_exp=1) regardless of grad_mode, so all
+    # THREE grad_mode/threaded_grad branches must reproduce the SAME
+    # reconstituted cost/inversion/silencing exactly (all solve the
+    # identical primal ODE at epoch 1 -- see the cross-backend testset
+    # above for why cost, as opposed to gradient, matches exactly rather
+    # than approximately).
     fwd = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=1, patience=1, learning_rate=0.05, label="[fwd-anneal]",
-        threaded_grad=false, anneal_direct_weights=true)
-    @test adj[6][1].cost == fwd[6][1].cost
-    @test adj[6][1].inversion == fwd[6][1].inversion
-    @test adj[6][1].silencing == fwd[6][1].silencing
+        hop=1, num_epochs=1, patience=1, learning_rate=0.05, label="[fwd-anneal]",
+        threaded_grad=false, anneal_direct_weights=true, dynamic_barrier=true)
+    thr = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=1, num_epochs=1, patience=1, learning_rate=0.05, label="[thr-anneal]",
+        threaded_grad=true, anneal_direct_weights=true, dynamic_barrier=true)
+    @test adj[6][1].cost == fwd[6][1].cost == thr[6][1].cost
+    @test adj[6][1].inversion == fwd[6][1].inversion == thr[6][1].inversion
+    @test adj[6][1].silencing == fwd[6][1].silencing == thr[6][1].silencing
+
+    # p_exp/q_exp agree across all three branches at every epoch (computed
+    # identically upstream of the branch dispatch, so this should hold
+    # trivially -- but is exactly the kind of wiring bug worth pinning).
+    adj3 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal3]",
+        grad_mode=:adjoint, threaded_grad=false, dynamic_barrier=true)
+    fwd3 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[fwd-anneal3]",
+        threaded_grad=false, dynamic_barrier=true)
+    @test [h.p_exp for h in adj3[6]] == [h.p_exp for h in fwd3[6]]
+    @test [h.q_exp for h in adj3[6]] == [h.q_exp for h in fwd3[6]]
 end

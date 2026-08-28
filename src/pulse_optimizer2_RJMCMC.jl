@@ -244,6 +244,15 @@ larger) fixes that while still starting quiet, and now stays "1% of
 amp_scale" in the correct, current units even if `amp_scale` itself
 differs between the old and new pulse. `raw_cf = 0` (no chirp;
 `freq_scale = d.FWHM` has no k-dependence, so this needs no re-encoding).
+
+The new sub-pulse's own duration `d_new` is clamped to `new_pulse.dur_floor`
+BEFORE the surrounding gaps are derived from it (see the inline comment at
+the split itself) -- this is what actually keeps every OTHER sub-pulse's
+absolute timing fixed when the gap being split is small; splitting first
+and only discovering the floor during `_encode_gap_dur`'s own internal
+clamp (the pre-existing behaviour) would silently widen the birthed
+sub-pulse AFTER `g_after` had already been computed from the narrower,
+pre-clamp value, drifting every later sub-pulse's timing by the difference.
 """
 function _grow_pulse(pulse::CompositePulse, u::AbstractVector, d)
     _, _, raw_phi0, _, raw_cf = unpack(pulse, u)
@@ -251,16 +260,36 @@ function _grow_pulse(pulse::CompositePulse, u::AbstractVector, d)
     cA = _physical_cA(pulse, u)
     k = pulse.k
 
+    new_pulse = CompositePulse(k + 1, pulse.n_coeff_A, pulse.n_coeff_f, d;
+                                degree=pulse.degree, taper_frac=pulse.taper_frac)
+
     # `slot` (in the OLD 1:k numbering) is the sub-pulse whose own LEADING
     # gap is being split: slot=1 is the gap before the very first sub-pulse
     # (t=0 -> t_start[1]); slot=i (i>1) is the internal gap between old
     # sub-pulses i-1 and i. The new sub-pulse is inserted AT this index,
     # shifting old sub-pulse `slot` (and everything after it) one slot later.
+    #
+    # d_new is clamped to new_pulse.dur_floor (a fixed, k-independent
+    # T_max*1e-3, see CompositePulse's own constructor) BEFORE g_after is
+    # derived from it -- not after. _encode_gap_dur below cannot represent a
+    # duration below dur_floor: encoding an unclamped d_new=G/3 < dur_floor
+    # and then decoding it back silently inflates the birthed sub-pulse to
+    # ~dur_floor, but g_after would already have been computed from the
+    # SMALLER, pre-inflation G/3 -- so the new sub-pulse ends up wider than
+    # budgeted and every later sub-pulse's absolute t_start silently drifts
+    # later, violating this function's own "only the new sub-pulse's timing
+    # changes" contract. Clamping here instead keeps g_after (and hence
+    # every downstream sub-pulse's timing) consistent with what will
+    # actually be encoded, by construction -- a genuine no-op whenever
+    # G/3 >= dur_floor (the common case: g_new/d_new/g_after are then
+    # bit-identical to the unclamped G/3 split). The extra max(.,0.0) below
+    # guards the (rarer still) case G < dur_floor itself, where d_new alone
+    # would otherwise exceed the whole gap being split.
     slot = argmax(gap)
     G = gap[slot]
-    g_new = G / 3
-    d_new = G / 3
-    g_after = G - g_new - d_new
+    d_new = max(G / 3, new_pulse.dur_floor)
+    g_new = max((G - d_new) / 2, 0.0)
+    g_after = max(G - g_new - d_new, 0.0)
 
     new_gap = copy(gap)
     new_dur = copy(dur)
@@ -268,8 +297,6 @@ function _grow_pulse(pulse::CompositePulse, u::AbstractVector, d)
     insert!(new_gap, slot, g_new)
     insert!(new_dur, slot, d_new)
 
-    new_pulse = CompositePulse(k + 1, pulse.n_coeff_A, pulse.n_coeff_f, d;
-                                degree=pulse.degree, taper_frac=pulse.taper_frac)
     new_raw_gap, new_raw_dur = _encode_gap_dur(new_pulse, new_gap, new_dur)
 
     silent_cA = fill(0.01 * new_pulse.amp_scale, pulse.n_coeff_A)
@@ -405,7 +432,9 @@ end
         target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, label_prefix="",
         anneal_direct_weights=true, x_tune_alpha=_DEFAULT_X_TUNE_ALPHA,
-        recalibrate_optima_x=true, solve_kwargs...)
+        recalibrate_optima_x=true, dynamic_barrier=true,
+        barrier_safe=_DEFAULT_BARRIER_SAFE, barrier_min=_DEFAULT_BARRIER_MIN,
+        barrier_lambda=_DEFAULT_BARRIER_LAMBDA, barrier_max_exp=_DEFAULT_BARRIER_MAX_EXP, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Trans-dimensional (reversible-jump-flavoured) basin-hopping global search
@@ -524,42 +553,62 @@ would silently decode into a nonsensical pulse rather than fail loudly.
 `run_local_adam` call, hop 0 and every subsequent hop -- INCLUDING across
 a `_grow_pulse`/`_shrink_pulse` dimension change, since it's a
 `run_local_adam`-level schedule, not a `pulse`-level one) anneals each
-hop's own `w_time`/`w_tmax`/`w_power` gradient TOGETHER (one shared
-factor) from near-zero as that hop's physics fidelity improves -- see
-[`run_local_adam`](@ref)'s own docstring and
+hop's own `w_time` gradient (`w_tmax`/`w_power` are NEVER annealed --
+always the caller's own base weight) from near-zero as that hop's physics
+fidelity improves -- see [`run_local_adam`](@ref)'s own docstring and
 [`_curriculum_fidelity_weight`](@ref) for the schedule. As with the
 fixed-`k` `optimise_composite_pulse`, this is an explicit keyword here
 specifically so it is NEVER part of `solve_kwargs` -- `initial_metrics`/
 `final_metrics` (`pulse_cost` calls, which know nothing about it) and
 every hop's `_extract_physics_cost` comparison therefore still see only
-the STATIC, caller-configured-weight cost `run_local_adam` already
+the STATIC, caller-configured `w_time` `run_local_adam` already
 reconstitutes before returning. Pass `anneal_direct_weights=false` to
-disable annealing entirely and recover the original fixed-weight cost.
+disable annealing entirely and recover the original fixed-`w_time` cost.
 
+**`hop==0` always has `w_time` suppressed to `0.0`** -- exactly mirroring
+[`run_local_adam`](@ref)'s own unconditional `hop==0` rule (physics-only
+optimisation for the entire first hop, REGARDLESS of
+`anneal_direct_weights`'s own value -- confirmed deliberate, not an
+oversight; see that function's own docstring for why this is a genuinely
+different `factor` default than the ordinary `anneal_direct_weights=false`
+one). No calibration `pulse_cost` evaluation spent on hop 0 either way.
+**Hop 1 is the first hop ORDINARY annealing (the `anneal_direct_weights`-
+gated kind) ever applies to** -- INCLUDING when hop 1 itself performs a
+`_grow_pulse`/`_shrink_pulse` k-change, since which hop number this is is
+orthogonal to `k` -- and is therefore this function's own "seed" hop:
 `x_tune_alpha` (default [`_DEFAULT_X_TUNE_ALPHA`](@ref)) picks the
 schedule's curvature via [`solve_optimal_x_start`](@ref) -- there is no
 raw, manually-set curvature keyword; it is always either calibrated or
 the plain linear sentinel (see [`run_local_adam`](@ref)'s own docstring).
-Under the defaults, a SINGLE calibration MANDATORILY runs once, from `u0`
-(the seed pulse -- either a fresh `initial_guess` or `warm_start_u`,
-whichever hop 0 itself starts from, always at the INPUT `k`) -- before
-hop 0's own `run_local_adam` call, i.e. before any actual optimisation
-begins, reusing `initial_metrics` (already computed at `u0`) rather than
-an extra `pulse_cost` evaluation -- hop 0's own `run_local_adam` call
-receives this calibrated value directly (via its internal
-`_precalibrated_x_tune`, bypassing that function's OWN calibration, which
-would otherwise needlessly re-evaluate `pulse_cost` at the very same
-point `u0`). That calibrated value is what hop 0 actually optimises with.
-`recalibrate_optima_x` (default `true`) controls every hop AFTER hop 0 --
-INCLUDING across a `_grow_pulse`/`_shrink_pulse` dimension change: `true`
-re-runs the SAME per-hop calibration `run_local_adam` already supports
-internally, against THAT hop's own starting point (whose fidelity can
-differ a lot after a k-change); `false` instead reuses the single
-seed-calibrated value for every subsequent hop unchanged, via
+Under the defaults, hop 1's own `run_local_adam` call performs a SINGLE
+MANDATORY calibration from ITS OWN starting point, exactly as
+[`run_local_adam`](@ref) already does internally for any nonzero `hop` --
+no separate calibration code is needed in this function for hop 1, unlike
+hop 0's now-moot upfront calibration (removed entirely, since hop 0 never
+anneals and therefore never needs a calibrated `x_tune` at all).
+`recalibrate_optima_x` (default `true`) controls every hop AFTER hop 1
+(hop 2 onwards) -- INCLUDING across a `_grow_pulse`/`_shrink_pulse`
+dimension change: `true` re-runs the SAME per-hop calibration
+`run_local_adam` already supports internally, against THAT hop's own
+starting point (whose fidelity can differ a lot after a k-change); `false`
+instead reuses hop 1's own single calibrated value (captured from its
+returned `history`) for every subsequent hop unchanged, via
 `run_local_adam`'s internal `_precalibrated_x_tune`, never recalibrating
 again. Passing `x_tune_alpha=nothing` EXPLICITLY bypasses calibration
-entirely -- the only way to run the annealed schedule uncalibrated (plain
-linear) -- and is a silent no-op whenever `anneal_direct_weights=false`.
+entirely from hop 1 onwards -- the only way to run the annealed schedule
+uncalibrated (plain linear) -- and is a silent no-op whenever
+`anneal_direct_weights=false`. If `n_hops == 1` (no hop ever reaches hop
+1), the entire run never anneals at all.
+
+`dynamic_barrier`/`barrier_safe`/`barrier_min`/`barrier_lambda`/
+`barrier_max_exp` (defaults `true`/[`_DEFAULT_BARRIER_SAFE`](@ref)/
+[`_DEFAULT_BARRIER_MIN`](@ref)/[`_DEFAULT_BARRIER_LAMBDA`](@ref)/
+[`_DEFAULT_BARRIER_MAX_EXP`](@ref), forwarded unchanged to every
+`run_local_adam` call, hop 0 and every subsequent hop) are
+[`run_local_adam`](@ref)'s own dynamic-barrier feature, forwarded through
+unchanged -- see that function's own docstring. Unlike annealing,
+`dynamic_barrier` is NOT gated by `hop==0`; it applies identically on
+every hop, including hop 0.
 """
 function optimise_composite_pulse_rjmcmc(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
@@ -569,7 +618,13 @@ function optimise_composite_pulse_rjmcmc(
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     anneal_direct_weights::Bool=true,
-    x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true, solve_kwargs...,
+    x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
+    dynamic_barrier::Bool=true,
+    barrier_safe::Real=_DEFAULT_BARRIER_SAFE,
+    barrier_min::Real=_DEFAULT_BARRIER_MIN,
+    barrier_lambda::Real=_DEFAULT_BARRIER_LAMBDA,
+    barrier_max_exp::Real=_DEFAULT_BARRIER_MAX_EXP,
+    solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
@@ -583,7 +638,9 @@ function optimise_composite_pulse_rjmcmc(
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
          anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
-         recalibrate_optima_x=recalibrate_optima_x),
+         recalibrate_optima_x=recalibrate_optima_x,
+         dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
+         barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp),
         solve_settings,
     )
 
@@ -605,33 +662,19 @@ function optimise_composite_pulse_rjmcmc(
     initial_metrics = pulse_cost(u0, pulse, d; cost_kwargs..., solve_kwargs...)
     history = NamedTuple[]
 
-    # Calibrate ONCE here, reusing initial_metrics (already evaluated at u0,
-    # always at the INPUT k), rather than let hop 0's own run_local_adam
-    # call redundantly re-evaluate pulse_cost at that SAME point to do its
-    # own internal calibration -- avoids a second ODE-solve pair. Mirrors
-    # run_local_adam's own calibration formula exactly (see its docstring).
-    # x_tune_seed is what hop 0 ALWAYS runs with (via _precalibrated_x_tune,
-    # bypassing run_local_adam's internal calibration entirely), and what
-    # every later hop reuses too when recalibrate_optima_x=false.
-    x_tune_seed = if x_tune_alpha !== nothing && anneal_direct_weights
-        silencing_success0 = 1.0 - (Float64(initial_metrics[3]) - target_F)^2
-        F_0_seed = Float64(initial_metrics[2]) * silencing_success0
-        val = solve_optimal_x_start(F_0_seed, Float64(x_tune_alpha))
-        println(
-            "$(label_prefix)x_tune_alpha=$(x_tune_alpha): seed calibration (u0) x_tune=" *
-            "$(round(val, sigdigits=4)) from F_0=$(round(F_0_seed, sigdigits=4))"
-        )
-        val
-    else
-        0.0
-    end
-
+    # Hop 0 NEVER anneals (see run_local_adam's own hop==0 rule), so it has
+    # nothing to calibrate x_tune for -- no seed-calibration block needed
+    # here any more; x_tune_alpha/_precalibrated_x_tune are simply not
+    # forwarded to hop 0's own call.
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate,
         label="$(label_prefix)[hop 0]", anneal_direct_weights=anneal_direct_weights,
-        x_tune_alpha=nothing, _precalibrated_x_tune=x_tune_seed, solve_kwargs...
+        dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
+        barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
+        solve_kwargs...
     )
     append!(history, hop0_history)
+    x_tune_seed = 0.0   # populated once hop 1 completes; used only if recalibrate_optima_x=false
     current_pulse = pulse
     # Physics-only cost (pulse_cost minus its k-dependent power-penalty
     # MEAN, see _extract_physics_cost) is what every hop's Metropolis test
@@ -656,22 +699,36 @@ function optimise_composite_pulse_rjmcmc(
             candidate_pulse, candidate_u0 = _shrink_pulse(current_pulse, current_u, d)
         end
 
-        # recalibrate_optima_x=true (default): let run_local_adam recalibrate
-        # x_tune again from THIS hop's own candidate_u0 (possibly at a
-        # different k after a grow/shrink move), exactly as before this
-        # feature existed. false: skip that, reusing the single
-        # seed-calibrated x_tune_seed for every remaining hop unchanged, via
-        # run_local_adam's internal _precalibrated_x_tune.
+        # hop==1 is the first hop annealing ever applies to (see
+        # run_local_adam's own hop==0 rule) -- it ALWAYS calibrates fresh
+        # from its own starting point (possibly at a different k after a
+        # grow/shrink move), exactly as run_local_adam's own mandatory
+        # calibration already does for any nonzero hop; there is no earlier
+        # annealed hop to reuse a value from yet. From hop 2 onwards,
+        # recalibrate_optima_x=true (default) keeps recalibrating fresh
+        # each time; false reuses hop 1's own calibrated value (captured
+        # below) for every remaining hop unchanged, via run_local_adam's
+        # internal _precalibrated_x_tune.
+        hop_x_tune_alpha, hop_precal = if hop == 1 || recalibrate_optima_x
+            (x_tune_alpha, nothing)
+        else
+            (nothing, x_tune_seed)
+        end
+
         cand_u, cand_cost, _, _, _, hop_history = run_local_adam(
             candidate_u0, candidate_pulse, d, cost_kwargs;
             hop, num_epochs, patience, tol, learning_rate,
             label="$(label_prefix)[hop $hop move=$move k=$(candidate_pulse.k)]",
             anneal_direct_weights=anneal_direct_weights,
-            x_tune_alpha=(recalibrate_optima_x ? x_tune_alpha : nothing),
-            _precalibrated_x_tune=(recalibrate_optima_x ? nothing : x_tune_seed),
+            x_tune_alpha=hop_x_tune_alpha, _precalibrated_x_tune=hop_precal,
+            dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
+            barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
             solve_kwargs...,
         )
         append!(history, hop_history)
+        if hop == 1
+            x_tune_seed = isempty(hop_history) ? 0.0 : hop_history[1].x_tune
+        end
         cand_phys_cost = _extract_physics_cost(cand_cost, cand_u, candidate_pulse, w_power)
 
         if cand_phys_cost < global_best_phys_cost - tol

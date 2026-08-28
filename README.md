@@ -10,6 +10,7 @@ Julia simulation code for **"Inhomogeneous Light-Matter Coupling as a Resource f
 * Frequency and spin–cavity coupling-strength inhomogeneity
 * Configurable pulse sequences and ensemble distributions
 * Noise and correlation calculations using the Quantum Regression Theorem
+* PINN first-order datagen catalog (`src/datagen/`; see [src/datagen/README.md](src/datagen/README.md))
 
 ## Installation
 
@@ -529,20 +530,47 @@ Run a script from the repository directory using, for example:
 julia --project=. scripts/compute_noise.jl
 ```
 
+## PINN datagen
+
+`src/datagen/` is a separate script package that builds a first-order
+trajectory catalog for PINN training. It does not change solver physics.
+Full documentation: [src/datagen/README.md](src/datagen/README.md).
+
+`--phase` is required (`configs`, `simulate`, or `all`). Running the
+script with no arguments is an error. `configs` **replaces**
+`data/datagen/configs/`; do not use it to resume. Resume a killed
+simulate with `--phase simulate` and the same run flags. Skip is
+filename-based (JLD2 + nonempty pulsemat). The process exits `1` if any
+catalog entry or trajectory failed.
+
+Default `--M-cap 60000` and `--NT-save 5001` need on the order of 10 GB
+host RAM per job. Smoke one stem with a smaller cap before a full
+campaign. Start Julia with at least as many threads as CUDA GPUs
+(`-t auto`).
+
+```bash
+julia --project=. src/datagen/datagen_run.jl --help
+julia --project=. src/datagen/datagen_run.jl --phase configs --dry-run
+julia --project=. src/datagen/datagen_run.jl --phase configs
+julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate --start 1 --stop 1
+julia --project=. src/datagen/datagen_selftest.jl
+```
+
 ## Repository Structure
 
 ```text
 InhomogeneousSpinCavityDynamics.jl/
 ├── src/              Main simulation source code
+│   └── datagen/      PINN first-order datagen catalog (see src/datagen/README.md)
 ├── examples/         Example scripts for running simulations
 ├── scripts/          Plotting, noise, and correlation analysis scripts
 ├── paper/            Scripts for Obtaining data for figures in the paper (see citation)
-├── data/             Saved JLD2 simulation data
+├── data/             Saved JLD2 simulation data (including data/datagen/)
 ├── Project.toml      Julia package dependencies and compatibility
 └── README.md         Repository documentation
 ```
 
-- `src/`: Contains the first-order and second-order solvers, ensemble discretization, pulse definitions, validation functions, data-saving functions, and data-analysis functions.
+- `src/`: Contains the first-order and second-order solvers, ensemble discretization, pulse definitions, validation functions, data-saving functions, and data-analysis functions. `src/datagen/` is the PINN first-order datagen catalog (see [src/datagen/README.md](src/datagen/README.md)).
 
 - `examples/`: Contains example scripts showing how to define `SIM_SETTING`, `SYSTEM_CONFIG`, and `PULSE_CONFIG` and run a simulation.
 
