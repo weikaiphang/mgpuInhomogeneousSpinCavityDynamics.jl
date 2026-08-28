@@ -729,119 +729,184 @@ function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; compute::Sym
 end
 
 # ============================================================
-# Dynamic barrier exponents (p_exp/q_exp): generalises the cost's
-# fidelity_phys = inversion*silencing_success to
-# fidelity_phys = inversion^p_exp * silencing_success^q_exp, a per-epoch
-# repulsive barrier (see _dynamic_barrier_exponent below) that discourages
-# the optimizer from sacrificing inversion/silencing_success below a floor
-# to buy cheap gains elsewhere. p_exp=q_exp=1 (the default for every
-# function below) is EXACTLY today's formula -- not approximately: see
-# _pow_or_identity's identity branch. This formula/chain-rule pair is
-# shared by FOUR independent consumers (pulse_cost, _pulse_cost_grad_threaded,
-# pulse_cost_grad_adjoint, pulse_cost_on_frozen_mesh) that would otherwise
-# each hand-copy it -- exactly the kind of drift risk _schedule_shape was
-# factored out to avoid for the x_tune schedule.
+# Squared-hinge exterior penalty (I_min/kappa_I, S_min/kappa_S): an
+# AD-integrated exact-penalty method replacing the earlier per-epoch
+# p_exp/q_exp exponent barrier. That exponent barrier had two structural
+# problems, independently audited and confirmed against the code (not
+# just suspected):
+#   (1) gradient starvation: its restoring gradient term was
+#       p*inversion^(p-1) (ordinary power rule), which -> 0 as
+#       inversion -> 0 for ANY finite p>1 -- so the "barrier" went SLACK
+#       exactly where inversion had collapsed hardest, the opposite of
+#       what a barrier should do. No choice of the old max_exp/lambda
+#       could fix this: x^(p-1) -> 0 as x -> 0 is unavoidable for finite
+#       p, not a tuning artifact.
+#   (2) phase lag: p_exp/q_exp were computed once per epoch from
+#       `last_good_aux` -- the PREVIOUS accepted point's detached
+#       Float64 metrics, not the live AD state being differentiated THIS
+#       epoch -- so the barrier's shape always reacted one epoch late to
+#       inversion/silencing_success changes.
+# This penalty fixes both by construction: it is evaluated directly on
+# the CURRENT epoch's own inversion/silencing_success (whatever
+# Dual/Float64 type they arrive as -- inside pulse_cost's ForwardDiff
+# tape for the primal, and via the SAME live inversion/silencing values
+# already available in both gradient backends), so there is no
+# detach-and-lag step; and its restoring gradient is LINEAR in the
+# violation (kappa*(I_min-inversion)), a nonzero, non-vanishing
+# coefficient as inversion -> 0 (unlike the old power-law term), tunable
+# via kappa_I/kappa_S rather than fixed by a saturating exponent. Both
+# tracks (inversion AND silencing_success) are barriered symmetrically,
+# each with its own floor/strength pair, matching the ORIGINAL barrier
+# feature's own "barrier both tracks" decision -- this is a like-for-like
+# replacement of the barrier MECHANISM, not a scope reduction.
+#
+# Because kappa_I/kappa_S are STATIC (caller-supplied constants, not an
+# epoch-varying schedule the way p_exp/q_exp were), physics_cost is the
+# SAME formula every epoch regardless of hop/epoch -- there is no longer
+# any "reconstitute the barrier's own contribution back to p=q=1" step
+# needed in run_local_adam's epoch loop (see _reconstitute_epoch_cost
+# below): the penalty is a permanent, reported part of the objective,
+# not a gradient-only reshaping that has to be corrected back out for
+# best_cost/Metropolis comparisons to stay apples-to-apples.
+#
+# This formula/gradient pair is shared by FOUR independent consumers
+# (pulse_cost, _pulse_cost_grad_threaded, pulse_cost_grad_adjoint,
+# pulse_cost_on_frozen_mesh) that would otherwise each hand-copy it --
+# exactly the kind of drift risk _schedule_shape was factored out to
+# avoid for the x_tune schedule.
 # ============================================================
 
 """
-    _pow_or_identity(x, e), _pow_derivative(x, e)
+    _DEFAULT_PENALTY_MIN, _DEFAULT_PENALTY_KAPPA
 
-`x^e` and its derivative `e*x^(e-1)`, EXCEPT at `e == 1` where each takes
-an exact identity branch (`x`, `one(x)`) -- never evaluating `x^1`/`x^0` at
-all, so `p_exp == q_exp == 1` (the default everywhere) reproduces the
-legacy `inversion*silencing_success` formula BIT-FOR-BIT regardless of
-`x`'s sign, not merely `≈`.
-
-At `e != 1`, `x` is floored to `max(x, 0)` before exponentiating --
-`inversion`/`silencing` are themselves always clamped to `[0,1]` by
-[`_weighted_inversion`](@ref)/[`_weighted_silencing_factor`](@ref), so
-`silencing_success = 1-(silencing-target_F)^2` is PROVABLY `>= 0` too for
-any documented `target_F ∈ [0,1]` (`|silencing-target_F| <= 1` there) --
-this floor is therefore a genuine no-op on the entire documented/tested
-domain, not a silent behaviour change. It exists purely so a caller who
-passes `target_F` outside `[0,1]` (never validated -- see `pulse_cost`'s
-own docstring, which only documents `target_F ∈ {0.0, 1.0}` but does not
-forbid other values) gets a real, finite, if unusual, cost under a
-non-integer `dynamic_barrier` exponent, instead of Julia's `x^e` throwing
-`DomainError` for a negative base and non-integer real `e` -- a genuine
-regression risk from generalising `^1` (safe for any sign) to arbitrary
-real `e >= 1` (undefined in `Reals` for a negative base and fractional
-`e`). Confirmed reproducible without this floor:
-`_fidelity_physics_cost(0.5, 0.0, 2.0, 1.0, 2.5)` (`target_F=2.0`, clearly
-out of range) throws `DomainError` on `silencing_success = 1-(0-2)^2 = -3`
-raised to `q_exp=2.5`.
+Default floor (`0.85`, the same numeric value the earlier exponent
+barrier used for its own `barrier_min`) and default penalty strength
+(`50.0`) for [`run_local_adam`](@ref)'s `I_min`/`kappa_I`/`S_min`/
+`kappa_S` squared-hinge penalty (see [`_fidelity_physics_cost`](@ref)).
+Unlike the old barrier's exponents (self-normalising: `x^p ∈ [0,1]`
+regardless of `p`), `kappa_I`/`kappa_S` are NOT self-normalising -- the
+penalty term is unbounded and its magnitude relative to the `(1-fid)^2`
+base term depends entirely on this choice, so `50.0` is a starting
+default, not a derived constant; retune per-problem if the penalty
+under- or over-dominates the base term near the floor.
 """
-_pow_or_identity(x, e) = e == one(e) ? x : max(x, zero(x))^e
-_pow_derivative(x, e) = e == one(e) ? one(x) : e * max(x, zero(x))^(e - one(e))
+const _DEFAULT_PENALTY_MIN = 0.85
+const _DEFAULT_PENALTY_KAPPA = 50.0
 
 """
-    _assert_barrier_exponents(p_exp, q_exp)
+    _assert_penalty_params(I_min, kappa_I, S_min, kappa_S)
 
-Validates `p_exp`/`q_exp` are both finite and `>= 1`. `inversion` is
-provably in `[0,1]` already (`_weighted_inversion` clamps per-bin), and so
-is `silencing_success = 1-(silencing-target_F)^2` for any DOCUMENTED
-`target_F ∈ [0,1]` (`silencing` itself clamped to `[0,1]` by
-`_weighted_silencing_factor`, so `|silencing-target_F| <= 1` there) -- an
-UNvalidated `target_F` outside `[0,1]` can still make `silencing_success`
-negative, which `_pow_or_identity`/`_pow_derivative`'s own `max(x,0)` floor
-handles separately (see their docstring) so that even that out-of-contract
-case stays finite rather than throwing. With `e >= 1` and a floored,
-non-negative base, no `DomainError`/NaN from `0^(negative or non-integer)`
-is reachable -- `_dynamic_barrier_exponent` below only ever emits `>= 1`,
-so this constraint is never user-visible in the default flow, only a
-defensive contract against a caller passing `p_exp`/`q_exp` directly.
+Validates the squared-hinge penalty's own parameters -- NOT validated by
+either consumer function itself (mirrors the old barrier's own
+`_assert_barrier_exponents`, now this feature's analogous defensive
+contract). Two DISTINCT foot-guns this guards against, each confirmed
+directly reachable through any public entry point (`pulse_cost`,
+`run_local_adam`, `optimise_composite_pulse`/`_rjmcmc`) since `I_min`/
+`kappa_I`/`S_min`/`kappa_S` are ordinary caller-facing keywords with no
+prior validation anywhere in the call graph:
+
+1. `kappa_I`/`kappa_S < 0`: the penalty's own gradient contribution is
+   `-kappa*max(0,floor-x)`, so a NEGATIVE `kappa` flips its sign --
+   instead of restoring `x` back toward `floor`, it actively REWARDS `x`
+   for being further below `floor` (confirmed: `_fidelity_physics_cost`
+   with `kappa_I=-50` gives a cost that gets MORE NEGATIVE as `inversion`
+   drops, and a gradient that pushes `inversion` DOWN, not up) -- silent
+   misoptimization with no error, not a hypothetical.
+2. `I_min`/`S_min` outside `[0,1]`: `inversion`/`silencing_success` are
+   both provably in `[0,1]` (see `_weighted_inversion`/
+   `_weighted_silencing_factor`'s own clamps; `silencing_success`'s own
+   bound holds for any documented `target_F ∈ [0,1]`), so a FLOOR above
+   `1` can never be satisfied -- the penalty stays permanently active,
+   with a permanently nonzero restoring gradient, even at PERFECT
+   fidelity (confirmed: `I_min=1.5` at `inversion=1.0` still gives a
+   nonzero penalty and gradient) -- a plausible unit/typo foot-gun (e.g.
+   passing a percentage `85` instead of `0.85`) that would otherwise
+   silently prevent convergence to the true optimum with no error to
+   flag it.
 """
-function _assert_barrier_exponents(p_exp, q_exp)
-    (isfinite(p_exp) && p_exp >= 1) || error(
-        "_assert_barrier_exponents: p_exp must be finite and >= 1, got $p_exp."
+function _assert_penalty_params(I_min, kappa_I, S_min, kappa_S)
+    (isfinite(kappa_I) && kappa_I >= 0) || error(
+        "_assert_penalty_params: kappa_I must be finite and >= 0, got $kappa_I " *
+        "(negative kappa_I would REWARD low inversion instead of penalising it)."
     )
-    (isfinite(q_exp) && q_exp >= 1) || error(
-        "_assert_barrier_exponents: q_exp must be finite and >= 1, got $q_exp."
+    (isfinite(kappa_S) && kappa_S >= 0) || error(
+        "_assert_penalty_params: kappa_S must be finite and >= 0, got $kappa_S " *
+        "(negative kappa_S would REWARD low silencing_success instead of penalising it)."
+    )
+    (isfinite(I_min) && 0 <= I_min <= 1) || error(
+        "_assert_penalty_params: I_min must be finite and in [0,1] (inversion's own " *
+        "provable range), got $I_min -- a value > 1 can never be satisfied, leaving " *
+        "the penalty permanently active even at inversion=1.0."
+    )
+    (isfinite(S_min) && 0 <= S_min <= 1) || error(
+        "_assert_penalty_params: S_min must be finite and in [0,1] (silencing_success's " *
+        "own provable range for target_F ∈ [0,1]), got $S_min -- a value > 1 can never " *
+        "be satisfied, leaving the penalty permanently active even at silencing_success=1.0."
     )
 end
 
 """
-    _fidelity_physics_cost(inversion::T, silencing::T, target_F, p_exp, q_exp) where {T}
+    _fidelity_physics_cost(inversion::T, silencing::T, target_F, I_min, kappa_I, S_min, kappa_S) where {T}
         -> (physics_cost::T, fidelity_phys::T, silencing_success::T)
 
     silencing_success = 1 - (silencing - target_F)^2
-    fidelity_phys     = inversion^p_exp * silencing_success^q_exp
-    physics_cost      = (1 - fidelity_phys)^2
+    fidelity_phys      = inversion * silencing_success                       # always the plain product now
+    J_base             = (1 - fidelity_phys)^2
+    J_pen_I            = 0.5 * kappa_I * max(0, I_min - inversion)^2
+    J_pen_S            = 0.5 * kappa_S * max(0, S_min - silencing_success)^2
+    physics_cost       = J_base + J_pen_I + J_pen_S
 
-`p_exp == q_exp == 1` reproduces the legacy `inversion*silencing_success`
-formula BIT-FOR-BIT (via `_pow_or_identity`'s identity branch, not merely
-`≈`). Generic in `T` so the SAME code serves [`pulse_cost`](@ref)'s
-`ForwardDiff.Dual` primal (ForwardDiff differentiates `Dual^Float64` via the
-ordinary power rule automatically, so the primal's gradient stays exact
-without any manual chain rule) AND the two gradient backends'
-(`_pulse_cost_grad_threaded`/`pulse_cost_grad_adjoint`) plain-`Float64`
-analytical chain rule via [`_fidelity_partials`](@ref) below.
+`kappa_I == kappa_S == 0` reproduces the legacy, unbarriered
+`(1-inversion*silencing_success)^2` formula BIT-FOR-BIT (`0.5*0*x^2 ==
+0.0` exactly in IEEE754 for any finite `x`, no floating-point
+cancellation risk). `max(0, ...)` makes each penalty a genuine ONE-SIDED
+hinge: zero contribution (and zero gradient) whenever the corresponding
+track is already at/above its floor, so this is inert overhead-free
+outside the barrier's own activation region. Generic in `T` so the SAME
+code serves [`pulse_cost`](@ref)'s `ForwardDiff.Dual` primal (ForwardDiff
+differentiates `max`/`^2` through the ordinary chain rule automatically,
+so the primal's gradient stays exact without any manual chain rule) AND
+the two gradient backends' (`_pulse_cost_grad_threaded`/
+`pulse_cost_grad_adjoint`) plain-`Float64` analytical chain rule via
+[`_fidelity_gradient_coefficients`](@ref) below.
 """
-function _fidelity_physics_cost(inversion::T, silencing::T, target_F, p_exp, q_exp) where {T}
-    _assert_barrier_exponents(p_exp, q_exp)
+function _fidelity_physics_cost(inversion::T, silencing::T, target_F, I_min, kappa_I, S_min, kappa_S) where {T}
+    _assert_penalty_params(I_min, kappa_I, S_min, kappa_S)
     ss = one(T) - (silencing - convert(T, target_F))^2
-    fid = _pow_or_identity(inversion, p_exp) * _pow_or_identity(ss, q_exp)
-    return (one(T) - fid)^2, fid, ss
+    fid = inversion * ss
+    J_base = (one(T) - fid)^2
+
+    pen_I_val = inversion < convert(T, I_min) ? (convert(T, I_min) - inversion) : zero(T)
+    pen_S_val = ss < convert(T, S_min) ? (convert(T, S_min) - ss) : zero(T)
+    J_pen = convert(T, 0.5 * kappa_I) * pen_I_val^2 + convert(T, 0.5 * kappa_S) * pen_S_val^2
+
+    return J_base + J_pen, fid, ss
 end
 
 """
-    _fidelity_partials(inversion, silencing_success, p_exp, q_exp) -> (term_I, term_S)
+    _fidelity_gradient_coefficients(inversion, silencing_success, fidelity_phys, I_min, kappa_I, S_min, kappa_S)
+        -> (coeff_I, coeff_S)
 
-`∂fidelity_phys/∂inversion` and `∂fidelity_phys/∂silencing_success` for
-[`_fidelity_physics_cost`](@ref)'s `fidelity_phys = inversion^p_exp *
-silencing_success^q_exp` (ordinary power rule on each factor, the other held
-fixed). At `p_exp == q_exp == 1` these reduce EXACTLY to `(silencing_success,
-inversion)` -- the legacy chain rule's own coefficients, unchanged. Never
-branches on whether `inversion`/`silencing_success` are `0` (a `0^0`-style
-guard would be WRONG at `p_exp==1`/`q_exp==1`, where the correct partial is
-simply the other factor, not `0`) -- branches only on the EXPONENT being `1`
-via `_pow_derivative`, which is correct by construction for any `p_exp,
-q_exp >= 1` (validated by [`_assert_barrier_exponents`](@ref)).
+`∂physics_cost/∂inversion` and `∂physics_cost/∂silencing_success` for
+[`_fidelity_physics_cost`](@ref), each the sum of the base multiplicative
+term (ordinary product-rule/chain-rule derivative of `(1-inversion*
+silencing_success)^2`, distributed rather than factored since the penalty
+term below does NOT share the base term's own `-2*(1-fid)` factor) and
+the squared-hinge penalty's own restoring gradient
+(`d/dx[0.5*kappa*max(0,floor-x)^2] = -kappa*max(0,floor-x)`, continuous
+at `x==floor`, i.e. `0` exactly there -- a genuine C1 kink, not a
+discontinuity). At `kappa_I == kappa_S == 0` these reduce EXACTLY to the
+legacy chain rule's own coefficients `(silencing_success, inversion)`.
 """
-function _fidelity_partials(inversion, silencing_success, p_exp, q_exp)
-    _assert_barrier_exponents(p_exp, q_exp)
-    return (_pow_derivative(inversion, p_exp) * _pow_or_identity(silencing_success, q_exp),
-            _pow_or_identity(inversion, p_exp) * _pow_derivative(silencing_success, q_exp))
+function _fidelity_gradient_coefficients(inversion, silencing_success, fidelity_phys, I_min, kappa_I, S_min, kappa_S)
+    _assert_penalty_params(I_min, kappa_I, S_min, kappa_S)
+    base_coeff_I = -2.0 * (1.0 - fidelity_phys) * silencing_success
+    base_coeff_S = -2.0 * (1.0 - fidelity_phys) * inversion
+
+    pen_coeff_I = inversion < I_min ? -Float64(kappa_I) * (Float64(I_min) - inversion) : 0.0
+    pen_coeff_S = silencing_success < S_min ? -Float64(kappa_S) * (Float64(S_min) - silencing_success) : 0.0
+
+    return base_coeff_I + pen_coeff_I, base_coeff_S + pen_coeff_S
 end
 
 """
@@ -857,8 +922,9 @@ preserving collective coherence (RASE-style revival); `target_F=0.0`
 rewards destroying it (ROSE-style echo silencing).
 
     silencing_success = 1 - (silencing - target_F)²
-    fidelity_phys = inversion^p_exp * silencing_success^q_exp
-    physics_cost = (1 - fidelity_phys)²
+    fidelity_phys = inversion * silencing_success
+    physics_cost = (1 - fidelity_phys)² + 0.5*kappa_I*max(0, I_min-inversion)²
+                                         + 0.5*kappa_S*max(0, S_min-silencing_success)²
 
     J = physics_cost + w_time*(duration/T_max) + w_tmax*max(t_end[end]-T_max, 0)²/T_max²
         + w_power*mean(|cA/amp_scale|²)
@@ -866,19 +932,21 @@ rewards destroying it (ROSE-style echo silencing).
 `fidelity_phys` is the MULTIPLICATIVE combination of the two tracks (not
 the additive `-w_inv*inversion + w_sil*(...)²` an earlier version of this
 cost used): both a well-inverted `:ground` track AND a well-silenced/
-well-revived `:equator` track are required for `physics_cost` to reach
-its minimum of 0 -- either track alone, however good, cannot drive the
-cost down on its own, since `fidelity_phys` is their PRODUCT, not their
-weighted sum. There is accordingly no `w_inv`/`w_sil` knob any more: both
-tracks are always solved, unconditionally.
+well-revived `:equator` track are required for `physics_cost`'s base term
+to reach its minimum of 0 -- either track alone, however good, cannot
+drive the cost down on its own, since `fidelity_phys` is their PRODUCT,
+not their weighted sum. There is accordingly no `w_inv`/`w_sil` knob any
+more: both tracks are always solved, unconditionally.
 
-`p_exp`/`q_exp` (both default `1.0`, reproducing the plain product exactly
-via [`_fidelity_physics_cost`](@ref)) are the dynamic barrier exponents --
-see [`_dynamic_barrier_exponent`](@ref)/[`run_local_adam`](@ref)'s
-`dynamic_barrier` for how [`run_local_adam`](@ref) computes and passes
-non-default values per epoch. A direct `pulse_cost` call (e.g.
-`initial_metrics`/`final_metrics`) that doesn't pass them gets today's exact
-math.
+`I_min`/`kappa_I`/`S_min`/`kappa_S` (defaults [`_DEFAULT_PENALTY_MIN`](@ref)/
+[`_DEFAULT_PENALTY_KAPPA`](@ref) each) are a squared-hinge exterior
+penalty -- see [`_fidelity_physics_cost`](@ref) -- added directly to the
+SAME cost every call, unconditionally (unlike the earlier `p_exp`/`q_exp`
+exponent barrier this replaces, there is no per-epoch schedule here: the
+formula is identical for `initial_metrics`/`final_metrics` and every
+`run_local_adam` epoch alike). Pass `kappa_I=0, kappa_S=0` to disable the
+penalty entirely and recover the plain `(1-inversion*silencing_success)^2`
+formula bit-for-bit.
 
 `w_power` is an L2 penalty on the decoded, scale-normalised amplitude
 coefficients (i.e. `softplus.(raw_cA)`). Failed solves return `Inf`.
@@ -900,7 +968,8 @@ destructuring ignores extra trailing values).
 """
 function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
                      target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
-                     p_exp::Real=1.0, q_exp::Real=1.0,
+                     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
+                     S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
                      compute::Symbol=:auto, kwargs...)
     _forbid_initial_condition(kwargs)
     T = eltype(u)
@@ -937,7 +1006,7 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
         return infT, nanT, nanT, duration, nanT, nanT
     end
 
-    physics_cost, _, _ = _fidelity_physics_cost(inversion, silencing, target_F, p_exp, q_exp)
+    physics_cost, _, _ = _fidelity_physics_cost(inversion, silencing, target_F, I_min, kappa_I, S_min, kappa_S)
 
     cost = physics_cost + w_time * (duration / pulse.T_max) + tmax_penalty + power_penalty
     return cost, inversion, silencing, duration, coherence, field_amp
@@ -2195,84 +2264,6 @@ near-zero-fidelity case this guards against.
 const _DEFAULT_X_TUNE_ALPHA = 0.025
 
 """
-    _DEFAULT_BARRIER_SAFE, _DEFAULT_BARRIER_MIN, _DEFAULT_BARRIER_LAMBDA, _DEFAULT_BARRIER_MAX_EXP
-
-Default thresholds for [`run_local_adam`](@ref)'s `dynamic_barrier` feature
-(see [`_dynamic_barrier_exponent`](@ref)): `safe=0.95` (no barrier at/above
-this), `min_val=0.85` (the floor, capped at `max_exp=8.0` at/below it),
-`lambda=5.0` (curve steepness in between). Shared by BOTH the inversion
-barrier (`p_exp`, via [`_dynamic_barrier_p`](@ref)) and the silencing
-barrier (`q_exp`, via [`_dynamic_barrier_q`](@ref)) -- `silencing_success`
-is already a `[0,1]` "closeness to target" scalar directly analogous to
-`inversion`'s own role, so one shared threshold set applies to both by
-design, not oversight.
-"""
-const _DEFAULT_BARRIER_SAFE = 0.95
-const _DEFAULT_BARRIER_MIN = 0.85
-const _DEFAULT_BARRIER_LAMBDA = 5.0
-const _DEFAULT_BARRIER_MAX_EXP = 8.0
-
-"""
-    _dynamic_barrier_exponent(x; safe=_DEFAULT_BARRIER_SAFE, min_val=_DEFAULT_BARRIER_MIN,
-        lambda=_DEFAULT_BARRIER_LAMBDA, max_exp=_DEFAULT_BARRIER_MAX_EXP) -> Float64
-
-Continuous repulsive barrier exponent on a `[0,1]` quality metric `x`:
-`1.0` at/above `safe` (no barrier -- reduces to the plain product term at
-that exponent, see [`_pow_or_identity`](@ref)); rising as
-`1 + lambda*((safe-x)/(x-min_val))^2` for `x` strictly between `min_val` and
-`safe`; saturating at `max_exp` at/below `min_val` (a FINITE, tunable cap --
-NOT literally the unbounded blow-up a naive `1/(x-min_val)` would give as
-`x -> min_val`, which would zero out `x^exponent` for any `x<1` and kill the
-very gradient the barrier exists to provide; `max_exp=8.0` keeps
-`0.8^8 ≈ 0.17` and its derivative `8*0.8^7 ≈ 1.68` both meaningfully
-nonzero). `NaN` (no accepted point measured yet) maps to `1.0`, i.e. NO
-barrier -- the conservative choice for THIS role, deliberately the OPPOSITE
-convention from [`_curriculum_fidelity_weight`](@ref)'s own `NaN -> 0`
-(worst-case fidelity): that function's schedule wants to suppress direct
-weights when nothing is known yet, while a barrier that fired on unmeasured
-data would be applying a penalty to a metric it has no evidence for.
-Validates `0 <= min_val < safe <= 1`, `lambda >= 0`, `max_exp >= 1`.
-"""
-function _dynamic_barrier_exponent(x::Real; safe::Real=_DEFAULT_BARRIER_SAFE, min_val::Real=_DEFAULT_BARRIER_MIN,
-                                    lambda::Real=_DEFAULT_BARRIER_LAMBDA, max_exp::Real=_DEFAULT_BARRIER_MAX_EXP)::Float64
-    0.0 <= min_val < safe <= 1.0 || error(
-        "_dynamic_barrier_exponent: requires 0 <= min_val < safe <= 1, got min_val=$min_val, safe=$safe."
-    )
-    lambda >= 0.0 || error("_dynamic_barrier_exponent: lambda must be >= 0, got $lambda.")
-    max_exp >= 1.0 || error("_dynamic_barrier_exponent: max_exp must be >= 1, got $max_exp.")
-    isnan(x) && return 1.0
-    x_val = clamp(Float64(x), 0.0, 1.0)
-    x_val >= safe && return 1.0
-    x_val <= min_val && return Float64(max_exp)
-    p = 1.0 + Float64(lambda) * ((safe - x_val) / (x_val - min_val))^2
-    return min(p, Float64(max_exp))
-end
-
-"""
-    _dynamic_barrier_p(inversion; safe, min_val, lambda, max_exp) -> Float64
-
-The inversion barrier exponent `p_exp` -- [`_dynamic_barrier_exponent`](@ref)
-applied directly to `inversion` (already a `[0,1]` scalar).
-"""
-_dynamic_barrier_p(inversion::Real; safe::Real=_DEFAULT_BARRIER_SAFE, min_val::Real=_DEFAULT_BARRIER_MIN,
-                    lambda::Real=_DEFAULT_BARRIER_LAMBDA, max_exp::Real=_DEFAULT_BARRIER_MAX_EXP) =
-    _dynamic_barrier_exponent(inversion; safe=safe, min_val=min_val, lambda=lambda, max_exp=max_exp)
-
-"""
-    _dynamic_barrier_q(silencing, target_F; safe, min_val, lambda, max_exp) -> Float64
-
-The silencing barrier exponent `q_exp` -- [`_dynamic_barrier_exponent`](@ref)
-applied to `silencing_success = 1-(silencing-target_F)^2`, NOT to `silencing`
-itself (mirroring exactly what [`_fidelity_physics_cost`](@ref) actually
-barriers). `silencing=NaN` (no accepted point yet) maps to `q_exp=1.0`
-directly, without computing a NaN `silencing_success` first.
-"""
-_dynamic_barrier_q(silencing::Real, target_F::Real; safe::Real=_DEFAULT_BARRIER_SAFE, min_val::Real=_DEFAULT_BARRIER_MIN,
-                    lambda::Real=_DEFAULT_BARRIER_LAMBDA, max_exp::Real=_DEFAULT_BARRIER_MAX_EXP) =
-    isnan(silencing) ? 1.0 :
-    _dynamic_barrier_exponent(1.0 - (Float64(silencing) - Float64(target_F))^2; safe=safe, min_val=min_val, lambda=lambda, max_exp=max_exp)
-
-"""
     solve_optimal_x_start(F_0, alpha; x_max=100.0, tol=1e-6, max_iter=200) -> Float64
 
 Finds the curvature `x_tune` such that [`_schedule_shape`](@ref) (the same
@@ -2487,16 +2478,19 @@ for `physics_cost` ANALYTICALLY afterward, on the host, to combine
 `grad_I = ∇inversion` and `grad_F = ∇silencing` into `∇physics_cost`:
 
     silencing_success = 1 - (silencing - target_F)^2
-    fidelity_phys     = inversion^p_exp * silencing_success^q_exp
-    (term_I, term_S)  = _fidelity_partials(inversion, silencing_success, p_exp, q_exp)
+    fidelity_phys     = inversion * silencing_success
+    (coeff_I, coeff_S) = _fidelity_gradient_coefficients(inversion, silencing_success,
+                                                          fidelity_phys, I_min, kappa_I, S_min, kappa_S)
     grad_Ssucc        = -2*(silencing - target_F) * grad_F
-    ∇physics_cost     = -2*(1 - fidelity_phys) * (term_I*grad_I + term_S*grad_Ssucc)
+    ∇physics_cost     = coeff_I*grad_I + coeff_S*grad_Ssucc
 
-`p_exp`/`q_exp` (both default `1.0`, reproducing the plain product exactly)
-are the dynamic barrier exponents -- see [`_fidelity_physics_cost`](@ref)/
-[`_fidelity_partials`](@ref), the SAME helpers [`pulse_cost`](@ref) and
-[`pulse_cost_grad_adjoint`](@ref) use, so this stays the analytically exact
-gradient of `pulse_cost`'s own formula regardless of `p_exp`/`q_exp`.
+`I_min`/`kappa_I`/`S_min`/`kappa_S` (defaults [`_DEFAULT_PENALTY_MIN`](@ref)/
+[`_DEFAULT_PENALTY_KAPPA`](@ref) each) are the squared-hinge exterior
+penalty -- see [`_fidelity_physics_cost`](@ref)/
+[`_fidelity_gradient_coefficients`](@ref), the SAME helpers [`pulse_cost`](@ref)
+and [`pulse_cost_grad_adjoint`](@ref) use, so this stays the analytically
+exact gradient of `pulse_cost`'s own formula for any `I_min`/`kappa_I`/
+`S_min`/`kappa_S`.
 
 `∇cost = ∇physics_cost + ∇[direct term]` (the `w_time`/`tmax`/`power`
 pieces, which never touch either ODE solve and are still handed to their
@@ -2519,7 +2513,8 @@ failure contract: `(fill(NaN, n), Inf, NaN, NaN, duration, NaN)`.
 """
 function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                                     target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
-                                    p_exp::Real=1.0, q_exp::Real=1.0,
+                                    I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
+                                    S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
                                     compute::Symbol=:auto, kwargs...)
     _forbid_initial_condition(kwargs)
     sk = _solver_kwargs(kwargs)
@@ -2679,11 +2674,12 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
 
     # Explicit analytical application of the non-linear chain rule coupling the two tracks
     physics_cost, fidelity_phys, silencing_success =
-        _fidelity_physics_cost(inversion, silencing, Float64(target_F), p_exp, q_exp)
-    term_I, term_S = _fidelity_partials(inversion, silencing_success, p_exp, q_exp)
+        _fidelity_physics_cost(inversion, silencing, Float64(target_F), I_min, kappa_I, S_min, kappa_S)
+    coeff_I, coeff_S = _fidelity_gradient_coefficients(inversion, silencing_success,
+                                                        fidelity_phys, I_min, kappa_I, S_min, kappa_S)
 
     grad_S = -2.0 * (silencing - Float64(target_F)) .* grad_F
-    grad_physics = -2.0 * (1.0 - fidelity_phys) .* (term_I .* grad_I .+ term_S .* grad_S)
+    grad_physics = coeff_I .* grad_I .+ coeff_S .* grad_S
 
     grad = grad_physics .+ grad_direct
     cost = physics_cost + direct_val
@@ -2703,9 +2699,7 @@ end
     run_local_adam(u_start, pulse, d, cost_kwargs; hop=0, num_epochs=30, patience=5, tol=1e-3,
         learning_rate=0.05, cf_lr_scale=1.0, label="", threaded_grad=false, compute=:auto,
         grad_mode=:forwarddiff, anneal_direct_weights=true,
-        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, dynamic_barrier=true,
-        barrier_safe=_DEFAULT_BARRIER_SAFE, barrier_min=_DEFAULT_BARRIER_MIN,
-        barrier_lambda=_DEFAULT_BARRIER_LAMBDA, barrier_max_exp=_DEFAULT_BARRIER_MAX_EXP, kwargs...)
+        x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, kwargs...)
         -> (best_u, best_cost, best_inversion, best_silencing, best_duration, history)
 
 One basin's local descent: Adam from `u_start`, stopped either after
@@ -2759,7 +2753,7 @@ basins (a basin's local best is not necessarily better than a previous
 basin's) -- plus `history`, a `Vector{<:NamedTuple}` with one entry per
 epoch actually run
 (`hop, epoch, k, cost, inversion, silencing, duration, coherence,
-improved, x_tune, schedule_factor, p_exp, q_exp`), tagged with the
+improved, x_tune, schedule_factor`), tagged with the
 caller-supplied `hop` index so a caller accumulating history across many
 basins can tell which hop each row came from. `k` (the sub-pulse count,
 from `pulse.k`) is recorded on every row too, even though it's constant
@@ -2778,9 +2772,7 @@ ACCEPTED point (`0.0` whenever `anneal_direct_weights=false` OR `hop==0`,
 since the factor is computed unconditionally every epoch regardless -- see
 the comment at its computation site) -- both recorded on every row so a
 caller can see exactly what shaped that epoch's gradient without
-recomputing it. `p_exp`/`q_exp` are the dynamic-barrier exponents actually
-used that epoch -- see `dynamic_barrier` below (`1.0`/`1.0` whenever
-`dynamic_barrier=false`).
+recomputing it.
 
 `grad_mode` (default `:forwarddiff`) selects the ODE gradient. `:forwarddiff`
 is the production Dual-Tsit5 path (`threaded_grad` applies here only).
@@ -2894,26 +2886,27 @@ directly) lets [`optimise_composite_pulse`](@ref)/
 here entirely (takes priority over `x_tune_alpha`, which is ignored when
 this is set).
 
-`dynamic_barrier` (default `true`) is a SEPARATE mechanism from
-`anneal_direct_weights`/`x_tune` -- it barriers the cost's own
-`fidelity_phys` formula (see [`_fidelity_physics_cost`](@ref)) rather than
-annealing a weight, and is NOT gated by `hop==0`; it applies identically
-on every hop, including hop 0. Each epoch, `p_exp`/`q_exp` (the barrier
-exponents on `inversion`/`silencing_success` respectively) are computed
-once from the LAST ACCEPTED point via [`_dynamic_barrier_p`](@ref)/
-[`_dynamic_barrier_q`](@ref) (`1.0`/`1.0`, i.e. no barrier, whenever no
-accepted point exists yet -- always true at any hop's own epoch 1) and
-passed to whichever `grad_mode` backend that epoch uses. `barrier_safe`/
-`barrier_min`/`barrier_lambda`/`barrier_max_exp` (defaults
-[`_DEFAULT_BARRIER_SAFE`](@ref)/[`_DEFAULT_BARRIER_MIN`](@ref)/
-[`_DEFAULT_BARRIER_LAMBDA`](@ref)/[`_DEFAULT_BARRIER_MAX_EXP`](@ref)) are
-the SAME threshold set applied to both `inversion` and `silencing_success`
--- see [`_dynamic_barrier_exponent`](@ref) for the exact shape. As with
-`anneal_direct_weights`, `cost` is reconstituted back to `p_exp=q_exp=1`
-for reporting/comparison (`best_cost`/Metropolis/`_extract_physics_cost`),
-so only the descent direction is shaped by the barrier. Pass
-`dynamic_barrier=false` to disable entirely and recover `pulse_cost`'s
-plain `inversion*silencing_success` formula exactly.
+`I_min`/`kappa_I`/`S_min`/`kappa_S` (the squared-hinge exterior penalty on
+`inversion`/`silencing_success` respectively, see
+[`_fidelity_physics_cost`](@ref)) are NOT separate keywords here -- like
+`target_F`/`w_tmax`/`w_power`/`w_time`'s own base values, they travel
+through inside the caller's own `cost_kwargs` (defaulting to
+[`_DEFAULT_PENALTY_MIN`](@ref)/[`_DEFAULT_PENALTY_KAPPA`](@ref) on
+[`pulse_cost`](@ref) itself if the caller's `cost_kwargs` doesn't include
+them). This is a SEPARATE mechanism from `anneal_direct_weights`/
+`x_tune`, and NOT gated by `hop==0`; it applies identically on every hop,
+including hop 0, and identically every epoch (unlike the earlier
+`p_exp`/`q_exp` exponent barrier this replaces, there is no per-epoch
+schedule or `last_good_aux` detachment here: the penalty is evaluated
+directly on the CURRENT epoch's own live inversion/silencing_success,
+inside whichever `grad_mode` backend that epoch uses). Because the
+penalty is static, `cost` needs no barrier-specific reconstitution step
+any more -- it is the SAME formula every epoch, so `best_cost`/
+Metropolis/`_extract_physics_cost` compare it directly (still
+reconstituted for `anneal_direct_weights`'s own `w_time` annealing, which
+remains a genuinely epoch-varying schedule). Include `kappa_I=0,
+kappa_S=0` in `cost_kwargs` to disable the penalty entirely and recover
+`pulse_cost`'s plain `inversion*silencing_success` formula exactly.
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
@@ -2922,11 +2915,6 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
                          anneal_direct_weights::Bool=true,
                          x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA,
                          _precalibrated_x_tune::Union{Nothing,Real}=nothing,
-                         dynamic_barrier::Bool=true,
-                         barrier_safe::Real=_DEFAULT_BARRIER_SAFE,
-                         barrier_min::Real=_DEFAULT_BARRIER_MIN,
-                         barrier_lambda::Real=_DEFAULT_BARRIER_LAMBDA,
-                         barrier_max_exp::Real=_DEFAULT_BARRIER_MAX_EXP,
                          solve_kwargs...)
     _forbid_initial_condition(solve_kwargs)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
@@ -3022,50 +3010,53 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         end
         dyn_w_time = base_w_time * factor
 
-        # dynamic_barrier: a SEPARATE mechanism from anneal_direct_weights/
-        # x_tune -- barriers the cost's OWN fidelity_phys formula rather
-        # than annealing a weight, and is NOT gated by hop==0 (applies
-        # identically on every hop, including hop 0) -- see this function's
-        # own docstring. p_exp/q_exp computed once per epoch from the LAST
-        # ACCEPTED point, same detachment pattern as factor/x_tune above.
-        p_exp = dynamic_barrier ? _dynamic_barrier_p(last_good_aux[2]; safe=barrier_safe, min_val=barrier_min,
-                                                      lambda=barrier_lambda, max_exp=barrier_max_exp) : 1.0
-        q_exp = dynamic_barrier ? _dynamic_barrier_q(last_good_aux[3], target_F_val; safe=barrier_safe, min_val=barrier_min,
-                                                      lambda=barrier_lambda, max_exp=barrier_max_exp) : 1.0
-        barrier_on = !(p_exp == 1.0 && q_exp == 1.0)
-
+        # I_min/kappa_I/S_min/kappa_S (the squared-hinge penalty on
+        # inversion/silencing_success, see _fidelity_physics_cost) are NOT
+        # separate run_local_adam keywords -- like target_F/w_tmax/
+        # w_power/w_time's own BASE values, they travel through inside the
+        # caller's own `cost_kwargs`, so whatever the caller put there
+        # (or pulse_cost's own defaults, if they put nothing) is exactly
+        # what every epoch -- and initial_metrics/final_metrics one level
+        # up, which call pulse_cost directly with the SAME cost_kwargs --
+        # actually uses. Unlike the earlier p_exp/q_exp exponent barrier
+        # this replaces, there is nothing to compute here per epoch and no
+        # separate merge needed: the penalty is evaluated on THIS epoch's
+        # own live inversion/silencing_success (via whichever grad_mode
+        # backend), not a detached previous point, and is NOT gated by
+        # hop==0 -- it applies identically on every hop, including hop 0.
+        #
         # Override w_time whenever dyn_w_time could differ from base_w_time:
         # hop==0 (factor forced to 0.0, always needs applying) OR
         # anneal_direct_weights=true at hop!=0 (factor genuinely dynamic).
         # The one case safely omitted is anneal_direct_weights=false at
         # hop!=0, where factor=1.0 makes dyn_w_time==base_w_time already.
         epoch_cost_kwargs = merge(cost_kwargs,
-            (hop == 0 || anneal_direct_weights) ? (w_time=dyn_w_time,) : NamedTuple(),
-            barrier_on                          ? (p_exp=p_exp, q_exp=q_exp) : NamedTuple())
+            (hop == 0 || anneal_direct_weights) ? (w_time=dyn_w_time,) : NamedTuple())
         tmax_frac_sq, power_mean = _tmax_power_components(u, pulse)
 
-        # Reconstitutes a dynamically-annealed/barriered epoch's raw cost
-        # back to what it would have been under the caller's own static
-        # w_time AND p_exp=q_exp=1 -- so best_cost/improved/early-stopping
-        # here, and everything optimise_composite_pulse/_rjmcmc does one
-        # level up (Metropolis test, final_metrics, _extract_physics_cost),
-        # always compare the SAME fixed objective regardless of what shaped
-        # THIS epoch's gradient. w_tmax/w_power are fed base_w_tmax/
+        # Reconstitutes a dynamically-annealed epoch's raw cost back to
+        # what it would have been under the caller's own static w_time --
+        # so best_cost/improved/early-stopping here, and everything
+        # optimise_composite_pulse/_rjmcmc does one level up (Metropolis
+        # test, final_metrics, _extract_physics_cost), always compare the
+        # SAME fixed objective regardless of what shaped THIS epoch's
+        # gradient. The squared-hinge penalty needs NO analogous
+        # reconstitution -- I_min/kappa_I/S_min/kappa_S are static across
+        # every epoch/hop, so physics_cost (including the penalty) is
+        # already the SAME formula everywhere, unlike the old p_exp/q_exp
+        # barrier whose STRENGTH varied epoch-to-epoch and therefore had
+        # to be corrected back out. w_tmax/w_power are fed base_w_tmax/
         # base_w_power for BOTH the "static" and "dyn" argument to
         # _reconstitute_static_direct_cost, since they are never annealed
         # any more -- their contribution to the reconstitution difference
         # is identically (base-base)=0, so that function needs no changes
         # itself, only this caller's own inputs.
-        function _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
+        function _reconstitute_epoch_cost(dyn_cost, dur_)
             isfinite(dyn_cost) || return dyn_cost
-            c = (hop == 0 || anneal_direct_weights) ?
+            return (hop == 0 || anneal_direct_weights) ?
                 _reconstitute_static_direct_cost(dyn_cost, base_w_time, dyn_w_time, base_w_tmax, base_w_tmax,
                                                   base_w_power, base_w_power, dur_, tmax_frac_sq, power_mean,
                                                   pulse.T_max) : dyn_cost
-            barrier_on || return c
-            pc_dyn, _, _ = _fidelity_physics_cost(inv_, sil_, target_F_val, p_exp, q_exp)
-            pc_ref, _, _ = _fidelity_physics_cost(inv_, sil_, target_F_val, 1.0, 1.0)
-            return c - pc_dyn + pc_ref
         end
 
         # After a revert, `u` is exactly `last_good_u` -- a point already
@@ -3094,12 +3085,12 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
             grad, dyn_cost, inv_, sil_, dur_, coh_, famp_ = pulse_cost_grad_adjoint(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
-            cost = _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
+            cost = _reconstitute_epoch_cost(dyn_cost, dur_)
         elseif threaded_grad
             grad, dyn_cost, inv_, sil_, dur_, coh_, famp_ = _pulse_cost_grad_threaded(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
-            cost = _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
+            cost = _reconstitute_epoch_cost(dyn_cost, dur_)
         else
             function cost_only(uu)
                 c, inv_2, sil_2, dur_2, coh_2, famp_2 = pulse_cost(uu, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...)
@@ -3115,13 +3106,13 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
             end
             grad = ForwardDiff.gradient(cost_only, u)
             dyn_cost, inv_, sil_, dur_, coh_, famp_ = aux[]
-            cost = _reconstitute_epoch_cost(dyn_cost, dur_, inv_, sil_)
+            cost = _reconstitute_epoch_cost(dyn_cost, dur_)
         end
         if !isfinite(cost)
             epochs_since_improve += 1
             push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
                              silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_, improved=false,
-                             x_tune=x_tune_eff, schedule_factor=factor, p_exp=p_exp, q_exp=q_exp))
+                             x_tune=x_tune_eff, schedule_factor=factor))
             elapsed = time() - t_wall
             u .= last_good_u
             lr /= 2
@@ -3158,7 +3149,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
 
         push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
                          silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_, improved=improved,
-                         x_tune=x_tune_eff, schedule_factor=factor, p_exp=p_exp, q_exp=q_exp))
+                         x_tune=x_tune_eff, schedule_factor=factor))
 
         adam_step!(u, grad, adam; lr=lr, lr_scale=lr_scale)
 
@@ -3188,8 +3179,8 @@ end
         warm_start_u=nothing, label_prefix="", threaded_grad=true, compute=:auto,
         grad_mode=:forwarddiff, anneal_direct_weights=true,
         x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x=true,
-        dynamic_barrier=true, barrier_safe=_DEFAULT_BARRIER_SAFE, barrier_min=_DEFAULT_BARRIER_MIN,
-        barrier_lambda=_DEFAULT_BARRIER_LAMBDA, barrier_max_exp=_DEFAULT_BARRIER_MAX_EXP, solve_kwargs...)
+        I_min=_DEFAULT_PENALTY_MIN, kappa_I=_DEFAULT_PENALTY_KAPPA,
+        S_min=_DEFAULT_PENALTY_MIN, kappa_S=_DEFAULT_PENALTY_KAPPA, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Basin-hopping global search over composite-pulse solutions for THIS
@@ -3322,15 +3313,13 @@ annealed schedule uncalibrated (plain linear) -- and is a silent no-op
 whenever `anneal_direct_weights=false`. If `n_hops == 1` (no hop ever
 reaches hop 1), the entire run never anneals at all.
 
-`dynamic_barrier`/`barrier_safe`/`barrier_min`/`barrier_lambda`/
-`barrier_max_exp` (defaults `true`/[`_DEFAULT_BARRIER_SAFE`](@ref)/
-[`_DEFAULT_BARRIER_MIN`](@ref)/[`_DEFAULT_BARRIER_LAMBDA`](@ref)/
-[`_DEFAULT_BARRIER_MAX_EXP`](@ref), forwarded unchanged to every
+`I_min`/`kappa_I`/`S_min`/`kappa_S` (defaults [`_DEFAULT_PENALTY_MIN`](@ref)/
+[`_DEFAULT_PENALTY_KAPPA`](@ref) each, forwarded unchanged to every
 `run_local_adam` call, hop 0 and every subsequent hop) are
-[`run_local_adam`](@ref)'s own dynamic-barrier feature, forwarded
+[`run_local_adam`](@ref)'s own squared-hinge penalty feature, forwarded
 through unchanged -- see that function's own docstring. Unlike annealing,
-`dynamic_barrier` is NOT gated by `hop==0`; it applies identically on
-every hop, including hop 0.
+it is NOT gated by `hop==0`; it applies identically on every hop,
+including hop 0.
 """
 function optimise_composite_pulse(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
@@ -3342,11 +3331,8 @@ function optimise_composite_pulse(
     threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
     anneal_direct_weights::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
-    dynamic_barrier::Bool=true,
-    barrier_safe::Real=_DEFAULT_BARRIER_SAFE,
-    barrier_min::Real=_DEFAULT_BARRIER_MIN,
-    barrier_lambda::Real=_DEFAULT_BARRIER_LAMBDA,
-    barrier_max_exp::Real=_DEFAULT_BARRIER_MAX_EXP,
+    I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
+    S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
     solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
@@ -3354,7 +3340,8 @@ function optimise_composite_pulse(
         "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
     )
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
-    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time)
+    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time,
+                   I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S)
     rng = Random.Xoshiro(seed)
 
     # threaded_grad/compute are deliberately kept OUT of solve_kwargs
@@ -3370,8 +3357,7 @@ function optimise_composite_pulse(
          threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count(),
          anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
          recalibrate_optima_x=recalibrate_optima_x,
-         dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
-         barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp),
+         I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S),
         solve_settings,
     )
 
@@ -3402,8 +3388,6 @@ function optimise_composite_pulse(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
         label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, compute=compute,
         grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights,
-        dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
-        barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
         solve_kwargs...
     )
     append!(history, hop0_history)
@@ -3436,8 +3420,6 @@ function optimise_composite_pulse(
             label="$(label_prefix)[hop $hop]", threaded_grad=threaded_grad, compute=compute,
             grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights,
             x_tune_alpha=hop_x_tune_alpha, _precalibrated_x_tune=hop_precal,
-            dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
-            barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
             solve_kwargs...,
         )
         append!(history, hop_history)

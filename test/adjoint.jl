@@ -233,13 +233,13 @@ end
     )
 
     for cost_kw in ((target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0),
-                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, p_exp=3.0, q_exp=1.0),
-                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, p_exp=1.0, q_exp=3.0),
-                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, p_exp=2.5, q_exp=4.0))
+                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, I_min=0.99, kappa_I=5.0, kappa_S=0.0),
+                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, S_min=0.99, kappa_S=5.0, kappa_I=0.0),
+                     (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, I_min=0.9, kappa_I=3.0, S_min=0.9, kappa_S=8.0))
         # Both pulse_cost_grad_adjoint and pulse_cost_on_frozen_mesh get the
-        # SAME p_exp/q_exp -- this is the test that would go silently
-        # meaningless if pulse_cost_on_frozen_mesh had been forgotten when
-        # the dynamic-barrier exponents were added.
+        # SAME I_min/kappa_I/S_min/kappa_S -- this is the test that would go
+        # silently meaningless if pulse_cost_on_frozen_mesh had been
+        # forgotten when the squared-hinge penalty was added.
         g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw...)
         @test all(isfinite, g_adj)
         @test isfinite(cost_adj)
@@ -330,10 +330,10 @@ end
     for kw in ((w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0),
                (w_tmax=0.0, w_power=0.0, w_time=0.0, target_F=1.0),
                (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0),
-               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, p_exp=3.0, q_exp=1.0),
-               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, p_exp=1.0, q_exp=3.0),
-               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, p_exp=2.5, q_exp=4.0),
-               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, p_exp=6.0, q_exp=2.0))
+               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, I_min=0.99, kappa_I=5.0, kappa_S=0.0),
+               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, S_min=0.99, kappa_S=5.0, kappa_I=0.0),
+               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, I_min=0.9, kappa_I=3.0, S_min=0.9, kappa_S=8.0),
+               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, I_min=0.9, kappa_I=6.0, S_min=0.9, kappa_S=2.0))
         g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, FAKE_D_ODE; kw...)
         g_thr, cost_thr, inv_t, sil_t, dur_t, coh_t = _pulse_cost_grad_threaded(θ, pulse, FAKE_D_ODE; kw...)
         @test cost_adj == cost_thr
@@ -361,38 +361,46 @@ end
     adj = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal]",
         grad_mode=:adjoint, threaded_grad=false, compute=:cpu,
-        anneal_direct_weights=true, dynamic_barrier=true)
+        anneal_direct_weights=true)
     @test length(adj[1]) == n_params(pulse)
     @test isfinite(adj[2])
     @test length(adj[6]) >= 1
     @test any(h.schedule_factor != 0.0 for h in adj[6])  # annealing genuinely active at hop=1
 
     # Epoch 1 starts from the SAME worst-case schedule state (no accepted
-    # point yet -> factor=0, p_exp=q_exp=1) regardless of grad_mode, so all
-    # THREE grad_mode/threaded_grad branches must reproduce the SAME
-    # reconstituted cost/inversion/silencing exactly (all solve the
-    # identical primal ODE at epoch 1 -- see the cross-backend testset
-    # above for why cost, as opposed to gradient, matches exactly rather
-    # than approximately).
+    # point yet -> factor=0) regardless of grad_mode, so all THREE
+    # grad_mode/threaded_grad branches must reproduce the SAME reconstituted
+    # cost/inversion/silencing exactly (all solve the identical primal ODE
+    # at epoch 1 -- see the cross-backend testset above for why cost, as
+    # opposed to gradient, matches exactly rather than approximately). The
+    # squared-hinge penalty (I_min/kappa_I/S_min/kappa_S, defaulted here
+    # since cost_kwargs doesn't override them) is static, so this equality
+    # holds trivially at every epoch, not just epoch 1 -- checked below too.
     fwd = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=1, patience=1, learning_rate=0.05, label="[fwd-anneal]",
-        threaded_grad=false, anneal_direct_weights=true, dynamic_barrier=true)
+        threaded_grad=false, anneal_direct_weights=true)
     thr = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=1, patience=1, learning_rate=0.05, label="[thr-anneal]",
-        threaded_grad=true, anneal_direct_weights=true, dynamic_barrier=true)
+        threaded_grad=true, anneal_direct_weights=true)
     @test adj[6][1].cost == fwd[6][1].cost == thr[6][1].cost
     @test adj[6][1].inversion == fwd[6][1].inversion == thr[6][1].inversion
     @test adj[6][1].silencing == fwd[6][1].silencing == thr[6][1].silencing
 
-    # p_exp/q_exp agree across all three branches at every epoch (computed
-    # identically upstream of the branch dispatch, so this should hold
-    # trivially -- but is exactly the kind of wiring bug worth pinning).
+    # cost/inversion/silencing stay CLOSE across all three branches over
+    # several epochs (not bit-exact past epoch 1: each backend's own
+    # roundoff-level gradient difference feeds into Adam's next step, which
+    # a nonlinear ODE solve then amplifies slightly -- so this is a loose
+    # relative check, not the epoch-1 exact-equality one above).
     adj3 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal3]",
-        grad_mode=:adjoint, threaded_grad=false, dynamic_barrier=true)
+        grad_mode=:adjoint, threaded_grad=false)
     fwd3 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[fwd-anneal3]",
-        threaded_grad=false, dynamic_barrier=true)
-    @test [h.p_exp for h in adj3[6]] == [h.p_exp for h in fwd3[6]]
-    @test [h.q_exp for h in adj3[6]] == [h.q_exp for h in fwd3[6]]
+        threaded_grad=false)
+    @test length(adj3[6]) == length(fwd3[6])
+    for i in eachindex(adj3[6])
+        @test adj3[6][i].cost ≈ fwd3[6][i].cost rtol=1e-4
+        @test adj3[6][i].inversion ≈ fwd3[6][i].inversion rtol=1e-4
+        @test adj3[6][i].silencing ≈ fwd3[6][i].silencing rtol=1e-4
+    end
 end

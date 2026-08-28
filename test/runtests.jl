@@ -206,33 +206,29 @@ const FAKE_D_ODE = merge(FAKE_D, (
     relerr = abs.(g .- fd) ./ max.(abs.(g), 1e-8)
     @test maximum(relerr) < 1e-3
 
-    # p_exp=q_exp=1.0 (explicit) must reproduce the no-kwargs default
-    # bit-for-bit -- direct callers (initial_metrics/final_metrics/this
-    # very test) that never pass barrier exponents get today's exact math.
-    cost_explicit = pulse_cost(u0, pulse, FAKE_D_ODE; p_exp=1.0, q_exp=1.0)
-    @test cost_explicit === pulse_cost(u0, pulse, FAKE_D_ODE)
+    # kappa_I=kappa_S=0.0 (explicit) must reproduce the legacy, unbarriered
+    # inversion*silencing_success formula bit-for-bit -- I_min/S_min are
+    # irrelevant at kappa=0 (0.5*0*x^2 == 0.0 exactly for any finite x).
+    cost_nopenalty = pulse_cost(u0, pulse, FAKE_D_ODE; kappa_I=0.0, kappa_S=0.0)
+    cost_nopenalty2 = pulse_cost(u0, pulse, FAKE_D_ODE; I_min=0.3, kappa_I=0.0, S_min=0.99, kappa_S=0.0)
+    @test cost_nopenalty === cost_nopenalty2
 
-    # ForwardDiff.gradient vs finite difference at nontrivial barrier
-    # exponents -- the SAME check as above, repeated over a grid spanning
-    # inversion-only, silencing-only, and both barriers active.
-    for (p, q) in ((3.0, 1.0), (1.0, 3.0), (2.5, 4.0), (8.0, 8.0))
-        costb = pulse_cost(u0, pulse, FAKE_D_ODE; p_exp=p, q_exp=q)[1]
-        gb = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; p_exp=p, q_exp=q)[1], u0)
+    # ForwardDiff.gradient vs finite difference at nontrivial squared-hinge
+    # penalty settings -- the SAME check as above, repeated over a grid
+    # spanning inversion-only, silencing-only, and both penalties active.
+    for (I_min, kI, S_min, kS) in ((0.99, 5.0, 0.0, 0.0), (0.0, 0.0, 0.99, 5.0), (0.9, 3.0, 0.9, 8.0))
+        costb = pulse_cost(u0, pulse, FAKE_D_ODE; I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1]
+        gb = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1], u0)
         @test all(isfinite, gb)
         fdb = similar(gb)
         for i in eachindex(u0)
             up = copy(u0)
             up[i] += eps
-            fdb[i] = (pulse_cost(up, pulse, FAKE_D_ODE; p_exp=p, q_exp=q)[1] - costb) / eps
+            fdb[i] = (pulse_cost(up, pulse, FAKE_D_ODE; I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1] - costb) / eps
         end
         relerrb = abs.(gb .- fdb) ./ max.(abs.(gb), 1e-8)
         @test maximum(relerrb) < 1e-3
     end
-
-    # Validation.
-    @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; p_exp=0.5)
-    @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; q_exp=0.5)
-    @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; p_exp=NaN)
 
     # g_b = 0 decouples spins from the drive AND from the cavity mode
     # entirely: :ground never inverts (inversion == 0), and the silencing
@@ -248,18 +244,19 @@ const FAKE_D_ODE = merge(FAKE_D, (
     @test inv_nog == 0.0
     @test sil_nog < 1e-6
 
-    # Direct regression guard for the sketch's wrong 0^0-style guard bug:
-    # inversion == 0.0 EXACTLY here, at a barriered p_exp -- the correct
-    # gradient still must be finite and match FD (a base-branching guard
-    # would silently zero the wrong term here).
-    cost_nog = pulse_cost(u0, pulse, d_nog; p_exp=3.0)[1]
-    g_nog = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, d_nog; p_exp=3.0)[1], u0)
+    # Direct regression guard: inversion == 0.0 EXACTLY here, deep inside
+    # the squared-hinge penalty's own activation region (0 < I_min) -- the
+    # correct gradient still must be finite and match FD (unlike the old
+    # power-law barrier, this penalty's own gradient at the violation is
+    # LINEAR (-kappa_I*(I_min-inversion)), never vanishing at inversion=0).
+    cost_nog = pulse_cost(u0, pulse, d_nog; kappa_I=5.0)[1]
+    g_nog = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, d_nog; kappa_I=5.0)[1], u0)
     @test all(isfinite, g_nog)
     fd_nog = similar(g_nog)
     for i in eachindex(u0)
         up = copy(u0)
         up[i] += eps
-        fd_nog[i] = (pulse_cost(up, pulse, d_nog; p_exp=3.0)[1] - cost_nog) / eps
+        fd_nog[i] = (pulse_cost(up, pulse, d_nog; kappa_I=5.0)[1] - cost_nog) / eps
     end
     relerr_nog = abs.(g_nog .- fd_nog) ./ max.(abs.(g_nog), 1e-8)
     @test maximum(relerr_nog) < 1e-3
@@ -287,12 +284,12 @@ end
         @test coh_t == coh_s
     end
 
-    # SAME cross-check at nontrivial dynamic-barrier exponents, threaded
-    # into both sides.
-    for (p, q) in ((3.0, 1.0), (1.0, 3.0), (2.5, 4.0), (8.0, 8.0))
-        gb_serial = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; cost_kwargs..., p_exp=p, q_exp=q)[1], u0)
-        costb_s = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., p_exp=p, q_exp=q)[1]
-        gb_thr, costb_t = _pulse_cost_grad_threaded(u0, pulse, FAKE_D_ODE; cost_kwargs..., p_exp=p, q_exp=q)
+    # SAME cross-check at nontrivial squared-hinge penalty settings,
+    # threaded into both sides.
+    for (I_min, kI, S_min, kS) in ((0.99, 5.0, 0.0, 0.0), (0.0, 0.0, 0.99, 5.0), (0.9, 3.0, 0.9, 8.0))
+        gb_serial = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; cost_kwargs..., I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1], u0)
+        costb_s = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1]
+        gb_thr, costb_t = _pulse_cost_grad_threaded(u0, pulse, FAKE_D_ODE; cost_kwargs..., I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)
         @test gb_thr ≈ gb_serial atol=1e-10 rtol=1e-10
         @test costb_t ≈ costb_s atol=1e-12
     end
@@ -541,12 +538,13 @@ end
     @test all(h.schedule_factor == 0.0 for h in hop0[6])
     @test all(h.x_tune == 0.0 for h in hop0[6])
 
-    hop0_one_epoch = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=1, patience=1, learning_rate=0.05, label="[hop0-1ep]", dynamic_barrier=false)
-    w_time0_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.0)
+    cost_kwargs_nopenalty = merge(cost_kwargs, (kappa_I=0.0, kappa_S=0.0))
+    hop0_one_epoch = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_nopenalty;
+        num_epochs=1, patience=1, learning_rate=0.05, label="[hop0-1ep]")
+    w_time0_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.0, kappa_I=0.0, kappa_S=0.0)
     explicit_w_time0 = run_local_adam(u0, pulse, FAKE_D_ODE, w_time0_kwargs;
         hop=1, num_epochs=1, patience=1, learning_rate=0.05, label="[explicit-w0]",
-        anneal_direct_weights=false, dynamic_barrier=false)
+        anneal_direct_weights=false)
     @test hop0_one_epoch[1] == explicit_w_time0[1]  # best_u: identical raw-gradient trajectory
 
     # hop=1 is the first hop annealing ever applies to: behaves exactly like
@@ -637,173 +635,132 @@ end
     # optimise_composite_pulse testset below.
 end
 
-@testset "_dynamic_barrier_exponent" begin
-    # Boundary exactness: at/above safe -> 1.0 exactly; at/below min_val ->
-    # max_exp exactly (the anti-5e14-cap regression guard: finite, tunable,
-    # not a gradient-killing blow-up).
-    @test _dynamic_barrier_exponent(0.95) == 1.0
-    @test _dynamic_barrier_exponent(0.99) == 1.0
-    @test _dynamic_barrier_exponent(1.0) == 1.0
-    @test _dynamic_barrier_exponent(1.5) == 1.0  # clamped above 1
-    @test _dynamic_barrier_exponent(0.85) == 8.0
-    @test _dynamic_barrier_exponent(0.5) == 8.0
-    @test _dynamic_barrier_exponent(0.0) == 8.0
-    @test _dynamic_barrier_exponent(-0.5) == 8.0  # clamped below 0
-
-    # Strict monotone DEcreasing in x over (min_val, safe): every value
-    # lands in [1.0, 8.0].
-    xs = collect(0.851:0.001:0.949)
-    vals = [_dynamic_barrier_exponent(x) for x in xs]
-    @test issorted(vals; rev=true)
-    @test all(1.0 .<= vals .<= 8.0)
-
-    # NaN (no accepted point measured yet) -> 1.0, the "no barrier" default.
-    @test _dynamic_barrier_exponent(NaN) == 1.0
-
-    # Validation.
-    @test_throws ErrorException _dynamic_barrier_exponent(0.5; min_val=0.9, safe=0.8)
-    @test_throws ErrorException _dynamic_barrier_exponent(0.5; safe=1.5)
-    @test_throws ErrorException _dynamic_barrier_exponent(0.5; min_val=-0.1)
-    @test_throws ErrorException _dynamic_barrier_exponent(0.5; lambda=-1.0)
-    @test_throws ErrorException _dynamic_barrier_exponent(0.5; max_exp=0.5)
-
-    # _dynamic_barrier_p is a direct pass-through onto inversion.
-    for i in (0.0, 0.5, 0.8, 0.9, 0.95, 1.0)
-        @test _dynamic_barrier_p(i) == _dynamic_barrier_exponent(i)
-    end
-
-    # _dynamic_barrier_q barriers silencing_success = 1-(silencing-target_F)^2,
-    # NOT silencing itself.
-    for (sil, tF) in ((1.0, 1.0), (0.5, 1.0), (0.0, 1.0), (0.613, 1.0), (0.0, 0.0), (1.0, 0.0))
-        ss = 1.0 - (sil - tF)^2
-        @test _dynamic_barrier_q(sil, tF) == _dynamic_barrier_exponent(ss)
-    end
-    @test _dynamic_barrier_q(NaN, 1.0) == 1.0
-    @test _dynamic_barrier_q(1.0, 1.0) == 1.0  # silencing_success=1 -> at/above safe
-end
-
-@testset "_fidelity_physics_cost / _fidelity_partials" begin
-    # Legacy bit-identity at p_exp=q_exp=1 over a grid including inv/sil
-    # edges (0, near-0, 1) -- === not ≈, proving the identity branch is
-    # taken, not merely numerically close.
+@testset "_fidelity_physics_cost / _fidelity_gradient_coefficients" begin
+    # kappa_I=kappa_S=0 bit-identity over a grid including inv/sil edges
+    # (0, near-0, 1) -- === not ≈, proving 0.5*0*x^2 == 0.0 exactly, not
+    # merely numerically close, regardless of I_min/S_min.
     for inv in (0.0, 1e-15, 0.5, 1.0), sil in (0.0, 0.5, 1.0), tF in (0.0, 1.0)
         ss_legacy = 1.0 - (sil - tF)^2
         fid_legacy = inv * ss_legacy
         pc_legacy = (1.0 - fid_legacy)^2
-        pc, fid, ss = _fidelity_physics_cost(inv, sil, tF, 1.0, 1.0)
+        pc, fid, ss = _fidelity_physics_cost(inv, sil, tF, 0.85, 0.0, 0.85, 0.0)
         @test pc === pc_legacy
         @test fid === fid_legacy
         @test ss === ss_legacy
-        term_I, term_S = _fidelity_partials(inv, ss, 1.0, 1.0)
-        @test term_I === ss_legacy
-        @test term_S === inv
+        coeff_I, coeff_S = _fidelity_gradient_coefficients(inv, ss, fid, 0.85, 0.0, 0.85, 0.0)
+        # == not === here: at fid_legacy==1.0 exactly, (1.0-fid_legacy) is a
+        # signed zero whose SIGN depends on multiplication order/associativity
+        # (-0.0 vs 0.0) -- mathematically identical (0.0 == -0.0), just not
+        # bit-identical, unlike the pc/fid/ss checks above (no such exact-1.0
+        # cancellation there).
+        @test coeff_I == -2.0 * (1.0 - fid_legacy) * ss_legacy
+        @test coeff_S == -2.0 * (1.0 - fid_legacy) * inv
     end
 
-    # Partials vs ForwardDiff over a grid spanning near-identity to strongly
-    # barriered exponents, including the exact corners (inv==0,p==1) /
-    # (ss==0,q==1) where a base-branching 0^0 guard (the sketch's bug) would
-    # misfire.
-    for p in (1.0, 1.0 + 1e-12, 2.0, 3.7, 8.0), q in (1.0, 1.0 + 1e-12, 2.0, 3.7, 8.0)
-        for inv in (0.0, 1e-12, 0.3, 1.0), ss in (0.0, 1e-12, 0.3, 1.0)
-            f(v) = v[1]^p * v[2]^q
+    # Coefficients vs ForwardDiff over a grid spanning inert (kappa=0) to
+    # strongly-penalized settings, including the exact corners where the
+    # penalty's own one-sided hinge switches on/off (inv/ss at, just below,
+    # and just above I_min/S_min).
+    for I_min in (0.0, 0.5, 0.85), kI in (0.0, 1.0, 50.0), S_min in (0.0, 0.5, 0.85), kS in (0.0, 1.0, 50.0)
+        for inv in (0.0, 0.3, 0.85, 1.0), ss in (0.0, 0.3, 0.85, 1.0)
+            # v[1]=inversion, v[2]=silencing_success DIRECTLY -- bypasses the
+            # silencing->silencing_success mapping entirely (already checked
+            # in the bit-identity loop above) so this isolates the penalty
+            # formula/gradient itself against an independent FD reference.
+            f(v) = (1.0 - v[1] * v[2])^2 + 0.5 * kI * max(0.0, I_min - v[1])^2 + 0.5 * kS * max(0.0, S_min - v[2])^2
             g_fd = ForwardDiff.gradient(f, [inv, ss])
-            term_I, term_S = _fidelity_partials(inv, ss, p, q)
-            @test all(isfinite, (term_I, term_S))
-            if p == 1.0 && q == 1.0
-                @test term_I == g_fd[1]
-                @test term_S == g_fd[2]
-            else
-                @test term_I ≈ g_fd[1] rtol=1e-9 atol=1e-12
-                @test term_S ≈ g_fd[2] rtol=1e-9 atol=1e-12
-            end
+            fid = inv * ss
+            coeff_I, coeff_S = _fidelity_gradient_coefficients(inv, ss, fid, I_min, kI, S_min, kS)
+            @test all(isfinite, (coeff_I, coeff_S))
+            @test coeff_I ≈ g_fd[1] rtol=1e-9 atol=1e-12
+            @test coeff_S ≈ g_fd[2] rtol=1e-9 atol=1e-12
         end
     end
 
-    # Validation.
-    @test_throws ErrorException _fidelity_physics_cost(0.5, 0.5, 1.0, 0.5, 1.0)
-    @test_throws ErrorException _fidelity_physics_cost(0.5, 0.5, 1.0, 1.0, 0.5)
-    @test_throws ErrorException _fidelity_physics_cost(0.5, 0.5, 1.0, NaN, 1.0)
-    @test_throws ErrorException _fidelity_partials(0.5, 0.5, 0.5, 1.0)
-    @test_throws ErrorException _fidelity_partials(0.5, 0.5, 1.0, Inf)
+    # Continuity at the hinge (x == floor): penalty contribution and its
+    # gradient are both exactly 0 there (C1 kink, not a discontinuity).
+    pc_at, _, _ = _fidelity_physics_cost(0.85, 1.0, 0.0, 0.85, 50.0, 0.0, 0.0)
+    pc_ref, _, _ = _fidelity_physics_cost(0.85, 1.0, 0.0, 0.85, 0.0, 0.0, 0.0)
+    @test pc_at == pc_ref
+    coeff_I_at, _ = _fidelity_gradient_coefficients(0.85, 1.0, 0.85 * 1.0, 0.85, 50.0, 0.0, 0.0)
+    coeff_I_ref, _ = _fidelity_gradient_coefficients(0.85, 1.0, 0.85 * 1.0, 0.85, 0.0, 0.0, 0.0)
+    @test coeff_I_at == coeff_I_ref
 
-    # Audit finding: silencing_success = 1-(silencing-target_F)^2 is only
-    # provably in [0,1] for target_F ∈ [0,1] (never validated). Before the
-    # max(x,0) floor in _pow_or_identity/_pow_derivative, a negative
-    # silencing_success (from an out-of-range target_F) raised to a
-    # non-integer q_exp threw Julia's own DomainError ("Exponentiation
-    # yielding a complex result requires a complex argument") -- a real
-    # regression risk once dynamic_barrier (real, possibly non-integer
-    # exponents) went on by default. Must now stay finite, not crash --
-    # and the legacy p_exp=q_exp=1 path must stay COMPLETELY unaffected
-    # (bit-identical, sign and all) since it never takes the floored branch.
-    pc_oob, fid_oob, ss_oob = _fidelity_physics_cost(0.5, 0.0, 2.0, 1.0, 2.5)
-    @test ss_oob == -3.0  # raw silencing_success reported unclamped, for diagnostics
-    @test fid_oob == 0.0  # inversion * max(-3.0, 0.0)^2.5 == inversion * 0 == 0
-    @test pc_oob == 1.0
-    term_I_oob, term_S_oob = _fidelity_partials(0.5, ss_oob, 1.0, 2.5)
-    @test all(isfinite, (term_I_oob, term_S_oob))
-    # Legacy path (p=q=1) is untouched by the floor -- exact hand-computed
-    # value, negative silencing_success and all.
-    pc_legacy_oob, fid_legacy_oob, ss_legacy_oob = _fidelity_physics_cost(0.5, 0.0, 2.0, 1.0, 1.0)
-    @test ss_legacy_oob === -3.0
-    @test fid_legacy_oob === 0.5 * (-3.0)
-    @test pc_legacy_oob === (1.0 - 0.5 * (-3.0))^2
-end
+    # Validation: negative kappa (would REWARD low inversion/silencing_success
+    # instead of penalising it) and I_min/S_min outside [0,1] (permanently
+    # active penalty, unsatisfiable even at perfect fidelity) both error
+    # loudly, on both functions, rather than silently misoptimising.
+    @test_throws ErrorException _fidelity_physics_cost(0.5, 1.0, 1.0, 0.85, -50.0, 0.0, 0.0)
+    @test_throws ErrorException _fidelity_physics_cost(0.5, 1.0, 1.0, 0.0, 0.0, 0.85, -50.0)
+    @test_throws ErrorException _fidelity_physics_cost(1.0, 1.0, 1.0, 1.5, 50.0, 0.0, 0.0)
+    @test_throws ErrorException _fidelity_physics_cost(1.0, 1.0, 1.0, -0.1, 50.0, 0.0, 0.0)
+    @test_throws ErrorException _fidelity_physics_cost(1.0, 1.0, 1.0, 0.0, 0.0, 1.5, 50.0)
+    @test_throws ErrorException _fidelity_physics_cost(1.0, 1.0, 1.0, 0.85, NaN, 0.0, 0.0)
+    @test_throws ErrorException _fidelity_physics_cost(1.0, 1.0, 1.0, NaN, 50.0, 0.0, 0.0)
+    @test_throws ErrorException _fidelity_gradient_coefficients(0.5, 1.0, 0.5, 0.85, -50.0, 0.0, 0.0)
+    @test_throws ErrorException _fidelity_gradient_coefficients(1.0, 1.0, 1.0, 1.5, 50.0, 0.0, 0.0)
 
-@testset "run_local_adam dynamic_barrier" begin
+    # ...and the same guard is actually reached from the public entry points
+    # (pulse_cost, run_local_adam via cost_kwargs), not just the two
+    # internal helpers directly.
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
-    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
+    @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; kappa_I=-1.0)
+    @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; I_min=1.2)
+    @test_throws ErrorException run_local_adam(u0, pulse, FAKE_D_ODE,
+        (w_tmax=1.0, w_power=0.05, w_time=0.15, kappa_S=-1.0);
+        num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-invalid]")
+end
 
-    # default==explicit-true bit-for-bit.
-    baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[db-default]")
-    explicit_on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[db-explicit]", dynamic_barrier=true)
-    @test baseline[6] == explicit_on[6]
+@testset "run_local_adam squared-hinge penalty" begin
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    u0 = seed_canonical(pulse, :hs1)
+    # Penalty settings are NOT separate run_local_adam keywords -- they
+    # travel through cost_kwargs, exactly like target_F/w_tmax/w_power/
+    # w_time's own base values (see run_local_adam's own docstring).
+    cost_kwargs_default = (w_tmax=1.0, w_power=0.05, w_time=0.15)
+    cost_kwargs_off = (w_tmax=1.0, w_power=0.05, w_time=0.15, kappa_I=0.0, kappa_S=0.0)
 
-    # dynamic_barrier=false => p_exp=q_exp=1.0 on every row, every epoch.
-    off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[db-off]", dynamic_barrier=false)
-    @test all(h.p_exp == 1.0 && h.q_exp == 1.0 for h in off[6])
-
-    # Epoch 1 always p_exp=q_exp=1.0 (NaN rule -- no accepted point yet).
-    @test baseline[6][1].p_exp == 1.0
-    @test baseline[6][1].q_exp == 1.0
-
-    # Epoch i>=2's p_exp/q_exp reproduce _dynamic_barrier_p/q applied to
-    # epoch i-1's own (inversion, silencing) -- mirrors the schedule_factor
-    # assertions above, and is unaffected by hop==0 (dynamic_barrier is NOT
-    # gated by hop, unlike annealing).
-    for i in 2:length(baseline[6])
-        expected_p = _dynamic_barrier_p(baseline[6][i-1].inversion)
-        expected_q = _dynamic_barrier_q(baseline[6][i-1].silencing, 1.0)
-        @test baseline[6][i].p_exp == expected_p
-        @test baseline[6][i].q_exp == expected_q
-    end
+    # default (pulse_cost's own I_min=0.85/kappa_I=50.0 etc, since
+    # cost_kwargs doesn't override them) vs kappa_I=kappa_S=0 (explicitly
+    # inert) must actually produce a DIFFERENT history -- the penalty is on
+    # by default and does something.
+    baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-default]")
+    off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_off;
+        num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-off]")
+    @test baseline[6] != off[6]
 
     # Reconstitution invariance: a 1-epoch run's reported cost equals the
-    # plain unbarriered pulse_cost at u0, for BOTH dynamic_barrier settings
-    # (proves the barrier shapes the gradient only, never the reported cost).
-    plain_cost = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)[1]
-    on1 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=1, patience=1, learning_rate=0.05, label="[db-on1]")
-    off1 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=1, patience=1, learning_rate=0.05, label="[db-off1]", dynamic_barrier=false)
-    @test on1[6][1].cost ≈ plain_cost atol=1e-12
-    @test off1[6][1].cost ≈ plain_cost atol=1e-12
+    # DIRECT pulse_cost value at u0 under the SAME cost_kwargs (proves the
+    # penalty needs no epoch-loop reconstitution any more -- it's already
+    # the same static formula everywhere, unlike the old per-epoch barrier).
+    # Holds for BOTH the default (penalty on) and off (kappa=0) settings.
+    plain_cost_default = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_default...)[1]
+    plain_cost_off = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_off...)[1]
+    @test plain_cost_default != plain_cost_off  # sanity: the penalty really changes the value
+    on1 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
+        num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-on1]")
+    off1 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_off;
+        num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-off1]")
+    @test on1[6][1].cost ≈ plain_cost_default atol=1e-12
+    @test off1[6][1].cost ≈ plain_cost_off atol=1e-12
 
-    # Threshold knobs actually bite: a much stricter barrier_safe/lower
-    # barrier_max_exp produces a different history.
-    strict = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
-        num_epochs=3, patience=3, learning_rate=0.05, label="[db-strict]",
-        barrier_safe=0.999, barrier_min=0.99, barrier_max_exp=4.0)
+    # Threshold knobs actually bite: much stricter I_min/kappa_I produces a
+    # different history from the default.
+    strict = run_local_adam(u0, pulse, FAKE_D_ODE,
+        merge(cost_kwargs_default, (I_min=0.999, kappa_I=500.0));
+        num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-strict]")
     @test strict[6] != baseline[6]
 
-    # Validation.
-    @test_throws ErrorException run_local_adam(
-        u0, pulse, FAKE_D_ODE, cost_kwargs; barrier_min=0.99, barrier_safe=0.9,
-    )
+    # dynamic_barrier is NOT gated by hop==0, and neither is this penalty --
+    # hop 0 (which suppresses w_time to 0, see the hop-0 testset above)
+    # still shows the penalty-on vs penalty-off cost difference.
+    baseline_hop0 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
+        hop=0, num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-hop0-on]")
+    off_hop0 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_off;
+        hop=0, num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-hop0-off]")
+    @test baseline_hop0[6][1].cost != off_hop0[6][1].cost
 end
 
 @testset "optimise_composite_pulse: hop 0 never anneals, hop 1 is the calibration seed" begin
@@ -886,13 +843,22 @@ end
         n_hops=1, num_epochs=2, patience=2, threaded_grad=false, seed=7, label_prefix="[ocp-1hop] ")
     @test all(h.schedule_factor == 0.0 && h.x_tune == 0.0 for h in single_hop[6])
 
-    # dynamic_barrier settings are present in optimizer_settings and
-    # forwarded correctly (default true; off propagates through history).
-    @test baseline[8].dynamic_barrier == true
-    @test baseline[8].barrier_safe == _DEFAULT_BARRIER_SAFE
-    off_barrier = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
-        common..., dynamic_barrier=false, label_prefix="[ocp-nobarrier] ")
-    @test all(h.p_exp == 1.0 && h.q_exp == 1.0 for h in off_barrier[6])
+    # I_min/kappa_I/S_min/kappa_S settings are present in optimizer_settings
+    # and forwarded correctly (defaults; kappa=0 propagates through cost).
+    @test baseline[8].I_min == _DEFAULT_PENALTY_MIN
+    @test baseline[8].kappa_I == _DEFAULT_PENALTY_KAPPA
+    off_penalty = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., kappa_I=0.0, kappa_S=0.0, label_prefix="[ocp-nopenalty] ")
+    @test off_penalty[8].kappa_I == 0.0
+    # I_min=1.0 unconditionally activates the penalty (inversion < 1.0
+    # always, short of an exact fixed point) -- deterministic difference
+    # from kappa=0, unlike relying on the random seed's own physics.
+    u0_base, pulse_base = baseline[4], baseline[3]
+    plain_cost_u0 = pulse_cost(u0_base, pulse_base, FAKE_D_ODE;
+        w_tmax=1.0, w_power=0.05, target_F=1.0, w_time=0.15, kappa_I=0.0, kappa_S=0.0)[1]
+    barriered_cost_u0 = pulse_cost(u0_base, pulse_base, FAKE_D_ODE;
+        w_tmax=1.0, w_power=0.05, target_F=1.0, w_time=0.15, I_min=1.0, kappa_I=50.0, kappa_S=0.0)[1]
+    @test plain_cost_u0 != barriered_cost_u0  # sanity: penalty really changes u0's cost
 end
 
 @testset "optimise_composite_pulse_rjmcmc: hop 0 never anneals, hop 1 is the calibration seed" begin
@@ -961,13 +927,15 @@ end
     @test baseline[8].anneal_direct_weights == true
     @test baseline[8].x_tune_alpha == _DEFAULT_X_TUNE_ALPHA
     @test baseline[8].recalibrate_optima_x == true
-    @test baseline[8].dynamic_barrier == true
+    @test baseline[8].I_min == _DEFAULT_PENALTY_MIN
+    @test baseline[8].kappa_I == _DEFAULT_PENALTY_KAPPA
     @test !haskey(baseline[8], :x_tune)
 
-    # dynamic_barrier=false propagates through history.
-    off_barrier = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
-        common..., dynamic_barrier=false, label_prefix="[rj-nobarrier] ")
-    @test all(h.p_exp == 1.0 && h.q_exp == 1.0 for h in off_barrier[6])
+    # kappa_I=kappa_S=0 propagates through optimizer_settings.
+    off_penalty = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
+        common..., kappa_I=0.0, kappa_S=0.0, label_prefix="[rj-nopenalty] ")
+    @test off_penalty[8].kappa_I == 0.0
+    @test off_penalty[8].kappa_S == 0.0
 end
 
 include(joinpath(@__DIR__, "adjoint.jl"))

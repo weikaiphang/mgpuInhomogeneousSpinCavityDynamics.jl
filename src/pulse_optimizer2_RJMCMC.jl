@@ -432,9 +432,9 @@ end
         target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, label_prefix="",
         anneal_direct_weights=true, x_tune_alpha=_DEFAULT_X_TUNE_ALPHA,
-        recalibrate_optima_x=true, dynamic_barrier=true,
-        barrier_safe=_DEFAULT_BARRIER_SAFE, barrier_min=_DEFAULT_BARRIER_MIN,
-        barrier_lambda=_DEFAULT_BARRIER_LAMBDA, barrier_max_exp=_DEFAULT_BARRIER_MAX_EXP, solve_kwargs...)
+        recalibrate_optima_x=true,
+        I_min=_DEFAULT_PENALTY_MIN, kappa_I=_DEFAULT_PENALTY_KAPPA,
+        S_min=_DEFAULT_PENALTY_MIN, kappa_S=_DEFAULT_PENALTY_KAPPA, solve_kwargs...)
         -> (best_u, best_cost, pulse::CompositePulse, u0, initial_metrics, history, final_metrics, optimizer_settings)
 
 Trans-dimensional (reversible-jump-flavoured) basin-hopping global search
@@ -600,15 +600,13 @@ uncalibrated (plain linear) -- and is a silent no-op whenever
 `anneal_direct_weights=false`. If `n_hops == 1` (no hop ever reaches hop
 1), the entire run never anneals at all.
 
-`dynamic_barrier`/`barrier_safe`/`barrier_min`/`barrier_lambda`/
-`barrier_max_exp` (defaults `true`/[`_DEFAULT_BARRIER_SAFE`](@ref)/
-[`_DEFAULT_BARRIER_MIN`](@ref)/[`_DEFAULT_BARRIER_LAMBDA`](@ref)/
-[`_DEFAULT_BARRIER_MAX_EXP`](@ref), forwarded unchanged to every
+`I_min`/`kappa_I`/`S_min`/`kappa_S` (defaults [`_DEFAULT_PENALTY_MIN`](@ref)/
+[`_DEFAULT_PENALTY_KAPPA`](@ref) each, forwarded unchanged to every
 `run_local_adam` call, hop 0 and every subsequent hop) are
-[`run_local_adam`](@ref)'s own dynamic-barrier feature, forwarded through
-unchanged -- see that function's own docstring. Unlike annealing,
-`dynamic_barrier` is NOT gated by `hop==0`; it applies identically on
-every hop, including hop 0.
+[`run_local_adam`](@ref)'s own squared-hinge penalty feature, forwarded
+through unchanged -- see that function's own docstring. Unlike annealing,
+it is NOT gated by `hop==0`; it applies identically on every hop,
+including hop 0.
 """
 function optimise_composite_pulse_rjmcmc(
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
@@ -619,16 +617,14 @@ function optimise_composite_pulse_rjmcmc(
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     anneal_direct_weights::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
-    dynamic_barrier::Bool=true,
-    barrier_safe::Real=_DEFAULT_BARRIER_SAFE,
-    barrier_min::Real=_DEFAULT_BARRIER_MIN,
-    barrier_lambda::Real=_DEFAULT_BARRIER_LAMBDA,
-    barrier_max_exp::Real=_DEFAULT_BARRIER_MAX_EXP,
+    I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
+    S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
     solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
-    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time)
+    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time,
+                   I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S)
     rng = Random.Xoshiro(seed)
 
     solve_settings = NamedTuple(kv for kv in pairs(solve_kwargs) if !(kv[2] isa Function))
@@ -639,8 +635,7 @@ function optimise_composite_pulse_rjmcmc(
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
          anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
          recalibrate_optima_x=recalibrate_optima_x,
-         dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
-         barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp),
+         I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S),
         solve_settings,
     )
 
@@ -669,8 +664,6 @@ function optimise_composite_pulse_rjmcmc(
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate,
         label="$(label_prefix)[hop 0]", anneal_direct_weights=anneal_direct_weights,
-        dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
-        barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
         solve_kwargs...
     )
     append!(history, hop0_history)
@@ -721,8 +714,6 @@ function optimise_composite_pulse_rjmcmc(
             label="$(label_prefix)[hop $hop move=$move k=$(candidate_pulse.k)]",
             anneal_direct_weights=anneal_direct_weights,
             x_tune_alpha=hop_x_tune_alpha, _precalibrated_x_tune=hop_precal,
-            dynamic_barrier=dynamic_barrier, barrier_safe=barrier_safe, barrier_min=barrier_min,
-            barrier_lambda=barrier_lambda, barrier_max_exp=barrier_max_exp,
             solve_kwargs...,
         )
         append!(history, hop_history)

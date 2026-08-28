@@ -197,11 +197,11 @@ end
 
 Test-facing primal: replay each track's frozen `dt` sequence with Φ
 (`tsit5_forced_step`) and score the same scalar as [`pulse_cost`](@ref),
-via the SAME [`_fidelity_physics_cost`](@ref) helper (so `p_exp`/`q_exp`
-dynamic-barrier exponents, default `1.0`, track `pulse_cost`'s own formula
-exactly -- see that function's docstring). Both `mesh_ground` and
-`mesh_equator` are always required now: the multiplicative
-`fidelity_phys = inversion^p_exp*silencing_success^q_exp` has no
+via the SAME [`_fidelity_physics_cost`](@ref) helper (so `I_min`/`kappa_I`/
+`S_min`/`kappa_S`, defaults `_DEFAULT_PENALTY_MIN`/`_DEFAULT_PENALTY_KAPPA`,
+track `pulse_cost`'s own formula exactly -- see that function's docstring).
+Both `mesh_ground` and `mesh_equator` are always required now: the
+multiplicative `fidelity_phys = inversion*silencing_success` has no
 well-defined value with either track missing.
 """
 function pulse_cost_on_frozen_mesh(
@@ -214,8 +214,8 @@ function pulse_cost_on_frozen_mesh(
     w_time=0.15,
     w_power=0.05,
     w_tmax=1.0,
-    p_exp::Real=1.0,
-    q_exp::Real=1.0,
+    I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
+    S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
     signal_E_of_t=_zero_drive,
 )
     T = eltype(u)
@@ -238,7 +238,7 @@ function pulse_cost_on_frozen_mesh(
     field_amp = _weighted_field_amplitude(Sp, d.g_b, d.Nj, T)
 
     direct = _direct_cost_term(u, pulse, w_time, w_power, w_tmax)
-    physics_cost, _, _ = _fidelity_physics_cost(inversion, silencing, target_F, p_exp, q_exp)
+    physics_cost, _, _ = _fidelity_physics_cost(inversion, silencing, target_F, I_min, kappa_I, S_min, kappa_S)
     cost = physics_cost + direct
     return cost, inversion, silencing, duration, coherence, field_amp
 end
@@ -277,10 +277,11 @@ Both tracks are always run (see [`inversion_pullback!`](@ref)/
 and `grad_F = ∇silencing(u)` -- the same two Jacobians
 [`_pulse_cost_grad_threaded`](@ref) computes via Dual ODEs. This function
 then applies the IDENTICAL analytical chain rule that function uses (via
-the SAME [`_fidelity_physics_cost`](@ref)/[`_fidelity_partials`](@ref)
-helpers, so `p_exp`/`q_exp` dynamic-barrier exponents, default `1.0`, are
-handled identically on both sides) to combine them into `∇physics_cost`,
-so `pulse_cost_grad_adjoint` and `_pulse_cost_grad_threaded` are adjoints
+the SAME [`_fidelity_physics_cost`](@ref)/[`_fidelity_gradient_coefficients`](@ref)
+helpers, so `I_min`/`kappa_I`/`S_min`/`kappa_S`, defaults
+`_DEFAULT_PENALTY_MIN`/`_DEFAULT_PENALTY_KAPPA`, are handled identically
+on both sides) to combine them into `∇physics_cost`, so
+`pulse_cost_grad_adjoint` and `_pulse_cost_grad_threaded` are adjoints
 of the exact same scalar [`pulse_cost`](@ref), just via two different
 ODE-sensitivity backends.
 """
@@ -292,8 +293,8 @@ function pulse_cost_grad_adjoint(
     w_time=0.15,
     w_power=0.05,
     w_tmax=1.0,
-    p_exp::Real=1.0,
-    q_exp::Real=1.0,
+    I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
+    S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
     compute::Symbol=:cpu,
     checkpoint_stride::Integer=300,
     use_checkpoints::Bool=true,
@@ -366,15 +367,17 @@ function pulse_cost_grad_adjoint(
     GC.gc(false)
 
     # Same analytical chain rule as _pulse_cost_grad_threaded (both call the
-    # SAME _fidelity_physics_cost/_fidelity_partials helpers): the raw
-    # per-track Jacobians grad_I/grad_F combine through physics_cost's
-    # multiplicative coupling here, not inside either pullback.
+    # SAME _fidelity_physics_cost/_fidelity_gradient_coefficients helpers):
+    # the raw per-track Jacobians grad_I/grad_F combine through
+    # physics_cost's multiplicative coupling (plus the squared-hinge
+    # penalty's own restoring gradient) here, not inside either pullback.
     physics_cost, fidelity_phys, silencing_success =
-        _fidelity_physics_cost(inversion, silencing, Float64(target_F), p_exp, q_exp)
-    term_I, term_S = _fidelity_partials(inversion, silencing_success, p_exp, q_exp)
+        _fidelity_physics_cost(inversion, silencing, Float64(target_F), I_min, kappa_I, S_min, kappa_S)
+    coeff_I, coeff_S = _fidelity_gradient_coefficients(inversion, silencing_success,
+                                                        fidelity_phys, I_min, kappa_I, S_min, kappa_S)
 
     grad_S = -2.0 * (silencing - Float64(target_F)) .* grad_F
-    grad_physics = -2.0 * (1.0 - fidelity_phys) .* (term_I .* grad_I .+ term_S .* grad_S)
+    grad_physics = coeff_I .* grad_I .+ coeff_S .* grad_S
 
     grad = grad_physics .+ grad_direct
     cost = physics_cost + direct_val
