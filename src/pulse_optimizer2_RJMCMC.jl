@@ -562,8 +562,9 @@ specifically so it is NEVER part of `solve_kwargs` -- `initial_metrics`/
 `final_metrics` (`pulse_cost` calls, which know nothing about it) and
 every hop's `_extract_physics_cost` comparison therefore still see only
 the STATIC, caller-configured `w_time` `run_local_adam` already
-reconstitutes before returning. Pass `anneal_direct_weights=false` to
-disable annealing entirely and recover the original fixed-`w_time` cost.
+re-evaluates `best_u` under before returning. Pass
+`anneal_direct_weights=false` to disable annealing entirely and recover
+the original fixed-`w_time` cost.
 
 **`hop==0` always has `w_time` suppressed to `0.0`** -- exactly mirroring
 [`run_local_adam`](@ref)'s own unconditional `hop==0` rule (physics-only

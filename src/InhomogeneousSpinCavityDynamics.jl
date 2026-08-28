@@ -39,7 +39,7 @@ include("tsit5_discrete_adjoint.jl")
 include("pulse_adjoint.jl")
 include("pulse_optimizer2_RJMCMC.jl")
 include("multi_seed_pulse_optimizer.jl")
-include("jld2_pulse_loader-old.jl")
+include("jld2_pulse_loader.jl")
 include("composite_arp_pulses.jl")
 
 # 2nd-order simulation (single-GPU)
@@ -129,10 +129,9 @@ export load_jld2_run, split_signal_control, build_signal_E_of_t
 export try_parse_pulse_config, load_jld2_reference, run_reference_forward
 export reconcile_reference, fit_linear_seed
 export jld2_pipeline_defaults, jld2_optimizer_defaults
-export run_sim_1st_order_trajectory, run_sim_1st_order_final, reconcile_against_jld2
+export run_sim_1st_order_trajectory, run_sim_1st_order_final
 export optrunlog_paths, save_optimisation_run_log, save_optimised_pulse_parameters
 export optimise_control_pulse_from_jld2
-export optimise_control_pulse_from_jld2_over_k
 
 # Analytic composite ARP pulse exports
 export generate_3arp_pi_pulse

@@ -547,6 +547,16 @@ end
         anneal_direct_weights=false)
     @test hop0_one_epoch[1] == explicit_w_time0[1]  # best_u: identical raw-gradient trajectory
 
+    # Adam's sandbox on hop 0 uses w_time=0 (history); the returned cost is
+    # a separate static evaluation of best_u under the caller's cost_kwargs.
+    # 1-epoch: Adam records cost at u0 then steps, so best_u is still u0.
+    sandbox_at_u0 = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_nopenalty..., w_time=0.0)[1]
+    static_at_u0 = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_nopenalty...)[1]
+    @test hop0_one_epoch[6][1].cost ≈ sandbox_at_u0 atol=1e-12
+    @test hop0_one_epoch[2] ≈ static_at_u0 atol=1e-12
+    @test sandbox_at_u0 != static_at_u0  # duration term is the difference
+    @test hop0[2] ≈ pulse_cost(hop0[1], pulse, FAKE_D_ODE; cost_kwargs...)[1] atol=1e-10
+
     # hop=1 is the first hop annealing ever applies to: behaves exactly like
     # the OLD hop=0 default did before this change -- mandatory calibration,
     # bit-for-bit identical between the implicit default and an explicit
@@ -558,6 +568,10 @@ end
     @test baseline[1] == explicit_on[1]  # best_u
     @test baseline[2] == explicit_on[2]  # best_cost
     @test baseline[6] == explicit_on[6]  # history
+    # Returned cost is the static evaluation of best_u; epoch-1 history is
+    # the factor=0 sandbox at u0 (last_good_aux still NaN).
+    @test baseline[2] ≈ pulse_cost(baseline[1], pulse, FAKE_D_ODE; cost_kwargs...)[1] atol=1e-10
+    @test baseline[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.0)[1] atol=1e-12
 
     # anneal_direct_weights=false at hop!=0 is the ORIGINAL "disable
     # annealing, recover the fixed w_time" contract -- schedule_factor==1.0
@@ -731,20 +745,24 @@ end
         num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-off]")
     @test baseline[6] != off[6]
 
-    # Reconstitution invariance: a 1-epoch run's reported cost equals the
-    # DIRECT pulse_cost value at u0 under the SAME cost_kwargs (proves the
-    # penalty needs no epoch-loop reconstitution any more -- it's already
-    # the same static formula everywhere, unlike the old per-epoch barrier).
-    # Holds for BOTH the default (penalty on) and off (kappa=0) settings.
+    # Penalty is already in the live formula (no barrier reconstitution).
+    # Hop 0's history records the sandbox (w_time=0); the returned cost is
+    # the static pulse_cost of best_u under the SAME cost_kwargs. 1-epoch:
+    # best_u is still u0. Holds for BOTH default (penalty on) and kappa=0.
     plain_cost_default = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_default...)[1]
     plain_cost_off = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_off...)[1]
+    sandbox_default = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_default..., w_time=0.0)[1]
+    sandbox_off = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_off..., w_time=0.0)[1]
     @test plain_cost_default != plain_cost_off  # sanity: the penalty really changes the value
+    @test sandbox_default != sandbox_off
     on1 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
         num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-on1]")
     off1 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_off;
         num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-off1]")
-    @test on1[6][1].cost ≈ plain_cost_default atol=1e-12
-    @test off1[6][1].cost ≈ plain_cost_off atol=1e-12
+    @test on1[6][1].cost ≈ sandbox_default atol=1e-12
+    @test off1[6][1].cost ≈ sandbox_off atol=1e-12
+    @test on1[2] ≈ plain_cost_default atol=1e-12
+    @test off1[2] ≈ plain_cost_off atol=1e-12
 
     # Threshold knobs actually bite: much stricter I_min/kappa_I produces a
     # different history from the default.

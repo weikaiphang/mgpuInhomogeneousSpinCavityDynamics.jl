@@ -348,7 +348,7 @@ end
 @testset "run_local_adam grad_mode=:adjoint + anneal_direct_weights=true" begin
     # Coverage gap otherwise: anneal_direct_weights=true is exercised
     # elsewhere only under the default (:forwarddiff) grad_mode. The
-    # schedule/reconstitution logic in run_local_adam is grad_mode-agnostic
+    # schedule/moving-target logic in run_local_adam is grad_mode-agnostic
     # by construction (it only touches epoch_cost_kwargs/dyn_cost, whichever
     # of the three branches produced them), but that wiring deserves its own
     # direct check, not just an inference from the other two branches'
@@ -369,7 +369,7 @@ end
 
     # Epoch 1 starts from the SAME worst-case schedule state (no accepted
     # point yet -> factor=0) regardless of grad_mode, so all THREE
-    # grad_mode/threaded_grad branches must reproduce the SAME reconstituted
+    # grad_mode/threaded_grad branches must reproduce the SAME sandbox
     # cost/inversion/silencing exactly (all solve the identical primal ODE
     # at epoch 1 -- see the cross-backend testset above for why cost, as
     # opposed to gradient, matches exactly rather than approximately). The

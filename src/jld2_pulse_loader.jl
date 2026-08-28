@@ -12,11 +12,13 @@
 #      Those metrics are the reference metrics.
 #   6. If the file stores results, reconcile this run's final-state
 #      outputs and metrics against them. If it stores none, auto-PASS.
-#   7. On PASS, linear-fit (fit_mode=:linear) a CompositePulse seed from
-#      PULSE_CONFIG, or from the CSV when PULSE_CONFIG was unavailable.
-#   8. optimise_composite_pulse (pulse_optimizer2.jl) on the SAME
-#      reference ensemble, warm-started from that seed, with the parsed
-#      signal as a fixed background (never in `u`).
+#      FAIL stops. PASS continues to 7 then 8 (pulse_optimizer2.jl).
+#   7. On PASS, linear-fit (fit_mode=:linear) a CompositePulse seed of the
+#      CONTROL pulse only (PULSE_CONFIG control segments, or the CSV when
+#      PULSE_CONFIG was unavailable). Signal is never in the fit target.
+#   8. optimise_composite_pulse (pulse_optimizer2.jl) optimises that same
+#      CONTROL pulse on the reference ensemble, warm-started from the seed.
+#      Parsed signal is a fixed background (never in `u`).
 # ============================================================
 
 """
@@ -49,7 +51,9 @@ function _sibling_pulsemat_n_samples(jld2_path::AbstractString)
     endswith(jld2_path, ".jld2") || return nothing
     sibling = jld2_path[1:end-length(".jld2")] * "_pulsemat.csv"
     isfile(sibling) || return nothing
-    return countlines(sibling) - 2
+    n = countlines(sibling) - 2
+    n >= 2 || return nothing
+    return n
 end
 
 """
@@ -89,130 +93,19 @@ function build_signal_E_of_t(signal_cfg, use_signal::Bool)
 end
 
 """
-    _segment_matched_seed_init(control_cfg, pulse::CompositePulse) -> Union{Vector{Float64},Nothing}
-
-Builds a raw parameter vector for `pulse` by matching each of its `k`
-sub-pulses 1:1 against `control_cfg[i]` -- ONLY when `length(control_cfg)
-== pulse.k` (returns `nothing` otherwise, so the caller falls back to
-[`fit_composite_pulse`](@ref)'s own generic, timing-blind
-[`initial_guess`](@ref)). Sub-pulse `i` is placed at the SAME
-`t_start`/`t_end` as `control_cfg[i]` (from its own `t_center`/`duration`
-fields, encoded back through the same `gap_scale`/`dur_scale`/`dur_floor`
-softplus reparameterisation [`decode`](@ref) uses), its amplitude B-spline
-started FLAT at `control_cfg[i]`'s own peak `amp` (falling back to
-`pulse.amp_scale` if that field is absent), and -- when `control_cfg[i]`
-has a `bandwidth` field (i.e. looks like a `:wurst` spec) -- its frequency
-B-spline control points started as a LINEAR ramp from `-bandwidth/2` to
-`+bandwidth/2` (times `control_cfg[i].chirp_sign`, defaulting to `+1.0`),
-a reasonable starting approximation of a linear chirp sweep (`0` chirp
-otherwise).
-
-This exists because the generic random `initial_guess` turned out to be a
-poor starting point for fitting a MULTI-segment target: verified on this
-package's own 3-ARP reference pulse (k=3, 3 WURST segments) that 200
-epochs of Adam from `initial_guess` plateaus at `rel_l2~0.998` (i.e.
-essentially no better than an all-zero pulse) -- the random init's own
-amplitude scale sits ~3x below the target's actual peak, and its sub-pulse
-timings have no relation to where the target's segments actually are, so
-early gradients are largely uninformative (a sub-pulse that doesn't
-overlap the target in time gets no useful amplitude/shape signal from it).
-Starting from each segment's own known timing/amplitude/chirp instead
-begins descent already in roughly the right basin; [`fit_composite_pulse`](@ref)'s
-own Adam descent still does all the actual curve shaping from there.
-"""
-function _segment_matched_seed_init(control_cfg, pulse::CompositePulse)
-    length(control_cfg) == pulse.k || return nothing
-    k = pulse.k
-
-    raw_gap = Vector{Float64}(undef, k)
-    raw_dur = Vector{Float64}(undef, k)
-    raw_phi0 = zeros(k)
-    raw_cA = Matrix{Float64}(undef, pulse.n_coeff_A, k)
-    raw_cf = Matrix{Float64}(undef, pulse.n_coeff_f, k)
-
-    t_prev_end = 0.0
-    for i in 1:k
-        cfg = control_cfg[i]
-        duration = Float64(cfg.duration)
-        t_start = Float64(cfg.t_center) - duration / 2
-        gap = max(t_start - t_prev_end, pulse.gap_scale * 1e-3)
-        dur_arg = max(duration - pulse.dur_floor, pulse.dur_scale * 1e-3)
-
-        raw_gap[i] = _encode_scaled_softplus(gap, pulse.gap_scale)
-        raw_dur[i] = _encode_scaled_softplus(dur_arg, pulse.dur_scale)
-
-        amp = hasproperty(cfg, :amp) ? Float64(cfg.amp) : pulse.amp_scale
-        raw_cA[:, i] .= _encode_scaled_softplus(amp, pulse.amp_scale)
-
-        if hasproperty(cfg, :bandwidth)
-            bw = Float64(cfg.bandwidth)
-            chirp_sign = hasproperty(cfg, :chirp_sign) ? Float64(cfg.chirp_sign) : 1.0
-            raw_cf[:, i] .= _clip_cf_raw(
-                collect(chirp_sign .* range(-bw / 2, bw / 2; length=pulse.n_coeff_f) ./ pulse.freq_scale),
-                20.0,
-            )
-        else
-            raw_cf[:, i] .= 0.0
-        end
-
-        t_prev_end = t_start + duration
-    end
-
-    return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
-end
-
-"""
-    fit_composite_pulse_seed(control_cfg, pulse::CompositePulse; kwargs...) -> (u_fit, fit_report)
-
-Interprets a recorded `PULSE_CONFIG`'s control segments `control_cfg`
-(e.g. [`split_signal_control`](@ref)'s second return value -- this file's
-own original, non-B-spline control pulse, however it was built, e.g. the
-`:wurst` segments [`generate_3arp_pi_pulse`](@ref) produces) as a target
-drive (`build_E_of_t(control_cfg)`, `pulses.jl`'s tuple-of-specs method)
-and fits `pulse`'s own B-spline raw parameters to approximate it (see
-[`fit_composite_pulse`](@ref) in pulse_optimizer2.jl for the actual
-ForwardDiff/Adam shape fit -- `kwargs` are forwarded there unchanged, EXCEPT
-`u_init`: unless the caller passes one explicitly, this defaults to
-[`_segment_matched_seed_init`](@ref)`(control_cfg, pulse)` rather than
-`fit_composite_pulse`'s own generic random `initial_guess`, when
-`length(control_cfg) == pulse.k` makes a 1:1 segment match possible -- see
-that function's own docstring for why this matters in practice). A
-standalone shape-fit helper; the jld2 pipeline's default seed is the
-closed-form linear fitter [`fit_linear_seed`](@ref), not this Adam fit.
-`control_cfg`'s own pulse kind (e.g. WURST's `tanh` gate + `sin^n`
-envelope + quadratic-phase chirp) is a different functional family from
-`pulse`'s clamped-B-spline-times-Gevrey-taper envelope, so some residual
-mismatch is inherent and expected -- see `fit_report.rel_l2` for a
-scale-free measure of how much, and confirm the physics separately (this
-function makes NO ODE solve at all -- see
-[`optimise_control_pulse_from_jld2`](@ref)'s own seed-reconciliation step,
-which does).
-"""
-function fit_composite_pulse_seed(control_cfg, pulse::CompositePulse; kwargs...)
-    E_target = build_E_of_t(control_cfg)
-    kwargs_nt = NamedTuple(kwargs)
-    if !(:u_init in keys(kwargs_nt))
-        smart_init = _segment_matched_seed_init(control_cfg, pulse)
-        if smart_init !== nothing
-            kwargs_nt = merge(kwargs_nt, (u_init=smart_init,))
-        end
-    end
-    return fit_composite_pulse(pulse, E_target; kwargs_nt...)
-end
-
-"""
     _sample_control_cfg(control_cfg, d, N_samples) -> (t, Ex, Ep)
 
 Samples `control_cfg`'s own combined drive (`build_E_of_t(control_cfg)`) at
 `N_samples` evenly spaced points over `[0, d.timespan[2]-d.timespan[1]]` --
 the shared "get a raw `(t, I, Q)` trace out of a `PULSE_CONFIG`-shaped
-segment list" step behind every seed-fitting entry point in this file that
-starts from `control_cfg` rather than an already-sampled trace.
+segment list" step used by [`load_jld2_reference`](@ref) when
+`PULSE_CONFIG` parses.
 """
 function _sample_control_cfg(control_cfg, d, N_samples::Integer)
     N_samples >= 2 || error("_sample_control_cfg: N_samples must be >= 2, got $N_samples.")
     E_target = build_E_of_t(control_cfg)
     T_max = d.timespan[2] - d.timespan[1]
+    T_max > 0 || error("_sample_control_cfg: ensemble timespan span must be positive, got $T_max.")
     Ex, Ep = sample_E_of_t(E_target, T_max, N_samples)
     length(Ex) == N_samples && length(Ep) == N_samples || error(
         "_sample_control_cfg: sample_E_of_t returned lengths $(length(Ex))/$(length(Ep)), expected $N_samples."
@@ -222,89 +115,12 @@ function _sample_control_cfg(control_cfg, d, N_samples::Integer)
     return t, Ex, Ep
 end
 
-"""
-    _load_reference_trace(source; load_mode=:jld2, N_samples=10001, n_signal=1)
-        -> (t, Ex, Ep, d, jld2_path)
-
-Shared "get a raw `(t, I, Q)` reference trace plus its ensemble `d`" step
-behind this file's two file-driven fitting entry points, selected by
-`load_mode`:
-
-  - `load_mode=:jld2` (default): `source` is a `.jld2` run's own path.
-    Loads it ([`load_jld2_run`](@ref)), builds `d`
-    (`build_full_config`/`prepare_derived` on its own `SIM_SETTING`/
-    `SYSTEM_CONFIG`), splits `PULSE_CONFIG` into signal/control
-    ([`split_signal_control`](@ref), `n_signal`), and RESAMPLES the control
-    segments alone at `N_samples` points ([`_sample_control_cfg`](@ref)).
-  - `load_mode=:csv`: `source` is a `_pulsemat.csv` path (the convention
-    [`save_E_samples`](@ref) writes, and [`save_run_data`](@ref) always
-    writes alongside its own `.jld2`). Reads it directly via
-    [`load_E_samples`](@ref) -- using the FILE's own recorded sample count,
-    `N_samples` is not consulted, there is nothing to resample -- and finds
-    its sibling `.jld2` (same directory/basename) for `d`, erroring if the
-    two files' own `T_max` disagree (they would not actually belong
-    together).
-
-Both modes return `jld2_path` too (the `source` itself in `:jld2` mode, the
-derived sibling in `:csv` mode) so a caller can chain further work that
-needs the full `.jld2` (e.g. [`load_jld2_run`](@ref) again for
-`SIM_SETTING`/full `PULSE_CONFIG` reconciliation) without re-deriving that
-path itself.
-
-Note the two modes source semantically different traces by convention in
-this file's own callers: `:jld2` mode is used to fit `control_cfg` ALONE
-(signal excluded, e.g. [`fit_composite_pulse_seed_auto`](@ref)), while
-`:csv` mode fits whatever `PULSE_CONFIG` subset the given `_pulsemat.csv`
-happens to contain (e.g. [`smoke_test_fit_from_pulsemat`](@ref), which reads
-a full-`PULSE_CONFIG` trace). This helper only unifies the MECHANICS of
-turning either source into `(t, Ex, Ep, d)` -- which `PULSE_CONFIG` subset
-ends up in a given file remains entirely up to how that file was produced.
-"""
-function _load_reference_trace(source::AbstractString; load_mode::Symbol=:jld2, N_samples::Integer=10001, n_signal::Integer=1)
-    if load_mode === :jld2
-        jld2_path = source
-        data = load_jld2_run(jld2_path)
-        CONFIG = build_full_config(data.SIM_SETTING, data.SYSTEM_CONFIG)
-        d = prepare_derived(CONFIG)
-        _, control_cfg = split_signal_control(data.PULSE_CONFIG; n_signal=n_signal)
-        t, Ex, Ep = _sample_control_cfg(control_cfg, d, N_samples)
-        return t, Ex, Ep, d, jld2_path
-    elseif load_mode === :csv
-        pulsemat_path = source
-        endswith(pulsemat_path, "_pulsemat.csv") || error(
-            "Expected a path ending in \"_pulsemat.csv\", got $pulsemat_path."
-        )
-        base = pulsemat_path[1:end-length("_pulsemat.csv")]
-        jld2_path = base * ".jld2"
-        isfile(jld2_path) || error(
-            "Expected the sibling run $jld2_path (same directory/basename as $pulsemat_path, " *
-            "the convention save_run_data writes both files under) -- not found."
-        )
-
-        t_end, Ex, Ep = load_E_samples(pulsemat_path)
-        N = length(Ex)
-        length(Ep) == N || error("_load_reference_trace: I/Q length mismatch $(N)/$(length(Ep)).")
-        t = collect(range(0.0, t_end; length=N))
-
-        data = load_jld2_run(jld2_path)
-        CONFIG = build_full_config(data.SIM_SETTING, data.SYSTEM_CONFIG)
-        d = prepare_derived(CONFIG)
-        isapprox(d.timespan[2] - d.timespan[1], t_end; rtol=1e-9) || error(
-            "T_max mismatch: $jld2_path's own SIM_SETTING.Ttotal implies T_max=" *
-            "$(d.timespan[2]-d.timespan[1])s, but $pulsemat_path's own metadata says " *
-            "t_end=$(t_end)s -- these two files don't actually belong together."
-        )
-        return t, Ex, Ep, d, jld2_path
-    else
-        error("load_mode must be :jld2 or :csv, got $(repr(load_mode)).")
-    end
-end
-
 # ============================================================
 # REFERENCE PIPELINE (shared with reference_run_workflow.ipynb)
 #
 # load_jld2_reference → run_reference_forward → reconcile_reference
-# → fit_linear_seed → optimise_composite_pulse
+#   PASS → fit_linear_seed (CONTROL) → optimise_composite_pulse (CONTROL)
+# FAIL at reconcile_reference refuses steps 7–8.
 # jld2_pipeline_defaults / jld2_optimizer_defaults are the knobs.
 # Changing a default here changes BOTH the loader and the notebook.
 # ============================================================
@@ -374,6 +190,53 @@ function jld2_optimizer_defaults()
         kappa_I=_DEFAULT_PENALTY_KAPPA,
         S_min=_DEFAULT_PENALTY_MIN,
         kappa_S=_DEFAULT_PENALTY_KAPPA,
+    )
+end
+
+# Control-trace sample count when no sibling *_pulsemat.csv exists and the
+# caller did not pass `fit_N`. Must be >= 2.
+const _DEFAULT_CONTROL_FIT_N = 10001
+
+# Names `optimise_composite_pulse` accepts beyond `jld2_optimizer_defaults()`.
+const _JLD2_OPTIMISER_EXTRA_KEYS = (:warm_start_u, :label_prefix)
+const _JLD2_SOLVER_KEYS = (:reltol, :abstol, :alg, :tstops)
+
+function _jld2_allowed_keys()
+    allowed = Set{Symbol}(keys(jld2_pipeline_defaults()))
+    union!(allowed, keys(jld2_optimizer_defaults()))
+    union!(allowed, _JLD2_OPTIMISER_EXTRA_KEYS)
+    union!(allowed, _JLD2_SOLVER_KEYS)
+    push!(allowed, :verbose)
+    return allowed
+end
+
+function _jld2_split_kwargs(kwargs)
+    caller = NamedTuple(kwargs)
+    verbose = haskey(caller, :verbose) ? caller.verbose : true
+    verbose isa Bool || error("verbose must be a Bool, got $(typeof(verbose)).")
+    merged = merge(jld2_pipeline_defaults(), jld2_optimizer_defaults(), caller)
+    allowed = _jld2_allowed_keys()
+    for k in keys(merged)
+        k in allowed || error(
+            "unknown keyword $(k) for the jld2 pipeline / optimise_control_pulse_from_jld2. " *
+            "Pipeline knobs: $(keys(jld2_pipeline_defaults())). " *
+            "Optimiser knobs: $(keys(jld2_optimizer_defaults())) plus $(_JLD2_OPTIMISER_EXTRA_KEYS). " *
+            "Solver extras: $(_JLD2_SOLVER_KEYS)."
+        )
+    end
+    pipe_keys = keys(jld2_pipeline_defaults())
+    pipe = NamedTuple{pipe_keys}(map(k -> getfield(merged, k), pipe_keys))
+    opt_pairs = Pair{Symbol,Any}[
+        k => v for (k, v) in pairs(merged) if k !== :verbose && !(k in pipe_keys)
+    ]
+    opt = (; opt_pairs...)
+    return pipe, opt, verbose
+end
+
+function _call_optimise_composite_pulse(k, n_coeff_A, n_coeff_f, d, signal_E_of_t, opt)
+    return optimise_composite_pulse(
+        Int(k), Int(n_coeff_A), Int(n_coeff_f), d;
+        signal_E_of_t=signal_E_of_t, opt...,
     )
 end
 
@@ -469,13 +332,12 @@ function build_E_of_t_from_samples(t::AbstractVector, Ex::AbstractVector, Ep::Ab
     Tspan > 0 || error("build_E_of_t_from_samples: t span must be positive, got $Tspan.")
     Ex_c = collect(Float64, Ex)
     Ep_c = collect(Float64, Ep)
-    n_f = n
     return function (tt)
-        x = (Float64(tt) - t0) / Tspan * (n_f - 1)
+        x = (Float64(tt) - t0) / Tspan * (n - 1)
         if x <= 0
             return complex(Ex_c[1], Ep_c[1])
-        elseif x >= n_f - 1
-            return complex(Ex_c[n_f], Ep_c[n_f])
+        elseif x >= n - 1
+            return complex(Ex_c[n], Ep_c[n])
         end
         i = floor(Int, x) + 1
         α = x - (i - 1)
@@ -594,6 +456,8 @@ function load_jld2_reference(
 
     hasproperty(data, :SIM_SETTING) || error("$jld2_path has no SIM_SETTING.")
     hasproperty(data, :SYSTEM_CONFIG) || error("$jld2_path has no SYSTEM_CONFIG.")
+    hasproperty(data.SIM_SETTING, :reltol) || error("$jld2_path SIM_SETTING has no reltol.")
+    hasproperty(data.SIM_SETTING, :abstol) || error("$jld2_path SIM_SETTING has no abstol.")
     CONFIG = build_full_config(data.SIM_SETTING, data.SYSTEM_CONFIG)
     d = prepare_derived(CONFIG)
 
@@ -603,8 +467,7 @@ function load_jld2_reference(
         pulse_source = :pulse_config
         pulse_source_reason = "parsed PULSE_CONFIG from $(basename(jld2_path))"
         sibling_n = _sibling_pulsemat_n_samples(jld2_path)
-        sibling_n !== nothing && sibling_n < 2 && (sibling_n = nothing)
-        fit_N_use = fit_N !== nothing ? Int(fit_N) : something(sibling_n, 10001)
+        fit_N_use = fit_N !== nothing ? Int(fit_N) : something(sibling_n, _DEFAULT_CONTROL_FIT_N)
         if fit_N !== nothing
             fit_N_source = "explicit fit_N"
         elseif sibling_n !== nothing
@@ -856,8 +719,9 @@ end
         param_budget=60, degree=3, taper_frac=0.1, verbose=true)
         -> (pulse, u_fit, fit_report, segments)
 
-Step 7: closed-form `fit_mode=:linear` seed from `ref`'s control I/Q
-(PULSE_CONFIG samples, or the CSV when PULSE_CONFIG was unavailable).
+Step 7: closed-form `fit_mode=:linear` seed of the **control pulse** from
+`ref`'s control I/Q (PULSE_CONFIG control segments, or the CSV when
+PULSE_CONFIG was unavailable). The signal is not in this fit.
 AUTO (all of `k`/`n_coeff_A`/`n_coeff_f` omitted) sizes the shape from
 `param_budget`. EXACT (all three given) fits that shape.
 """
@@ -882,6 +746,10 @@ function fit_linear_seed(
     )
 
     t, Ex, Ep, d = ref.control_t, ref.control_Ex, ref.control_Ep, ref.d
+    length(t) == length(Ex) == length(Ep) || error(
+        "fit_linear_seed: control trace lengths t/Ex/Ep = $(length(t))/$(length(Ex))/$(length(Ep)) must match."
+    )
+    length(t) >= 2 || error("fit_linear_seed: control trace has $(length(t)) sample(s); need >= 2.")
     if n_given == 0
         pulse, u_fit, fit_report, segments = fit_composite_pulse_from_samples(
             t, Ex, Ep, d; fit_mode=:linear, param_budget=param_budget,
@@ -914,96 +782,26 @@ function fit_linear_seed(
     return pulse, u_fit, fit_report, segments
 end
 
-function stage_jld2_run(path::AbstractString; load_mode::Symbol=:jld2, kwargs...)
-    load_mode === :csv && println(
-        "stage_jld2_run: load_mode=:csv is ignored; CSV is used only when PULSE_CONFIG cannot be parsed."
-    )
-    return load_jld2_reference(path; kwargs...)
-end
-fit_control_seed_from_staged(ref; kwargs...) = fit_linear_seed(ref; kwargs...)
-
 """
-    fit_composite_pulse_seed_auto(control_cfg, d; N_samples=10001, fit_mode=:linear, kwargs...)
+    fit_composite_pulse_seed_linear_exact(t, Ex, Ep, d, k, n_coeff_A, n_coeff_f;
+        degree=3, taper_frac=0.1, rel_thresh=1e-3, min_active_samples=5,
+        min_silence_samples=3, cA_floor_frac, cf_clip_mult)
         -> (pulse::CompositePulse, u_fit, fit_report, segments)
 
-Thin convenience wrapper around
-[`fit_composite_pulse_from_samples`](@ref) for a recorded `PULSE_CONFIG`'s
-control segments: samples `control_cfg` (via [`_sample_control_cfg`](@ref),
-`pulses.jl`'s [`build_E_of_t`](@ref)/[`sample_E_of_t`](@ref) underneath) at
-`N_samples` evenly spaced points over `[0, d.timespan[2]-d.timespan[1]]`,
-then discovers `k` and sizes `n_coeff_A`/`n_coeff_f` from that sampled trace
-ITSELF rather than from `control_cfg`'s own labelled entry count -- unlike
-[`fit_composite_pulse_seed`](@ref) (which assumes `k == length(control_cfg)`
-and takes a caller-built `pulse` with caller-chosen coefficient counts),
-this makes no such assumption: it would work identically on a raw sampled
-trace with no `PULSE_CONFIG` behind it at all.
-
-`fit_mode` (`:linear` default, or `:learned`) and every other keyword are
-forwarded straight to [`fit_composite_pulse_from_samples`](@ref) -- see that
-function's own docstring for what each mode does and which extra keywords
-it accepts (`cA_floor_frac`/`segments` for `:linear`;
-`num_epochs`/`learning_rate`/`seed` for `:learned`). `N_samples=10001`
-matches the Nyquist-safe default this package's own optimisation pipeline
-([`optimise_control_pulse_from_jld2`](@ref)) uses everywhere else -- pass a
-smaller value explicitly if a coarser/faster fit is acceptable.
-"""
-function fit_composite_pulse_seed_auto(control_cfg, d; N_samples::Integer=10001, fit_mode::Symbol=:linear, kwargs...)
-    t, Ex, Ep = _sample_control_cfg(control_cfg, d, N_samples)
-    return fit_composite_pulse_from_samples(t, Ex, Ep, d; fit_mode=fit_mode, kwargs...)
-end
-
-"""
-    fit_composite_pulse_seed_linear_exact(control_cfg, d, k, n_coeff_A, n_coeff_f;
-        N_samples=10001, degree=3, taper_frac=0.1,
-        rel_thresh=1e-3, min_active_samples=5, min_silence_samples=3, kwargs...)
-        -> (pulse::CompositePulse, u_fit, fit_report, segments)
-
-Like [`fit_composite_pulse_seed_auto`](@ref) with `fit_mode=:linear`
-(closed-form linear least-squares, NEVER `ForwardDiff`/Adam -- see that
-function's own docstring for why), but for the EXACT `(k, n_coeff_A, n_coeff_f)` shape the
-caller already needs (e.g. because [`optimise_control_pulse_from_jld2`](@ref)
-is about to hand `u_fit` straight to `optimise_composite_pulse(k,
-n_coeff_A, n_coeff_f, d; warm_start_u=u_fit, ...)`, which requires an EXACT
-length match), rather than whatever `k`/`n_coeff` the trace's own segment
-detection happens to size things at.
-
-Requires `n_coeff_A == n_coeff_f` (the `fit_mode=:linear` implementation
-has no separate amplitude/frequency coefficient count -- one shared
-`n_coeff` sizes both). Samples `control_cfg` at `N_samples` points (same as
-[`fit_composite_pulse_seed_auto`](@ref)), detects sub-pulse segments
-([`_detect_subpulse_segments`](@ref), `rel_thresh`/`min_active_samples`/
-`min_silence_samples` forwarded to it), and requires the detected count to
-equal `k` exactly -- errors clearly (not silently) if the trace's own
-structure doesn't match the requested `k`, since there is no way to force a
-DIFFERENT `k` onto segments that were never fit to being merged/split.
-Given that, `points_per_segment` is back-solved (inverting
-[`_spline_coeff_count`](@ref)'s own `n_pieces = ceil(n_samples/pps)`,
-`n_coeff = n_pieces + degree`) to the LARGEST value that still gives EXACTLY
-`n_coeff_A` from the longest detected segment's own sample count -- not
-`param_budget`-style "at most", since an exact `CompositePulse(k,
-n_coeff_A, n_coeff_f, d)` match is required here, not just a budget.
-`kwargs` are forwarded to [`_fit_composite_pulse_from_samples_linear`](@ref)
-(`cA_floor_frac`, `cf_clip_mult`).
-
-`N_samples` must be dense enough, relative to `control_cfg`'s own fastest
-chirp/bandwidth, to avoid ALIASING the phase unwrap
-([`_instantaneous_frequency`](@ref)) that `cf`'s own linear solve fits
-against -- a WURST segment's instantaneous frequency can approach its own
-`bandwidth/2`, and Nyquist then requires `N_samples/T_max` comfortably above
-that. Undersampling does NOT show up as an error -- it silently produces a
-seemingly normal but badly WRONG fit (near-perfect `rel_l2_A`, since
-amplitude is untouched, but `rel_l2_f`/`phi_rms_rad` far from `0`, `rel_l2_complex`
-even above `1` in bad cases) -- if a fit like that comes back unexpectedly
-bad, raise `N_samples` (e.g. to the source run's own `SIM_SETTING.Nt_save`,
-which is guaranteed dense enough to have reproduced this exact pulse in the
-first place) before suspecting the fit itself.
+Closed-form `fit_mode=:linear` fit of an already-sampled control trace
+`(t, Ex, Ep)` into the EXACT `(k, n_coeff_A, n_coeff_f)` shape
+[`fit_linear_seed`](@ref) / [`optimise_control_pulse_from_jld2`](@ref)
+will hand to `optimise_composite_pulse` as `warm_start_u`. Requires
+`n_coeff_A == n_coeff_f`. Detected segment count must equal `k`.
+`cA_floor_frac` / `cf_clip_mult` are forwarded to
+[`_fit_composite_pulse_from_samples_linear`](@ref).
 """
 function fit_composite_pulse_seed_linear_exact(
     t::AbstractVector, Ex::AbstractVector, Ep::AbstractVector, d,
     k::Integer, n_coeff_A::Integer, n_coeff_f::Integer;
     degree::Integer=3, taper_frac::Real=0.1,
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
-    kwargs...,
+    cA_floor_frac::Real=_GRAD_SAFE_FRAC, cf_clip_mult::Real=20.0,
 )
     n_coeff_A == n_coeff_f || error(
         "fit_composite_pulse_seed_linear_exact requires n_coeff_A == n_coeff_f " *
@@ -1062,7 +860,7 @@ function fit_composite_pulse_seed_linear_exact(
 
     pulse, u_fit, fit_report, segments = _fit_composite_pulse_from_samples_linear(
         t, Ex, Ep, d; points_per_segment=points_per_segment, degree=degree, taper_frac=taper_frac,
-        segments=segments, kwargs...,
+        segments=segments, cA_floor_frac=cA_floor_frac, cf_clip_mult=cf_clip_mult,
     )
     (pulse.k == k && pulse.n_coeff_A == n_coeff_A && pulse.n_coeff_f == n_coeff_f) || error(
         "internal inconsistency: fit_composite_pulse_seed_linear_exact computed " *
@@ -1074,182 +872,6 @@ function fit_composite_pulse_seed_linear_exact(
     return pulse, u_fit, fit_report, segments
 end
 
-function fit_composite_pulse_seed_linear_exact(
-    control_cfg, d, k::Integer, n_coeff_A::Integer, n_coeff_f::Integer;
-    N_samples::Integer=10001, degree::Integer=3, taper_frac::Real=0.1,
-    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
-    kwargs...,
-)
-    t, Ex, Ep = _sample_control_cfg(control_cfg, d, N_samples)
-    return fit_composite_pulse_seed_linear_exact(
-        t, Ex, Ep, d, k, n_coeff_A, n_coeff_f;
-        degree=degree, taper_frac=taper_frac, rel_thresh=rel_thresh,
-        min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
-        kwargs...,
-    )
-end
-
-"""
-    smoke_test_fit_from_pulsemat(pulsemat_path;
-        fit_mode=:linear, out_dir=nothing, points_per_segment=nothing, param_budget=nothing,
-        degree=3, taper_frac=0.1, rel_thresh=1e-3, min_active_samples=5,
-        min_silence_samples=3, cA_floor_frac=_GRAD_SAFE_FRAC, cf_clip_mult=20.0,
-        num_epochs=1000, learning_rate=0.002, seed=42)
-        -> (pulse, u_fit, fit_report, segments, diff_report, paths)
-
-Pass `param_budget` (e.g. `60`) to cap the fitted `CompositePulse`'s total
-raw parameter count directly, instead of hand-picking `points_per_segment`
--- see [`points_per_segment_for_budget`](@ref)/
-[`fit_composite_pulse_from_samples`](@ref)'s own docstring for the
-sizing rule; forwarded to whichever `fit_mode` selects, and OVERRIDES
-`points_per_segment` (this function's own `pps` default of `6`/`22`) when
-given. A large real trace's default `points_per_segment` can otherwise size
-`n_coeff` into the hundreds per sub-pulse (see that docstring), which is
-fine for a forward-simulation fit but not for a subsequent gradient-based
-`optimise_composite_pulse` warm-start.
-
-End-to-end smoke test of the sample-derived seed-fitting pipeline
-([`fit_composite_pulse_from_samples`](@ref)) against a REAL recorded pulse,
-given nothing but its `_pulsemat.csv`:
-
-  1. Loads `pulsemat_path` and its SIBLING `.jld2` run via
-     [`_load_reference_trace`](@ref) (`load_mode=:csv`): the raw
-     `(t, I, Q)` trace comes straight from [`load_E_samples`](@ref) (`t`
-     reconstructed as `range(0.0, t_end; length=N)`, the same grid
-     [`sample_E_of_t`](@ref) wrote it on), and `d` from the sibling run --
-     same directory, same basename, `.jld2` (the convention
-     [`save_run_data`](@ref) writes both files under) -- via
-     `build_full_config`/`prepare_derived`, exactly like
-     [`optimise_control_pulse_from_jld2`](@ref) does. This is where the
-     cavity/ensemble parameters (`kappa_e`, `g_mean`, `FWHM`, ...) that
-     `CompositePulse`'s own `amp_scale`/`freq_scale` need come from --
-     they are NOT recoverable from `_pulsemat.csv` alone. Errors loudly if
-     the sibling `.jld2`'s own `SIM_SETTING.Ttotal` disagrees with the
-     CSV's own `t_end_us` metadata (the two files not actually belonging
-     together).
-  2. Fits a `CompositePulse` seed directly from the trace via
-     [`fit_composite_pulse_from_samples`](@ref): `fit_mode=:linear`
-     (default) is closed-form, practical at a real trace's sample density;
-     `fit_mode=:learned` is `ForwardDiff`/Adam instead -- expect this to
-     be drastically slower, see that function's own docstring.
-  3. Saves the fit's full parameterisation to `<basename>_fitparas.jld2`
-     (same shape/convention as
-     [`save_optimised_pulse_parameters`](@ref)'s `_opt_pulsepara.jld2`,
-     plus this fit's own `fit_report`/`segments`/source paths).
-  5. Resamples the FITTED pulse (`build_E_of_t(pulse, u_fit)`) at the same
-     `N` evenly-spaced points the original trace was recorded at, saving
-     it to `<basename>_fitpulsemat.csv` via the existing
-     [`sample_E_of_t`](@ref)/[`save_E_samples`](@ref) (identical format to
-     every other `_pulsemat.csv` in this package, so it round-trips
-     through [`load_E_samples`](@ref) the same way).
-  6. Saves the point-wise `(I - I_fit, Q - Q_fit)` residual to
-     `<basename>_fitsamplediff.csv`, same CSV format again.
-
-`out_dir` redirects the three OUTPUT files elsewhere; the SOURCE `.jld2`
-run is always read from next to `pulsemat_path` regardless.
-
-Returns `(pulse, u_fit, fit_report, segments, diff_report, paths)`.
-`diff_report = (rel_l2, max_abs_diff)`: `rel_l2 =
-sqrt(sum(abs2,diff)/sum(abs2,target))` computed on the FULL COMPLEX
-difference (unlike `fit_report`'s own `rel_l2_A`/`rel_l2_f`, which score
-amplitude/frequency separately) -- this is the smoke test's actual
-pass/fail signal, since it round-trips through the real CSV format a
-caller would use rather than just checking the in-memory arrays
-[`fit_composite_pulse_from_samples`](@ref) was unit-tested against. `paths =
-(source_pulsemat=..., source_jld2=..., fitparas=..., fitpulsemat=...,
-fitsamplediff=...)`.
-
-Do not be surprised to see a large `diff_report.rel_l2` only when the
-source trace is a genuinely different functional family from a clamped
-B-spline (WURST `tanh`/`sin^n`/quadratic chirp vs this seed) -- the
-per-sub-pulse absolute phase is now a `CompositePulse` parameter
-(`raw_phi0`, recovered by the `:linear` fitter), so a recorded phase
-offset at sub-pulse 1 is no longer an unfixable reconstruction rotation.
-"""
-function smoke_test_fit_from_pulsemat(
-    pulsemat_path::AbstractString;
-    fit_mode::Symbol=:linear,
-    out_dir=nothing,
-    points_per_segment::Union{Integer,Nothing}=nothing,
-    param_budget::Union{Integer,Nothing}=nothing,
-    degree::Integer=3, taper_frac::Real=0.1,
-    rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
-    cA_floor_frac::Real=_GRAD_SAFE_FRAC, cf_clip_mult::Real=20.0,
-    num_epochs::Integer=1000, learning_rate::Real=0.002, seed::Integer=42,
-)
-    t, Ex, Ep, d, jld2_path = _load_reference_trace(pulsemat_path; load_mode=:csv)
-    N = length(Ex)
-    base = jld2_path[1:end-length(".jld2")]
-
-    out_base = out_dir === nothing ? base : joinpath(out_dir, basename(base))
-    isempty(dirname(out_base)) || mkpath(dirname(out_base))
-    fitparas_path = out_base * "_fitparas.jld2"
-    fitpulsemat_path = out_base * "_fitpulsemat.csv"
-    fitsamplediff_path = out_base * "_fitsamplediff.csv"
-
-    pps = points_per_segment === nothing ? (fit_mode === :linear ? 6 : 22) : points_per_segment
-    mode_kwargs = fit_mode === :linear ?
-        (cA_floor_frac=cA_floor_frac,) :
-        (num_epochs=num_epochs, learning_rate=learning_rate, seed=seed)
-    pulse, u_fit, fit_report, segments = fit_composite_pulse_from_samples(
-        t, Ex, Ep, d; fit_mode=fit_mode, points_per_segment=pps,
-        degree=degree, taper_frac=taper_frac, rel_thresh=rel_thresh,
-        min_active_samples=min_active_samples, min_silence_samples=min_silence_samples,
-        cf_clip_mult=cf_clip_mult, param_budget=param_budget, mode_kwargs...,
-    )
-
-    t_start, t_end_decoded, phi0, cA, cf = decode(pulse, u_fit)
-    fitparas = (
-        source_pulsemat=pulsemat_path, source_jld2=jld2_path,
-        k=pulse.k, n_coeff_A=pulse.n_coeff_A, n_coeff_f=pulse.n_coeff_f,
-        degree=pulse.degree, taper_frac=pulse.taper_frac,
-        T_max=pulse.T_max, gap_scale=pulse.gap_scale, dur_scale=pulse.dur_scale,
-        dur_floor=pulse.dur_floor, amp_scale=pulse.amp_scale, freq_scale=pulse.freq_scale,
-        u_fit=collect(u_fit),
-        t_start=collect(t_start), t_end=collect(t_end_decoded), phi0=collect(phi0),
-        cA=collect(cA), cf=collect(cf),
-        fit_report=fit_report, segments=segments, fit_mode=fit_mode,
-    )
-    JLD2.save(fitparas_path, "data", fitparas)
-
-    E_fit = build_E_of_t(pulse, u_fit)
-    Ex_fit, Ep_fit = sample_E_of_t(E_fit, pulse.T_max, N; savepath=fitpulsemat_path)
-
-    dEx = Ex .- Ex_fit
-    dEp = Ep .- Ep_fit
-
-    target_energy = sum(abs2, Ex) + sum(abs2, Ep) + 1e-30
-    diff_energy = sum(abs2, dEx) + sum(abs2, dEp)
-    rel_l2 = sqrt(diff_energy / target_energy)
-    max_abs_diff = max(maximum(abs, dEx), maximum(abs, dEp))
-    diff_report = (rel_l2=rel_l2, max_abs_diff=max_abs_diff)
-
-    # rel_l2 here is exactly _fit_composite_pulse_from_samples_linear's own
-    # rel_l2_complex (fit_mode=:linear only -- same grid, same build_E_of_t,
-    # same target) -- carried
-    # into the CSV's own metadata line so the fit-quality number sits next
-    # to the raw per-sample differences it summarises, not just in-memory.
-    save_E_samples(
-        hcat(dEx, dEp), t[end], fitsamplediff_path;
-        extra_meta="rel_l2_complex,$(rel_l2),max_abs_diff,$(max_abs_diff)",
-    )
-
-    println(
-        "Smoke test: fit k=$(pulse.k) sub-pulses from $(length(segments)) detected segments, " *
-        "N=$N samples. rel_l2 (complex, full trace) = $(round(rel_l2, sigdigits=4)), " *
-        "max|diff| = $(round(max_abs_diff, sigdigits=4))."
-    )
-    println("  fitparas      -> $fitparas_path")
-    println("  fitpulsemat   -> $fitpulsemat_path")
-    println("  fitsamplediff -> $fitsamplediff_path")
-
-    paths = (
-        source_pulsemat=pulsemat_path, source_jld2=jld2_path,
-        fitparas=fitparas_path, fitpulsemat=fitpulsemat_path, fitsamplediff=fitsamplediff_path,
-    )
-    return pulse, u_fit, fit_report, segments, diff_report, paths
-end
-
 """
     _final_inversion(Sigma_z, N_total) -> Float64
 
@@ -1258,7 +880,7 @@ SINGLE (final) state -- `0` for the fully-ground ensemble, `1` for fully
 inverted, matching `Sigma_z = Σ_j Sz_j`'s own `[-N_total/2, N_total/2]`
 physical range (each bin's own `Sz_j` ranges over `[-Nj/2, Nj/2]`).
 Deliberately final-state-only, not a trajectory summary -- see
-[`run_sim_1st_order_final`](@ref)/[`reconcile_against_jld2`](@ref)'s own
+[`run_sim_1st_order_final`](@ref)/[`reconcile_reference`](@ref)'s own
 docstrings for why this package's `.jld2` reconciliation checks avoid a
 full-trajectory CPU solve wherever the endpoint alone answers the question.
 """
@@ -1274,8 +896,8 @@ reuses the SAME `rhs_1st_order!`/ensemble machinery, just saving every
 requested time point instead of one. `Sp`/`Sz` are returned as `(Nt, M)`
 matrices (one row per saved time point, matching this package's own
 `Sp_sol`/`Sz_sol` orientation from `run_sim_1st_order`). Used by
-[`reconcile_against_jld2`](@ref) to compare against a saved run's own
-recorded trajectory.
+[`generate_3arp_pi_pulse`](@ref) and datagen; the jld2 reconcile path
+uses [`run_sim_1st_order_final`](@ref) (endpoint only).
 """
 function run_sim_1st_order_trajectory(
     E_of_t, d;
@@ -1303,8 +925,8 @@ end
 
 Default absolute-error floor (`100 * abstol_solve`) for a final-state
 `a`/`Σp`/`Σz` comparison against a saved run -- shared by
-[`reconcile_against_jld2`](@ref) and [`optimise_control_pulse_from_jld2`](@ref)'s
-own seed-quality check, both of which compare a freshly-simulated FINAL
+[`reconcile_reference`](@ref) and [`optimise_control_pulse_from_jld2`](@ref),
+both of which compare a freshly-simulated FINAL
 state against a recorded one. An endpoint that happens to be near-zero
 (e.g. the cavity field after a completed pi-pulse) makes a PURELY relative
 comparison hypersensitive to ordinary solver-noise-level absolute error --
@@ -1327,7 +949,7 @@ step. `Sp`/`Sz` are the per-bin, length-`M` state AT THE FINAL TIME (same
 shape [`run_sim_1st_order_pure`](@ref) returns for a `CompositePulse`, here
 for an arbitrary `E_of_t` closure instead). Cheaper than
 [`run_sim_1st_order_trajectory`](@ref) whenever only the ENDPOINT is
-needed -- e.g. [`reconcile_against_jld2`](@ref)'s own sanity check against
+needed -- e.g. [`reconcile_reference`](@ref)'s own sanity check against
 a saved run's final `a_sol[end]`/`Σp_sol[end]`/`Σz_sol[end]`, which does not
 need every intermediate saved timepoint the way a peak-inversion-timing
 check does.
@@ -1347,77 +969,6 @@ function run_sim_1st_order_final(
         save_mode=:final, compute=compute_eff,
     )
     return a, Sp, Sz
-end
-
-"""
-    reconcile_against_jld2(path; n_signal=1, rtol=1e-3, atol=nothing, reltol=nothing, abstol=nothing, verbose=true) -> (ok, report, data, d)
-
-Loads `path`, reconstructs the run's own ORIGINAL signal+control drive
-EXACTLY as recorded in `data.PULSE_CONFIG` (signal always included here,
-regardless of what `use_signal` a subsequent optimisation run will use --
-this function's whole job is to validate against what the file actually
-recorded, which was produced WITH the signal pulse present), re-solves with
-[`run_sim_1st_order_final`](@ref) (this package's own CPU 1st-order physics
--- the SAME equations `run_sim_1st_order` used to produce `path` in the
-first place, just without the GPU/callback/file-I/O machinery) for ONLY the
-FINAL state, and checks that against `data`'s own saved
-`a_sol[end]`/`Σp_sol[end]`/`Σz_sol[end]` to relative tolerance `rtol`
-(`atol` is an absolute floor added to each comparison's scale, guarding
-against division by a near-zero saved value -- e.g. the cavity field after
-a completed pi-pulse; defaults to `100 * abstol_solve`, the solve's own
-absolute tolerance, rather than `0`, since a purely relative comparison
-against a near-zero endpoint is hypersensitive to ordinary solver-noise-
-level absolute error). `reltol`/`abstol` default to
-`data.SIM_SETTING`'s own values (the tolerances the file was originally
-produced with), so the comparison is as apples-to-apples as reasonably
-possible; `tstops` is deliberately left empty here too, matching
-`run_sim_1st_order`'s own solve call (no `tstops`), so the adaptive
-stepper behaves the same way it would have during the original production
-run.
-
-Deliberately checks only the ENDPOINT, not the full trajectory (unlike an
-earlier version of this function, which used
-[`run_sim_1st_order_trajectory`](@ref) and compared every saved timepoint)
--- a full-trajectory CPU solve over a large ensemble has no GPU
-acceleration and can take far longer than the original GPU-produced run
-itself for no real gain here: this check exists to catch a
-parsing/ensemble/physics MISMATCH between this port and the file's own
-provenance (wrong config, wrong RHS, wrong drive), which an endpoint
-mismatch already reveals just as reliably as a pointwise one would, at a
-fraction of the cost. [`optimise_control_pulse_from_jld2`](@ref)'s own
-seed-quality gate follows the same final-state-only philosophy (see
-[`run_sim_1st_order_final`](@ref)/[`_final_inversion`](@ref)), rather than
-comparing a fitted seed's full trajectory against the recorded one.
-
-Returns `(ok::Bool, report::NamedTuple, data, d)` -- `report` holds
-`rel_a`/`rel_p`/`rel_z` (and their absolute counterparts, all scalars now),
-plus `inversion` -- the collective FINAL inversion fraction
-([`_final_inversion`](@ref)) of this SAME `:ground`-track solve (the
-default `initial_condition` this function's own `run_sim_1st_order_final`
-call uses), at no extra ODE-solve cost -- for inspection regardless of
-`ok`. This is a REQUIRED gate before
-[`optimise_control_pulse_from_jld2`](@ref) proceeds to optimisation --
-any parsing/ensemble/physics mismatch between this port and the file's
-own provenance is caught here before it can silently corrupt an
-"optimised" pulse built on the wrong physics.
-"""
-function reconcile_against_jld2(
-    path::AbstractString;
-    n_signal::Integer=jld2_pipeline_defaults().n_signal,
-    use_signal::Bool=jld2_pipeline_defaults().use_signal,
-    rtol::Real=jld2_pipeline_defaults().rtol_check,
-    atol=jld2_pipeline_defaults().atol_check,
-    reltol=jld2_pipeline_defaults().check_reltol,
-    abstol=jld2_pipeline_defaults().check_abstol,
-    compute::Symbol=jld2_optimizer_defaults().compute,
-    verbose::Bool=true,
-)
-    ref = load_jld2_reference(path; n_signal=n_signal, use_signal=use_signal, verbose=verbose)
-    forward = run_reference_forward(
-        ref; reltol=reltol, abstol=abstol, compute=compute, verbose=verbose,
-    )
-    ok, report = reconcile_reference(ref, forward; rtol=rtol, atol=atol, verbose=verbose)
-    return ok, report, ref.data, ref.d
 end
 
 """
@@ -1533,10 +1084,7 @@ convention [`load_jld2_run`](@ref) already reads):
   - `benchmark_metrics` -- `(inversion, duration, silencing, coherence)` of
     the SOURCE FILE's own original, unfitted pulse (never the optimised
     CompositePulse), as computed by
-    [`optimise_control_pulse_from_jld2`](@ref)'s own reconciliation step;
-    `nothing` if that caller passed `reconcile=false` (nothing to
-    benchmark against in that case) -- see that function's own docstring
-    for exactly how each field is computed
+    [`run_reference_forward`](@ref); `nothing` if the caller omitted it
   - `initial_u` (the candidate pulse's own raw parameterisation, `u0`,
     used only after reconciliation passed)
   - `initial_metrics` (`(cost, inversion, silencing, duration, coherence)`
@@ -1613,7 +1161,15 @@ function save_optimisation_run_log(
     JLD2.save(optrunlog_path, "data", run_log)
     println("Saved optimisation run log to $optrunlog_path")
 
-    N = pulsemat_N === nothing ? data.SIM_SETTING.Nt_save : pulsemat_N
+    N = if pulsemat_N === nothing
+        hasproperty(data.SIM_SETTING, :Nt_save) || error(
+            "save_optimisation_run_log: pulsemat_N was not given and SIM_SETTING has no Nt_save."
+        )
+        data.SIM_SETTING.Nt_save
+    else
+        Int(pulsemat_N)
+    end
+    N >= 2 || error("save_optimisation_run_log: pulsemat sample count must be >= 2, got $N.")
     control_E_of_t = build_E_of_t(pulse, best_u)
     sample_E_of_t(control_E_of_t, pulse.T_max, N; savepath=pulsemat_path)
 
@@ -1635,16 +1191,20 @@ Linear pipeline:
        solves. Those metrics are the reference metrics.
   6.   [`reconcile_reference`](@ref) — if the file stores results, compare
        this run's final-state outputs and metrics against them; if it stores
-       none, auto-PASS. FAIL refuses to continue.
-  7.   [`fit_linear_seed`](@ref) — `fit_mode=:linear` on `PULSE_CONFIG`
-       (or the CSV). Skipped if `fit_seed_from_file=false` or `warm_start_u`
+       none, auto-PASS. FAIL refuses to continue. PASS is the gate that
+       lets steps 7–8 call `pulse_optimizer2.jl`.
+  7.   [`fit_linear_seed`](@ref) — `fit_mode=:linear` of the **control
+       pulse** (`PULSE_CONFIG` control segments, or the CSV). Signal is
+       not fit. Skipped if `fit_seed_from_file=false` or `warm_start_u`
        is passed.
-  8.   [`optimise_composite_pulse`](@ref) (`pulse_optimizer2.jl`) on the
-       same reference ensemble `d`, warm-started from the seed, with the
-       parsed signal as a fixed background.
+  8.   [`optimise_composite_pulse`](@ref) (`pulse_optimizer2.jl`) optimises
+       that same **control pulse** on the reference ensemble `d`,
+       warm-started from the seed. Parsed signal is a fixed background
+       (`signal_E_of_t`), never in `u`.
 
 Knobs: [`jld2_pipeline_defaults`](@ref) and [`jld2_optimizer_defaults`](@ref).
-Caller kwargs overlay both. The notebook calls the same helpers in this order.
+Caller kwargs overlay both; unknown names error rather than being splat
+into the optimiser. The notebook calls the same helpers in this order.
 """
 function optimise_control_pulse_from_jld2(
     path::AbstractString,
@@ -1659,10 +1219,7 @@ function optimise_control_pulse_from_jld2(
         "(AUTO mode) — got k=$k, n_coeff_A=$n_coeff_A, n_coeff_f=$n_coeff_f."
     )
 
-    merged = merge(jld2_pipeline_defaults(), jld2_optimizer_defaults(), NamedTuple(kwargs))
-    pipe_keys = keys(jld2_pipeline_defaults())
-    pipe = NamedTuple{pipe_keys}(map(k -> getfield(merged, k), pipe_keys))
-    opt_kwargs = NamedTuple(k => v for (k, v) in pairs(merged) if !(k in pipe_keys))
+    pipe, opt_kwargs, verbose = _jld2_split_kwargs(kwargs)
 
     seed_fit_will_run = pipe.fit_seed_from_file && !haskey(opt_kwargs, :warm_start_u)
     seed_fit_will_run || n_given == 3 || error(
@@ -1670,25 +1227,25 @@ function optimise_control_pulse_from_jld2(
         "(warm_start_u was provided, or fit_seed_from_file=false)."
     )
 
-    println("=== 1–4  load_jld2_reference ===")
+    verbose && println("=== 1–4  load_jld2_reference ===")
     ref = load_jld2_reference(
         path; n_signal=pipe.n_signal, use_signal=pipe.use_signal,
-        fit_N=pipe.fit_N, verbose=true,
+        fit_N=pipe.fit_N, verbose=verbose,
     )
     data = ref.data
     d = ref.d
     signal_E_of_t = ref.signal_E_of_t
 
-    println("=== 5  run_reference_forward (:ground + :equator) ===")
+    verbose && println("=== 5  run_reference_forward (:ground + :equator) ===")
     forward = run_reference_forward(
         ref; reltol=pipe.check_reltol, abstol=pipe.check_abstol,
-        compute=opt_kwargs.compute, verbose=true,
+        compute=opt_kwargs.compute, verbose=verbose,
     )
     reference_metrics = forward.metrics
 
-    println("=== 6  reconcile_reference ===")
-    ok, report = reconcile_reference(
-        ref, forward; rtol=pipe.rtol_check, atol=pipe.atol_check, verbose=true,
+    verbose && println("=== 6  reconcile_reference ===")
+    ok, _ = reconcile_reference(
+        ref, forward; rtol=pipe.rtol_check, atol=pipe.atol_check, verbose=verbose,
     )
     ok || error(
         "Reconciliation against $(ref.jld2_path) FAILED — refusing to optimise " *
@@ -1698,22 +1255,24 @@ function optimise_control_pulse_from_jld2(
 
     seed_fit_report = nothing
     if seed_fit_will_run
-        println("=== 7  fit_linear_seed (fit_mode=:linear) ===")
+        verbose && println("=== 7  fit_linear_seed (CONTROL pulse, fit_mode=:linear) ===")
         seed_pulse, u_fit, fit_report, _ = fit_linear_seed(
             ref; k=k, n_coeff_A=n_coeff_A, n_coeff_f=n_coeff_f,
             param_budget=pipe.param_budget,
             degree=opt_kwargs.degree, taper_frac=opt_kwargs.taper_frac,
+            verbose=verbose,
         )
         k, n_coeff_A, n_coeff_f = seed_pulse.k, seed_pulse.n_coeff_A, seed_pulse.n_coeff_f
         opt_kwargs = merge(opt_kwargs, (warm_start_u=u_fit,))
         seed_fit_report = (u_fit=u_fit, fit_report=fit_report)
     end
-    @assert k !== nothing && n_coeff_A !== nothing && n_coeff_f !== nothing
+    k === nothing && error("internal error: k is unset after the seed-fit branch.")
+    n_coeff_A === nothing && error("internal error: n_coeff_A is unset after the seed-fit branch.")
+    n_coeff_f === nothing && error("internal error: n_coeff_f is unset after the seed-fit branch.")
 
-    println("=== 8  optimise_composite_pulse (pulse_optimizer2.jl) ===")
-    best_u, best_cost, pulse, u0, initial_metrics, history, final_metrics, optimizer_settings = optimise_composite_pulse(
-        k, n_coeff_A, n_coeff_f, d; signal_E_of_t=signal_E_of_t, opt_kwargs...,
-    )
+    verbose && println("=== 8  optimise_composite_pulse (CONTROL pulse, pulse_optimizer2.jl) ===")
+    best_u, best_cost, pulse, u0, initial_metrics, history, final_metrics, optimizer_settings =
+        _call_optimise_composite_pulse(k, n_coeff_A, n_coeff_f, d, signal_E_of_t, opt_kwargs)
 
     if pipe.save_log
         full_settings = merge(
@@ -1732,81 +1291,4 @@ function optimise_control_pulse_from_jld2(
     end
 
     return best_u, best_cost, pulse, signal_E_of_t, d, data, seed_fit_report, reference_metrics
-end
-
-"""
-    optimise_control_pulse_from_jld2_over_k(path, n_coeff_A, n_coeff_f; kwargs...)
-        -> (result, signal_E_of_t, d, data)
-
-Same steps 1–6 as [`optimise_control_pulse_from_jld2`](@ref), then
-[`optimise_composite_pulse_over_k`](@ref) instead of a single-k linear seed
-+ [`optimise_composite_pulse`](@ref).
-"""
-function optimise_control_pulse_from_jld2_over_k(
-    path::AbstractString,
-    n_coeff_A::Integer, n_coeff_f::Integer;
-    kinds=(:hs1, :corpse, :bb1),
-    specs=nothing,
-    threaded::Bool=true,
-    Omega_max=nothing,
-    beta=nothing,
-    mu=nothing,
-    kwargs...,
-)
-    merged = merge(jld2_pipeline_defaults(), jld2_optimizer_defaults(), NamedTuple(kwargs))
-    pipe_keys = keys(jld2_pipeline_defaults())
-    pipe = NamedTuple{pipe_keys}(map(k -> getfield(merged, k), pipe_keys))
-    opt_kwargs = NamedTuple(k => v for (k, v) in pairs(merged) if !(k in pipe_keys))
-
-    println("=== 1–4  load_jld2_reference ===")
-    ref = load_jld2_reference(
-        path; n_signal=pipe.n_signal, use_signal=pipe.use_signal,
-        fit_N=pipe.fit_N, verbose=true,
-    )
-    data = ref.data
-    d = ref.d
-    signal_E_of_t = ref.signal_E_of_t
-
-    println("=== 5  run_reference_forward (:ground + :equator) ===")
-    forward = run_reference_forward(
-        ref; reltol=pipe.check_reltol, abstol=pipe.check_abstol,
-        compute=opt_kwargs.compute, verbose=true,
-    )
-
-    println("=== 6  reconcile_reference ===")
-    ok, report = reconcile_reference(
-        ref, forward; rtol=pipe.rtol_check, atol=pipe.atol_check, verbose=true,
-    )
-    ok || error(
-        "Reconciliation against $(ref.jld2_path) FAILED — refusing to optimise " *
-        "against physics this port hasn't verified it can reproduce. " *
-        "Inspect the printed errors above."
-    )
-
-    seed_use = haskey(opt_kwargs, :seed) ? opt_kwargs.seed : 42
-    opt_fwd = Base.structdiff(opt_kwargs, NamedTuple{(:seed,)})
-    result = optimise_composite_pulse_over_k(
-        n_coeff_A, n_coeff_f, d;
-        kinds=kinds, specs=specs, threaded=threaded,
-        Omega_max=Omega_max, beta=beta, mu=mu, seed=seed_use,
-        signal_E_of_t=signal_E_of_t, opt_fwd...,
-    )
-
-    if pipe.save_log
-        full_settings = merge(
-            (pulse_source=ref.pulse_source, rtol_check=pipe.rtol_check, atol_check=pipe.atol_check,
-             check_reltol=pipe.check_reltol, check_abstol=pipe.check_abstol,
-             n_signal=pipe.n_signal, USE_SIGNAL=pipe.use_signal, kinds=collect(kinds)),
-            result.optimizer_settings,
-        )
-        save_optimisation_run_log(
-            ref.jld2_path, data, d, result.pulse, signal_E_of_t, pipe.n_signal, pipe.use_signal,
-            result.u0, result.initial_metrics, result.best_u, result.final_metrics,
-            result.history, full_settings;
-            out_dir=pipe.log_out_dir, pulsemat_N=pipe.pulsemat_N,
-            benchmark_metrics=forward.metrics,
-        )
-    end
-
-    return result, signal_E_of_t, d, data
 end

@@ -764,10 +764,10 @@ end
 # epoch-varying schedule the way p_exp/q_exp were), physics_cost is the
 # SAME formula every epoch regardless of hop/epoch -- there is no longer
 # any "reconstitute the barrier's own contribution back to p=q=1" step
-# needed in run_local_adam's epoch loop (see _reconstitute_epoch_cost
-# below): the penalty is a permanent, reported part of the objective,
-# not a gradient-only reshaping that has to be corrected back out for
-# best_cost/Metropolis comparisons to stay apples-to-apples.
+# needed in run_local_adam's epoch loop: the penalty is a permanent,
+# reported part of the objective, not a gradient-only reshaping that has
+# to be corrected back out for best_cost/Metropolis comparisons to stay
+# apples-to-apples.
 #
 # This formula/gradient pair is shared by FOUR independent consumers
 # (pulse_cost, _pulse_cost_grad_threaded, pulse_cost_grad_adjoint,
@@ -1067,7 +1067,7 @@ end
 # file already uses elsewhere. Orders of magnitude cheaper than a physics
 # fit (no ODE solve per epoch), which is the point: it turns an arbitrary
 # recorded pulse (e.g. a jld2 run's own analytic control pulse -- see
-# jld2_pulse_loader.jl's fit_composite_pulse_seed) into a REASONED
+# jld2_pulse_loader.jl's fit_linear_seed) into a REASONED
 # CompositePulse seed for the physics optimisation below, rather than a
 # shape-blind random/canonical guess.
 # ============================================================
@@ -1115,10 +1115,9 @@ than all `k` sub-pulses initially overlapping near `t=0`. This is still a
 GENERIC, timing-blind default -- verified (again on the 3-ARP reference)
 to plateau at `rel_l2~0.998` (no better than an all-zero pulse) after 200
 epochs, because its amplitude scale and sub-pulse timings have no relation
-to the target's own; [`fit_composite_pulse_seed`](@ref) in
-jld2_pulse_loader.jl passes a much better `u_init`
-([`_segment_matched_seed_init`](@ref)) whenever the target's own segment
-count matches `pulse.k`.
+to the target's own; [`fit_linear_seed`](@ref) in
+jld2_pulse_loader.jl supplies a closed-form linear least-squares
+`warm_start_u` of the control pulse instead of this Adam waveform fit.
 
 Returns `(u_fit, fit_report)`: `u_fit` is the LOWEST-mse `u` seen across
 all epochs (not necessarily the last, same "track the best, don't just
@@ -1610,8 +1609,8 @@ are:
   4. Builds a segment-matched `u_init`: each sub-pulse placed at its
      detected segment's own `t`-span, amplitude flat at that segment's own
      peak `A`, frequency ramped linearly across that segment's own
-     `extrema(f)` -- the same idea as
-     [`_segment_matched_seed_init`](@ref) (jld2_pulse_loader.jl), but
+     `extrema(f)` -- the same idea as the linear control-seed path in
+     jld2_pulse_loader.jl ([`fit_linear_seed`](@ref)), but
      derived from the DETECTED segments' own sample data rather than a
      labelled `PULSE_CONFIG`.
   5. Fits via [`fit_composite_pulse_af`](@ref) (amplitude/frequency-space).
@@ -2021,7 +2020,7 @@ function _fit_composite_pulse_from_samples_linear(
     # itself (not from any of this loop's own per-segment intermediates,
     # e.g. A_pred/Basis_p1/cf_seg, which are LOCAL to a single sub-pulse
     # and don't include phi0/taper/silence) -- this is the same quantity
-    # smoke_test_fit_from_pulsemat's own diff_report.rel_l2 measures via a
+    # [`fit_linear_seed`](@ref) reports as `fit_report.rel_l2_complex`;
     # CSV round-trip; computing it here too means a direct caller of this
     # function (no file I/O involved) gets it for free.
     E_fit = build_E_of_t(pulse, u_fit)
@@ -2169,13 +2168,16 @@ end
 # starts from hop 1 onwards -- see run_local_adam's own docstring).
 # Detached from the epoch's own AD tape (built from the PREVIOUS accepted
 # point's plain-Float64 metrics, never from the Dual/adjoint state being
-# differentiated THIS epoch), and reconstructed back to the exact static
-# cost afterward (see `_reconstitute_static_direct_cost`) so every
-# comparison outside this one epoch's own gradient step --
-# `best_cost`/`improved`/early stopping here, and basin-hopping/final
-# reporting one level up in `optimise_composite_pulse`/
-# `optimise_composite_pulse_rjmcmc` -- stays on the SAME fixed objective
-# the caller actually asked for, never a moving target.
+# differentiated THIS epoch). Inside `run_local_adam`, Adam's own
+# `best_cost`/`improved`/early-stopping comparisons use the RAW annealed
+# cost (the same sandbox the gradient was computed under); when `w_time`
+# changes between epochs, previously-recorded costs are shifted by the
+# exact linear `w_time*(duration/T_max)` difference so those comparisons
+# stay apples-to-apples under the CURRENT epoch's weight. The value
+# returned one level up (basin-hopping's Metropolis test / `final_metrics`
+# in `optimise_composite_pulse`/`optimise_composite_pulse_rjmcmc`) is a
+# separate final evaluation of `best_u` under the caller's own static
+# `w_time`, so hops are still compared on the SAME fixed objective.
 # ============================================================
 
 """
@@ -2529,7 +2531,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
 
     # Force a single ForwardDiff chunk covering ALL n_params whenever
     # n_params <= 60 -- this package's own established param_budget cap
-    # (see fit_composite_pulse_seed_auto/points_per_segment_for_budget),
+    # (see fit_linear_seed / points_per_segment_for_budget),
     # so this covers this function's own intended caller
     # (run_local_adam(threaded_grad=true)) by construction in the common
     # AUTO-mode case. ForwardDiff.pickchunksize's own DEFAULT caps chunk
@@ -2821,18 +2823,20 @@ original fixed-`w_time` cost. `x_tune` (the curvature shaping that curve --
 negative front-loads it, positive back-loads it; see
 [`_curriculum_fidelity_weight`](@ref) for the exact shape) is not a
 keyword here -- it is ALWAYS derived via mandatory calibration, see
-`x_tune_alpha` below. Critically, `cost` itself (the value used for
-`best_cost`/`improved`/early stopping here, and everything
+`x_tune_alpha` below. Critically, THIS basin's own `best_cost`/`improved`/
+early-stopping comparisons use the RAW annealed cost off the tape -- the
+same sandbox the gradient was computed under -- not a reconstituted
+static value. When `dyn_w_time` changes between epochs, previously-recorded
+`best_cost` and `last_good_aux` are shifted by the exact linear
+`w_time*(duration/T_max)` difference so those comparisons stay
+apples-to-apples under the CURRENT epoch's `w_time`. That lets hop 0
+(where `dyn_w_time=0`) accept duration-expanding steps that improve
+physics, while later hops naturally tighten duration as `w_time` grows.
+The value RETURNED to
 [`optimise_composite_pulse`](@ref)/[`optimise_composite_pulse_rjmcmc`](@ref)
-does with the `run_local_adam`-returned cost one level up: basin-hopping's
-Metropolis test and `final_metrics`) is NOT the raw value that the
-annealed weight produced -- it is exactly reconstituted back to what it
-would have been under the caller's own static `w_time` via
-[`_reconstitute_static_direct_cost`](@ref), so every one of those
-comparisons still happens on the SAME fixed objective throughout, even
-though the GRADIENT driving `u` was shaped by a moving `w_time`. Only the
-descent direction is annealed; nothing that compares costs across epochs,
-hops, or calls ever sees a moving target.
+is a separate final evaluation of `best_u` under the caller's own static
+`cost_kwargs` (full `w_time`), so basin-hopping's Metropolis test and
+`final_metrics` still compare hops on the SAME fixed objective.
 
 **`hop==0` ALWAYS pins `factor` at `0.0` -- an unconditional pipeline
 rule, not something `anneal_direct_weights=false` can override.** This is
@@ -2901,12 +2905,12 @@ schedule or `last_good_aux` detachment here: the penalty is evaluated
 directly on the CURRENT epoch's own live inversion/silencing_success,
 inside whichever `grad_mode` backend that epoch uses). Because the
 penalty is static, `cost` needs no barrier-specific reconstitution step
-any more -- it is the SAME formula every epoch, so `best_cost`/
-Metropolis/`_extract_physics_cost` compare it directly (still
-reconstituted for `anneal_direct_weights`'s own `w_time` annealing, which
-remains a genuinely epoch-varying schedule). Include `kappa_I=0,
-kappa_S=0` in `cost_kwargs` to disable the penalty entirely and recover
-`pulse_cost`'s plain `inversion*silencing_success` formula exactly.
+any more -- it is the SAME formula every epoch, so the sandbox
+`best_cost` comparisons (and the returned static cost's Metropolis/
+`_extract_physics_cost` comparisons one level up) include it directly.
+Include `kappa_I=0, kappa_S=0` in `cost_kwargs` to disable the penalty
+entirely and recover `pulse_cost`'s plain `inversion*silencing_success`
+formula exactly.
 """
 function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_kwargs::NamedTuple;
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
@@ -2929,8 +2933,6 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     )
     aux = Ref{NTuple{6,Float64}}((NaN, NaN, NaN, NaN, NaN, NaN))
     base_w_time = haskey(cost_kwargs, :w_time) ? Float64(cost_kwargs.w_time) : 0.15
-    base_w_tmax = haskey(cost_kwargs, :w_tmax) ? Float64(cost_kwargs.w_tmax) : 1.0
-    base_w_power = haskey(cost_kwargs, :w_power) ? Float64(cost_kwargs.w_power) : 0.05
     target_F_val = haskey(cost_kwargs, :target_F) ? Float64(cost_kwargs.target_F) : 1.0
 
     # x_tune is never a caller-supplied keyword -- it is ALWAYS one of:
@@ -2980,6 +2982,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     adam_t0 = 0
     lr = learning_rate
     just_reverted = false
+    prev_dyn_w_time = base_w_time
 
     for epoch in 1:num_epochs
         t_wall = time()
@@ -2996,11 +2999,9 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # anneal_direct_weights=false at any hop!=0 is the ORIGINAL
         # "disable annealing, recover the full fixed w_time" contract, i.e.
         # factor=1.0 (NOT 0.0 -- these two "off" cases are NOT the same
-        # value and must not be conflated). Computing this unconditionally
-        # (even when just_reverted -- where it's dead, since that branch
-        # below never reads epoch_cost_kwargs/dyn_w_time/tmax_frac_sq/
-        # power_mean at all) is harmless: it's a few scalar ops plus one
-        # cheap decode() (no ODE solve).
+        # value and must not be conflated). Computed every epoch (including
+        # just_reverted retries): the moving-target shift below needs the
+        # current dyn_w_time even when the gradient itself is reused.
         factor = if hop == 0
             0.0
         elseif anneal_direct_weights
@@ -3025,39 +3026,26 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # backend), not a detached previous point, and is NOT gated by
         # hop==0 -- it applies identically on every hop, including hop 0.
         #
-        # Override w_time whenever dyn_w_time could differ from base_w_time:
-        # hop==0 (factor forced to 0.0, always needs applying) OR
-        # anneal_direct_weights=true at hop!=0 (factor genuinely dynamic).
-        # The one case safely omitted is anneal_direct_weights=false at
-        # hop!=0, where factor=1.0 makes dyn_w_time==base_w_time already.
-        epoch_cost_kwargs = merge(cost_kwargs,
-            (hop == 0 || anneal_direct_weights) ? (w_time=dyn_w_time,) : NamedTuple())
-        tmax_frac_sq, power_mean = _tmax_power_components(u, pulse)
+        # Always override w_time with this epoch's dyn_w_time (the merge is
+        # a no-op when anneal_direct_weights=false at hop!=0, where
+        # factor=1.0 already makes dyn_w_time==base_w_time).
+        epoch_cost_kwargs = merge(cost_kwargs, (w_time=dyn_w_time,))
 
-        # Reconstitutes a dynamically-annealed epoch's raw cost back to
-        # what it would have been under the caller's own static w_time --
-        # so best_cost/improved/early-stopping here, and everything
-        # optimise_composite_pulse/_rjmcmc does one level up (Metropolis
-        # test, final_metrics, _extract_physics_cost), always compare the
-        # SAME fixed objective regardless of what shaped THIS epoch's
-        # gradient. The squared-hinge penalty needs NO analogous
-        # reconstitution -- I_min/kappa_I/S_min/kappa_S are static across
-        # every epoch/hop, so physics_cost (including the penalty) is
-        # already the SAME formula everywhere, unlike the old p_exp/q_exp
-        # barrier whose STRENGTH varied epoch-to-epoch and therefore had
-        # to be corrected back out. w_tmax/w_power are fed base_w_tmax/
-        # base_w_power for BOTH the "static" and "dyn" argument to
-        # _reconstitute_static_direct_cost, since they are never annealed
-        # any more -- their contribution to the reconstitution difference
-        # is identically (base-base)=0, so that function needs no changes
-        # itself, only this caller's own inputs.
-        function _reconstitute_epoch_cost(dyn_cost, dur_)
-            isfinite(dyn_cost) || return dyn_cost
-            return (hop == 0 || anneal_direct_weights) ?
-                _reconstitute_static_direct_cost(dyn_cost, base_w_time, dyn_w_time, base_w_tmax, base_w_tmax,
-                                                  base_w_power, base_w_power, dur_, tmax_frac_sq, power_mean,
-                                                  pulse.T_max) : dyn_cost
+        # Shift historical sandbox costs onto the CURRENT epoch's w_time.
+        # Adam then compares apples-to-apples under the live weight: hop 0
+        # (dyn_w_time=0) can accept duration-expanding physics-improving
+        # steps, while later hops still tighten duration as w_time grows.
+        # w_tmax/w_power are never annealed, so they need no analogous shift.
+        if epoch > 1 && dyn_w_time != prev_dyn_w_time
+            w_diff = dyn_w_time - prev_dyn_w_time
+            best_cost += w_diff * (best_dur / pulse.T_max)
+            if isfinite(last_good_aux[1])
+                shifted_last_cost = last_good_aux[1] + w_diff * (last_good_aux[4] / pulse.T_max)
+                last_good_aux = (shifted_last_cost, last_good_aux[2], last_good_aux[3],
+                                 last_good_aux[4], last_good_aux[5], last_good_aux[6])
+            end
         end
+        prev_dyn_w_time = dyn_w_time
 
         # After a revert, `u` is exactly `last_good_u` -- a point already
         # fully evaluated (one ODE solve + AD gradient) the first time it
@@ -3069,12 +3057,9 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # each retry blends the SAME cached gradient into momentum exactly
         # once (as a normal step would), rather than accumulating it again
         # on top of whatever the previous failed attempt already blended in.
-        # `last_good_aux` already holds the STATIC (reconstituted) cost --
-        # see where it's cached below -- so it's read back directly here,
-        # with no reconstruction re-applied: re-reconstructing against the
-        # freshly-recomputed `dyn_w_time` above would be wrong, since it
-        # need not match the w_time `last_good_aux`'s cost was actually
-        # computed under.
+        # `last_good_aux` already holds the sandbox cost, shifted to the
+        # current w_time by the moving-target block above if the weight
+        # changed this epoch -- read it back directly, do not re-evaluate.
         if just_reverted
             grad = last_good_grad
             cost, inv_, sil_, dur_, coh_, famp_ = last_good_aux
@@ -3082,15 +3067,13 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
             adam.v .= adam_v0
             adam.t = adam_t0
         elseif grad_mode === :adjoint
-            grad, dyn_cost, inv_, sil_, dur_, coh_, famp_ = pulse_cost_grad_adjoint(
+            grad, cost, inv_, sil_, dur_, coh_, famp_ = pulse_cost_grad_adjoint(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
-            cost = _reconstitute_epoch_cost(dyn_cost, dur_)
         elseif threaded_grad
-            grad, dyn_cost, inv_, sil_, dur_, coh_, famp_ = _pulse_cost_grad_threaded(
+            grad, cost, inv_, sil_, dur_, coh_, famp_ = _pulse_cost_grad_threaded(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
-            cost = _reconstitute_epoch_cost(dyn_cost, dur_)
         else
             function cost_only(uu)
                 c, inv_2, sil_2, dur_2, coh_2, famp_2 = pulse_cost(uu, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...)
@@ -3105,8 +3088,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
                 return c
             end
             grad = ForwardDiff.gradient(cost_only, u)
-            dyn_cost, inv_, sil_, dur_, coh_, famp_ = aux[]
-            cost = _reconstitute_epoch_cost(dyn_cost, dur_)
+            cost, inv_, sil_, dur_, coh_, famp_ = aux[]
         end
         if !isfinite(cost)
             epochs_since_improve += 1
@@ -3167,7 +3149,17 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         end
     end
 
-    return best_u, best_cost, best_inv, best_sil, best_dur, history
+    # Adam optimized the annealed sandbox; basin-hopping Metropolis tests
+    # need the strict static cost under the caller's own cost_kwargs.
+    # Skip the extra solve when no epoch ever produced a finite cost
+    # (best_u is still u_start, which already failed).
+    final_static_cost = if isfinite(best_cost)
+        pulse_cost(best_u, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)[1]
+    else
+        Inf
+    end
+
+    return best_u, final_static_cost, best_inv, best_sil, best_dur, history
 end
 
 """
@@ -3275,10 +3267,10 @@ caller's own base weight) from near-zero as that hop's physics fidelity
 improves -- see [`run_local_adam`](@ref)'s own docstring and
 [`_curriculum_fidelity_weight`](@ref) for the schedule and why the `cost`
 this function itself compares (basin-hopping's Metropolis test,
-`final_metrics`) is unaffected: `run_local_adam` already reconstitutes it
-back to the static, caller-configured `w_time` before returning it. Pass
-`anneal_direct_weights=false` to disable annealing entirely and recover
-the original fixed-`w_time` cost.
+`final_metrics`) is unaffected: `run_local_adam` re-evaluates its
+returned `best_u` under the static, caller-configured `w_time` before
+returning it. Pass `anneal_direct_weights=false` to disable annealing
+entirely and recover the original fixed-`w_time` cost.
 
 **`hop==0` always has `w_time` suppressed to `0.0`** -- exactly mirroring
 [`run_local_adam`](@ref)'s own unconditional `hop==0` rule (physics-only
