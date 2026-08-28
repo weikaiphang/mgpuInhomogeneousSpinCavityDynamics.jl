@@ -2838,12 +2838,14 @@ is a separate final evaluation of `best_u` under the caller's own static
 `cost_kwargs` (full `w_time`), so basin-hopping's Metropolis test and
 `final_metrics` still compare hops on the SAME fixed objective.
 
-**`hop==0` ALWAYS pins `factor` at `0.0` -- an unconditional pipeline
-rule, not something `anneal_direct_weights=false` can override.** This is
-a DELIBERATE special case, confirmed explicitly: hop 0's `w_time`
-contribution to the gradient is fully suppressed (`dyn_w_time =
-base_w_time*0.0 = 0.0`, i.e. genuinely physics-only optimisation --
-duration ignored -- for the entire first hop) REGARDLESS of
+**`hop==0` ALWAYS runs at `dyn_w_time == 0.0` -- a HARD INVARIANT, not
+something `anneal_direct_weights=false` can override.** `factor` is pinned
+at `0.0`, AND `dyn_w_time` is computed as an explicit `hop==0 ? 0.0 :
+base_w_time*factor` short-circuit (not left to emerge from `factor==0`) and
+`@assert`ed, so a future change to `factor` cannot silently reintroduce a
+`w_time` term on hop 0. hop 0's `w_time` contribution to the gradient AND
+to `best_cost`/`improved` is fully suppressed (genuinely physics-only
+optimisation -- duration ignored -- for the entire first hop) REGARDLESS of
 `anneal_direct_weights`'s own value -- unlike every other hop, where
 `anneal_direct_weights=false` means the ORIGINAL "disable annealing,
 `factor=1.0`, recover the full fixed `w_time`" contract exactly as before
@@ -2874,7 +2876,12 @@ starts from (which can differ hop to hop, e.g. across a
 `_grow_pulse`/`_shrink_pulse` k-change in
 [`optimise_composite_pulse_rjmcmc`](@ref)) rather than a single blind
 guess reused everywhere. This is logged via `label` before the epoch loop
-starts. Passing `x_tune_alpha=nothing` EXPLICITLY skips calibration and
+starts. That same calibration `pulse_cost` evaluation's `(inversion,
+silencing)` are planted into `last_good_aux`'s corresponding slots, so
+epoch 1 already sees `fidelity_phys = F_0` and its `schedule_factor`
+equals `x_tune_alpha` (the calibrated non-zero floor) -- the schedule is
+active from the FIRST epoch of every calibrating hop, not first applied on
+epoch 2. Passing `x_tune_alpha=nothing` EXPLICITLY skips calibration and
 uses the plain linear schedule (`x_tune=0`, i.e. `factor = fidelity_phys`
 exactly) instead -- the only way to run the annealed schedule
 uncalibrated; not something that happens by leaving arguments at their
@@ -2888,7 +2895,11 @@ directly) lets [`optimise_composite_pulse`](@ref)/
 `x_tune` (computed by them from hop 1's own starting point) for their own
 `recalibrate_optima_x=false` hops (hop 2 onwards), bypassing calibration
 here entirely (takes priority over `x_tune_alpha`, which is ignored when
-this is set).
+this is set). Because no calibration `pulse_cost` is spent on these hops,
+there is no `(inversion, silencing)` seed for `last_good_aux`, so epoch 1
+of a `_precalibrated_x_tune` hop keeps `schedule_factor == 0.0` (i.e.
+`dyn_w_time == 0` for that one epoch) -- a deliberately accepted asymmetry
+vs the calibrating hops above.
 
 `I_min`/`kappa_I`/`S_min`/`kappa_S` (the squared-hinge exterior penalty on
 `inversion`/`silencing_success` respectively, see
@@ -2952,6 +2963,16 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     # fails to solve, solve_optimal_x_start's own F_0∈[0,1] validation
     # rejects the resulting NaN loudly rather than silently calibrating
     # against garbage.
+    # Seed for last_good_aux's (inversion, silencing) slots, so epoch 1 of a
+    # calibrating hop already sees a real fidelity_phys (=F_0) instead of the
+    # NaN->0 sentinel -- i.e. the calibrated x_tune is actually EXERCISED on
+    # epoch 1 (schedule_factor = x_tune_alpha, the deliberate non-zero floor),
+    # not first applied on epoch 2. Only set in the branch that already spends a
+    # calibration pulse_cost eval (no extra ODE solve). Left NaN for hop==0 (no
+    # annealing), for _precalibrated_x_tune hops (recalibrate_optima_x=false --
+    # no eval spent, so no seed available; epoch 1 keeps w_time=0 there), and
+    # for the uncalibrated linear fallback.
+    seed_inv, seed_sil = NaN, NaN
     x_tune_eff = if hop == 0
         0.0
     elseif _precalibrated_x_tune !== nothing
@@ -2961,6 +2982,9 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         silencing_success0 = 1.0 - (Float64(sil0) - target_F_val)^2
         F_0 = Float64(inv0) * silencing_success0
         val = solve_optimal_x_start(F_0, Float64(x_tune_alpha))
+        if isfinite(inv0) && isfinite(sil0)
+            seed_inv, seed_sil = Float64(inv0), Float64(sil0)
+        end
         println(
             "$label x_tune_alpha=$(x_tune_alpha): calibrated x_tune=$(round(val, sigdigits=4)) " *
             "from F_0=$(round(F_0, sigdigits=4)) at u_start"
@@ -2976,7 +3000,12 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     history = NamedTuple[]
     last_good_u = copy(u_start)
     last_good_grad = zeros(n)
-    last_good_aux = (NaN, NaN, NaN, NaN, NaN, NaN)
+    # (cost, inversion, silencing, duration, coherence, field_amp). cost stays
+    # NaN so the moving-target isfinite(last_good_aux[1]) guard skips at epoch 1
+    # and a failed epoch-1 solve still degrades to the revert loop. inversion/
+    # silencing carry the calibration seed (or NaN when none was taken) -- these
+    # are the only two slots _curriculum_fidelity_weight reads.
+    last_good_aux = (NaN, seed_inv, seed_sil, NaN, NaN, NaN)
     adam_m0 = zeros(n)
     adam_v0 = zeros(n)
     adam_t0 = 0
@@ -3009,7 +3038,17 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         else
             1.0
         end
-        dyn_w_time = base_w_time * factor
+        # HARD INVARIANT: hop 0 is the pure physics sandbox -- dyn_w_time is
+        # identically 0 for the WHOLE hop (gradient AND accept/reject), no
+        # schedule, no calibration, regardless of anneal_direct_weights. Written
+        # as an explicit hop==0 short-circuit (not left to emerge from factor==0)
+        # so a future change to `factor` cannot silently break it; the assert
+        # locks it. The epoch_cost_kwargs merge below is unconditional, so
+        # cost_kwargs.w_time can never leak into a hop-0 epoch either; and the
+        # moving-target block is inert at hop 0 (dyn_w_time is 0 every epoch and
+        # prev_dyn_w_time becomes 0 after epoch 1, so it never fires).
+        dyn_w_time = hop == 0 ? 0.0 : base_w_time * factor
+        @assert hop != 0 || dyn_w_time == 0.0 "hop 0 must run at w_time=0 (got dyn_w_time=$dyn_w_time)"
 
         # I_min/kappa_I/S_min/kappa_S (the squared-hinge penalty on
         # inversion/silencing_success, see _fidelity_physics_cost) are NOT

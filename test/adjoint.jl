@@ -367,8 +367,9 @@ end
     @test length(adj[6]) >= 1
     @test any(h.schedule_factor != 0.0 for h in adj[6])  # annealing genuinely active at hop=1
 
-    # Epoch 1 starts from the SAME worst-case schedule state (no accepted
-    # point yet -> factor=0) regardless of grad_mode, so all THREE
+    # Epoch 1 starts from the SAME schedule state regardless of grad_mode
+    # (the calibration seed -> schedule_factor = x_tune_alpha, applied
+    # identically in all three branches), so all THREE
     # grad_mode/threaded_grad branches must reproduce the SAME sandbox
     # cost/inversion/silencing exactly (all solve the identical primal ODE
     # at epoch 1 -- see the cross-backend testset above for why cost, as

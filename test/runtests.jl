@@ -568,10 +568,25 @@ end
     @test baseline[1] == explicit_on[1]  # best_u
     @test baseline[2] == explicit_on[2]  # best_cost
     @test baseline[6] == explicit_on[6]  # history
-    # Returned cost is the static evaluation of best_u; epoch-1 history is
-    # the factor=0 sandbox at u0 (last_good_aux still NaN).
+    # u0's own measured fidelity -> the calibrated x_tune the whole hop uses,
+    # AND (inv0, sil0) is the seed run_local_adam plants into last_good_aux's
+    # (inversion, silencing) slots so epoch 1 already anneals at the calibrated
+    # floor rather than the old NaN->factor=0 sandbox.
+    _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
+    F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
+    x_tune_expected = solve_optimal_x_start(F_0, _DEFAULT_X_TUNE_ALPHA)
+    factor1 = _curriculum_fidelity_weight(Float64(inv0), Float64(sil0), 1.0, x_tune_expected)
+
+    # Returned cost is the static evaluation of best_u under full cost_kwargs.
     @test baseline[2] ≈ pulse_cost(baseline[1], pulse, FAKE_D_ODE; cost_kwargs...)[1] atol=1e-10
-    @test baseline[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.0)[1] atol=1e-12
+    # Epoch 1 is NO LONGER the w_time=0 sandbox: the calibration seed makes its
+    # schedule_factor == x_tune_alpha (the deliberate non-zero floor, equal to
+    # _DEFAULT_X_TUNE_ALPHA up to solve_optimal_x_start's root tol), so epoch 1
+    # is descended at dyn_w_time = 0.15 * factor1.
+    @test factor1 > 0.0
+    @test isapprox(factor1, _DEFAULT_X_TUNE_ALPHA; atol=1e-5)
+    @test baseline[6][1].schedule_factor == factor1
+    @test baseline[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.15*factor1)[1] atol=1e-12
 
     # anneal_direct_weights=false at hop!=0 is the ORIGINAL "disable
     # annealing, recover the fixed w_time" contract -- schedule_factor==1.0
@@ -583,19 +598,14 @@ end
     @test off[6] != baseline[6]
 
     # history's x_tune field carries the CALIBRATED value (constant across
-    # every row) matching solve_optimal_x_start applied to u0's own
-    # measured fidelity under _DEFAULT_X_TUNE_ALPHA exactly.
-    _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
-    F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
-    x_tune_expected = solve_optimal_x_start(F_0, _DEFAULT_X_TUNE_ALPHA)
+    # every row) matching solve_optimal_x_start applied to u0's own fidelity.
     @test all(h.x_tune == x_tune_expected for h in baseline[6])
-    # Epoch 1's factor comes from last_good_aux still at its NaN/NaN
-    # sentinel (no accepted point yet) -- _curriculum_fidelity_weight
-    # treats that as worst-case fidelity_phys=0, giving factor==0 exactly.
-    @test baseline[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, x_tune_expected)
-    # Every later epoch's factor must reproduce _curriculum_fidelity_weight
-    # applied to the PREVIOUS row's own (inversion, silencing) -- i.e. the
-    # last ACCEPTED point, not the epoch about to run.
+    # Every epoch's factor reproduces _curriculum_fidelity_weight applied to
+    # the last ACCEPTED point's (inversion, silencing): epoch 1 from the
+    # calibration seed (u0's own inv0/sil0), each later epoch from the
+    # previous row.
+    @test baseline[6][1].schedule_factor ==
+        _curriculum_fidelity_weight(Float64(inv0), Float64(sil0), 1.0, x_tune_expected)
     for i in 2:length(baseline[6])
         expected = _curriculum_fidelity_weight(
             baseline[6][i-1].inversion, baseline[6][i-1].silencing, 1.0, x_tune_expected)
@@ -621,13 +631,29 @@ end
     # Passing x_tune_alpha=nothing EXPLICITLY is the escape hatch: bypasses
     # calibration entirely, falling back to the plain linear schedule
     # (x_tune=0, i.e. factor = fidelity_phys exactly) since there is no raw
-    # x_tune keyword to fall back to any more.
+    # x_tune keyword to fall back to any more. No calibration eval is spent,
+    # so there is no (inv, sil) seed either -- epoch 1 stays at the NaN->0
+    # sentinel (schedule_factor==0, w_time=0 for that one epoch).
     manual = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-manual]",
         x_tune_alpha=nothing)
     @test all(h.x_tune == 0.0 for h in manual[6])
     @test manual[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, 0.0)
+    @test manual[6][1].schedule_factor == 0.0
+    @test manual[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.0)[1] atol=1e-12
     @test manual[6] != baseline[6]  # linear (x_tune=0) differs from the calibrated default
+
+    # _precalibrated_x_tune hops (recalibrate_optima_x=false, hop>=2) inject an
+    # already-calibrated x_tune and spend NO calibration pulse_cost -- so there
+    # is no (inv, sil) seed, and epoch 1 deliberately keeps schedule_factor==0
+    # (dyn_w_time==0 for that one epoch), unlike the calibrating hops above.
+    precal = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=2, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-precal]",
+        _precalibrated_x_tune=x_tune_expected)
+    @test all(h.x_tune == x_tune_expected for h in precal[6])
+    @test precal[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, x_tune_expected)
+    @test precal[6][1].schedule_factor == 0.0
+    @test precal[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.0)[1] atol=1e-12
 
     # A custom x_tune_alpha overrides the default target, actually takes
     # effect (diverges from both the default-alpha baseline and the
