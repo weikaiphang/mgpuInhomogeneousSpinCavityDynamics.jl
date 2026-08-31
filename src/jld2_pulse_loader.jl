@@ -892,6 +892,7 @@ function jld2_pipeline_defaults()
     return (
         n_signal=nothing,
         use_signal=true,
+        use_interior=true,
         rtol_check=1e-3,
         atol_check=nothing,
         check_reltol=nothing,
@@ -1176,6 +1177,7 @@ function _print_reference_audit(ref)
     println("  n_signal_check        = $(ref.n_signal_check)")
     println("  USE_SIGNAL            = $(ref.use_signal)")
     println("  USE_SIGNAL note       = $(ref.use_signal_note)")
+    println("  use_interior          = $(ref.use_interior)")
     println("  control trace         = $(ref.control_trace_note)")
     println("  fit_N                 = $(ref.fit_N) ($(ref.fit_N_source))")
     println("  ensemble M            = $(ref.d.M)  (M_delta=$(ref.d.M_delta) x M_g=$(ref.d.M_g))")
@@ -1186,10 +1188,13 @@ function _print_reference_audit(ref)
 end
 
 """
-    load_jld2_reference(path; n_signal=nothing, use_signal=true, fit_N=nothing, verbose=true)
+    load_jld2_reference(path; n_signal=nothing, use_signal=true, use_interior=true,
+                        fit_N=nothing, verbose=true)
         -> NamedTuple
 
-Steps 1–4 of the jld2 pipeline:
+Steps 1–4 of the jld2 pipeline. `use_interior` is stored on the returned
+`ref` and consumed after step 7 by [`optimise_control_pulse_from_jld2`](@ref)
+(it does not change this loader's own I/Q / `d` / signal split):
 
   1. Open `path` (a `.jld2`, or a `*_pulsemat.csv` whose sibling `.jld2` is used).
   2. Extract `SIM_SETTING`, `SYSTEM_CONFIG`, `PULSE_CONFIG`.
@@ -1207,6 +1212,7 @@ function load_jld2_reference(
     path::AbstractString;
     n_signal::Union{Nothing,Integer}=jld2_pipeline_defaults().n_signal,
     use_signal::Bool=jld2_pipeline_defaults().use_signal,
+    use_interior::Bool=jld2_pipeline_defaults().use_interior,
     fit_N::Union{Nothing,Integer}=jld2_pipeline_defaults().fit_N,
     verbose::Bool=true,
 )
@@ -1328,6 +1334,7 @@ function load_jld2_reference(
         n_signal_check=n_signal,
         use_signal=use_signal,
         use_signal_note=use_signal_note,
+        use_interior=use_interior,
         signal_E_of_t=signal_E_of_t,
         signal_E_always=signal_E_always,
         recorded_E_of_t=recorded_E_of_t,
@@ -1987,6 +1994,10 @@ Linear pipeline:
        pulse** (`PULSE_CONFIG` control segments, or the CSV). Signal is
        not fit. Skipped if `fit_seed_from_file=false` or `warm_start_u`
        is passed.
+  7b.  [`generate_interior_seed`](@ref) — when `use_interior=true` (the
+       default), rewrite that `u_fit` toward inversion≈silencing≈0.5
+       using step 5's `inversion`/`silencing`. `use_interior=false`
+       leaves the linear seed unchanged.
   8.   [`optimise_composite_pulse`](@ref) (`pulse_optimizer2.jl`) optimises
        that same **control pulse** on the reference ensemble `d`,
        warm-started from the seed. Parsed signal is a fixed background
@@ -2020,7 +2031,7 @@ function optimise_control_pulse_from_jld2(
     verbose && println("=== 1–4  load_jld2_reference ===")
     ref = load_jld2_reference(
         path; n_signal=pipe.n_signal, use_signal=pipe.use_signal,
-        fit_N=pipe.fit_N, verbose=verbose,
+        use_interior=pipe.use_interior, fit_N=pipe.fit_N, verbose=verbose,
     )
     data = ref.data
     d = ref.d
@@ -2055,6 +2066,40 @@ function optimise_control_pulse_from_jld2(
         k, n_coeff_A, n_coeff_f = seed_pulse.k, seed_pulse.n_coeff_A, seed_pulse.n_coeff_f
         opt_kwargs = merge(opt_kwargs, (warm_start_u=u_fit,))
         seed_fit_report = (u_fit=u_fit, fit_report=fit_report)
+
+        if pipe.use_interior
+            verbose && println(
+                "=== 7b  generate_interior_seed (I,S from step 5 → ~0.5,~0.5) ===",
+            )
+            I = reference_metrics.inversion
+            S = reference_metrics.silencing
+            pulse_int, u_int, interior_report, _ = generate_interior_seed(
+                u_fit, I, S, seed_pulse, d;
+                param_budget=pipe.param_budget,
+                degree=opt_kwargs.degree, taper_frac=opt_kwargs.taper_frac,
+                preserve_shape=true,
+                N_samples=max(length(ref.control_t), 2),
+            )
+            k, n_coeff_A, n_coeff_f = pulse_int.k, pulse_int.n_coeff_A, pulse_int.n_coeff_f
+            opt_kwargs = merge(opt_kwargs, (warm_start_u=u_int,))
+            seed_fit_report = (
+                u_fit=u_int, u_fit_linear=u_fit, fit_report=fit_report,
+                interior_report=interior_report,
+            )
+            if verbose
+                println(
+                    "  inversion=$(round(I, sigdigits=6))  silencing=$(round(S, sigdigits=6))  " *
+                    "amp_scale_factor=$(round(interior_report.amp_scale_factor, sigdigits=6))  " *
+                    "chirp_bandwidth=$(interior_report.chirp_bandwidth)",
+                )
+            end
+        end
+    elseif pipe.use_interior
+        error(
+            "use_interior=true requires step 7 (fit_linear_seed). It is skipped when " *
+            "fit_seed_from_file=false or warm_start_u is passed — set use_interior=false " *
+            "to keep that warm start unchanged.",
+        )
     end
     k === nothing && error("internal error: k is unset after the seed-fit branch.")
     n_coeff_A === nothing && error("internal error: n_coeff_A is unset after the seed-fit branch.")
@@ -2069,7 +2114,8 @@ function optimise_control_pulse_from_jld2(
             (pulse_source=ref.pulse_source, rtol_check=pipe.rtol_check, atol_check=pipe.atol_check,
              check_reltol=pipe.check_reltol, check_abstol=pipe.check_abstol,
              fit_seed_from_file=pipe.fit_seed_from_file, fit_N=ref.fit_N,
-             param_budget=pipe.param_budget, n_signal_check=pipe.n_signal),
+             param_budget=pipe.param_budget, n_signal_check=pipe.n_signal,
+             use_interior=pipe.use_interior),
             optimizer_settings,
         )
         save_optimisation_run_log(

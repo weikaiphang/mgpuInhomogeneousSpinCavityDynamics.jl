@@ -2105,6 +2105,232 @@ function fit_composite_pulse_from_samples(
 end
 
 # ============================================================
+# INTERIOR SEED (map a fitted control seed toward inversion≈silencing≈0.5)
+#
+# A closed-form, non-optimising rewrite of an already-fitted `u_fit`: sample
+# the physical envelope, scale its area onto a π/2-equivalent pulse, replace
+# the (possibly chaotic) phase with a single linear chirp, then re-fit with
+# the same gradient-safe linear solver as `fit_linear_seed`. Wired into
+# `optimise_control_pulse_from_jld2` when `use_interior=true` (the pipeline
+# default); pass `use_interior=false` to keep the linear seed unchanged.
+# ============================================================
+
+"""
+    _interior_amp_scale_factor(inversion, target_inversion) -> Float64
+
+Amplitude multiplier that maps a resonant-pulse inversion `I = sin²(θ/2)`
+onto `target_inversion` by scaling pulse area (`θ → θ_target`). For a π
+pulse (`inversion = 1`) and `target_inversion = 0.5` this is exactly
+`0.5` -- a π/2-area equivalent. `inversion = 0.5` already is that area,
+so the factor is `1`.
+"""
+function _interior_amp_scale_factor(inversion::Real, target_inversion::Real)
+    I = Float64(inversion)
+    tgt = Float64(target_inversion)
+    isfinite(I) || error("_interior_amp_scale_factor: inversion must be finite, got $inversion.")
+    isfinite(tgt) || error(
+        "_interior_amp_scale_factor: target_inversion must be finite, got $target_inversion.",
+    )
+    (0.0 <= I <= 1.0) || error(
+        "_interior_amp_scale_factor: inversion must be in [0, 1], got $inversion.",
+    )
+    (0.0 < tgt <= 1.0) || error(
+        "_interior_amp_scale_factor: target_inversion must be in (0, 1], got $target_inversion.",
+    )
+    I_floor = 1e-12
+    I < I_floor && error(
+        "_interior_amp_scale_factor: inversion=$inversion is too small to map onto a " *
+        "π/2-area seed (need inversion > $I_floor).",
+    )
+    return asin(sqrt(tgt)) / asin(sqrt(clamp(I, I_floor, 1.0)))
+end
+
+"""
+    generate_interior_seed(u_fit, inversion, silencing, pulse, d;
+        target_inversion=0.5, amp_scale_factor=nothing,
+        chirp_bandwidth=2π*1e6, N_samples=4000, param_budget=60,
+        preserve_shape=false, degree=nothing, taper_frac=nothing, ...)
+        -> (pulse_new, u_new, fit_report, segments)
+
+Rewrite an already-fitted control seed `(u_fit, inversion=I, silencing=S)`
+into a new seed whose physics sits near `(inversion, silencing) ≈
+(target_inversion, 0.5)` -- typically `(0.5, 0.5)` -- without running
+Adam / `pulse_cost`. `u_fit` is the raw parameter vector from
+[`fit_composite_pulse_from_samples`](@ref) or
+[`fit_composite_pulse_seed_linear_exact`](@ref); `pulse` is the
+[`CompositePulse`](@ref) that vector belongs to; `d` is
+`prepare_derived`'s ensemble (same object the original fit used).
+`inversion` / `silencing` are that seed's current
+[`pulse_metrics`](@ref) (`[0, 1]`). [`optimise_control_pulse_from_jld2`](@ref)
+calls this after `fit_linear_seed` when `use_interior=true`, using step 5's
+reference `inversion`/`silencing`.
+
+Construction (linear least-squares re-fit, not a physics solve):
+
+  1. Sample `build_E_of_t(pulse, u_fit)` on `N_samples` points over
+     `[0, pulse.T_max]`.
+  2. Scale the envelope by `amp_scale_factor`. When that keyword is
+     omitted it is [`_interior_amp_scale_factor`](@ref)`(inversion,
+     target_inversion)`: a π pulse (`I=1`) maps to a π/2-area pulse
+     (factor `0.5`); a seed already at `I=0.5` is left at unit scale.
+  3. Replace the sampled phase with a monotonic linear chirp of
+     angular bandwidth `chirp_bandwidth` (default `2π * 1e6` rad/s)
+     spanning the full window. `Φ(t) = ∫ ω(s) ds` with `ω` ramping
+     from `-chirp_bandwidth/2` to `+chirp_bandwidth/2` -- the
+     gradient-friendly regularizer that lands silencing near `0.5`
+     instead of a chaotic echo phase. `silencing` is the current
+     metric (required, validated, recorded); the chirp itself does
+     not depend on its value. `chirp_bandwidth=0` keeps the original
+     I/Q phase and only scales amplitude.
+  4. Reconstruct Cartesian `(I, Q)` from the scaled envelope and
+     chirped phase.
+  5. Re-fit with the gradient-safe linear solver. Default
+     (`preserve_shape=false`) is AUTO
+     [`fit_composite_pulse_from_samples`](@ref) (`fit_mode=:linear`,
+     `param_budget=60`) as in the original interior-seed construction.
+     `preserve_shape=true` keeps `pulse`'s own
+     `(k, n_coeff_A, n_coeff_f)` via the same linear fitter so `u_new`
+     is a drop-in `warm_start_u` for the same `CompositePulse`.
+
+Returns `(pulse_new, u_new, fit_report, segments)`. `fit_report` is the
+linear fitter's own NamedTuple plus `inversion_in`, `silencing_in`,
+`target_inversion`, `amp_scale_factor`, `chirp_bandwidth`, `N_samples`.
+"""
+function generate_interior_seed(
+    u_fit::AbstractVector,
+    inversion::Real,
+    silencing::Real,
+    pulse::CompositePulse,
+    d;
+    target_inversion::Real=0.5,
+    amp_scale_factor::Union{Nothing,Real}=nothing,
+    chirp_bandwidth::Real=2 * pi * 1e6,
+    N_samples::Integer=4000,
+    param_budget::Integer=60,
+    preserve_shape::Bool=false,
+    degree::Union{Nothing,Integer}=nothing,
+    taper_frac::Union{Nothing,Real}=nothing,
+    rel_thresh::Real=1e-3,
+    min_active_samples::Integer=5,
+    min_silence_samples::Integer=3,
+    cf_clip_mult::Real=20.0,
+)
+    length(u_fit) == n_params(pulse) || error(
+        "generate_interior_seed: u_fit has length $(length(u_fit)), but this CompositePulse " *
+        "(k=$(pulse.k), n_coeff_A=$(pulse.n_coeff_A), n_coeff_f=$(pulse.n_coeff_f)) needs " *
+        "$(n_params(pulse)).",
+    )
+    N = Int(N_samples)
+    N >= 2 || error("generate_interior_seed: N_samples must be >= 2, got $N_samples.")
+    pulse.T_max > 0 || error(
+        "generate_interior_seed: pulse.T_max must be positive, got $(pulse.T_max).",
+    )
+    S = Float64(silencing)
+    isfinite(S) || error("generate_interior_seed: silencing must be finite, got $silencing.")
+    (0.0 <= S <= 1.0) || error(
+        "generate_interior_seed: silencing must be in [0, 1], got $silencing.",
+    )
+    bw = Float64(chirp_bandwidth)
+    isfinite(bw) || error(
+        "generate_interior_seed: chirp_bandwidth must be finite, got $chirp_bandwidth.",
+    )
+    bw >= 0 || error(
+        "generate_interior_seed: chirp_bandwidth must be >= 0, got $chirp_bandwidth.",
+    )
+
+    scale = if amp_scale_factor === nothing
+        _interior_amp_scale_factor(inversion, target_inversion)
+    else
+        s = Float64(amp_scale_factor)
+        isfinite(s) && s > 0 || error(
+            "generate_interior_seed: amp_scale_factor must be finite and > 0, got $amp_scale_factor.",
+        )
+        s
+    end
+
+    deg = degree === nothing ? pulse.degree : Int(degree)
+    tap = taper_frac === nothing ? pulse.taper_frac : Float64(taper_frac)
+
+    u_ref = collect(Float64, u_fit)
+    t_grid = collect(range(0.0, pulse.T_max; length=N))
+    E_ref = build_E_of_t(pulse, u_ref).(t_grid)
+    A_mod = abs.(E_ref) .* scale
+
+    if bw == 0.0
+        I_mod = real.(E_ref) .* scale
+        Q_mod = imag.(E_ref) .* scale
+    else
+        f_ramp = collect(range(-bw / 2, bw / 2; length=N))
+        dt = pulse.T_max / (N - 1)
+        Phi_mod = cumsum(f_ramp) .* dt
+        I_mod = A_mod .* cos.(Phi_mod)
+        Q_mod = A_mod .* sin.(Phi_mod)
+    end
+
+    if preserve_shape
+        pulse.n_coeff_A == pulse.n_coeff_f || error(
+            "generate_interior_seed: preserve_shape=true requires n_coeff_A == n_coeff_f " *
+            "(got n_coeff_A=$(pulse.n_coeff_A), n_coeff_f=$(pulse.n_coeff_f)); pass " *
+            "preserve_shape=false to AUTO-size a new shape, or rebuild `pulse` with equal " *
+            "coefficient counts.",
+        )
+        A_det = sqrt.(I_mod .^ 2 .+ Q_mod .^ 2)
+        segments_det = _detect_subpulse_segments(
+            t_grid, A_det; rel_thresh=rel_thresh, min_active_samples=min_active_samples,
+            min_silence_samples=min_silence_samples,
+        )
+        length(segments_det) == pulse.k || error(
+            "generate_interior_seed: preserve_shape=true detected $(length(segments_det)) " *
+            "sub-pulse(s) but pulse.k=$(pulse.k) — pass preserve_shape=false, or adjust " *
+            "rel_thresh/min_active_samples/min_silence_samples so detection matches k.",
+        )
+        n_pieces_target = pulse.n_coeff_A - deg
+        n_pieces_target >= 1 || error(
+            "generate_interior_seed: n_coeff_A=$(pulse.n_coeff_A) is too small for " *
+            "degree=$deg (need n_coeff_A >= degree+1 = $(deg + 1)).",
+        )
+        n_samples_max = maximum(i_end - i_start + 1 for (i_start, i_end) in segments_det)
+        pps = cld(n_samples_max, n_pieces_target)
+        n_pieces_lo = cld(n_samples_max, pps)
+        n_pieces_lo == n_pieces_target || error(
+            "generate_interior_seed: n_coeff_A=$(pulse.n_coeff_A) is not achievable for a " *
+            "segment of $n_samples_max samples at degree=$deg (points_per_segment-based " *
+            "sizing has a gap here). Pass preserve_shape=false to AUTO-size, or change " *
+            "N_samples.",
+        )
+        pulse_new, u_new, fit_report, segments = _fit_composite_pulse_from_samples_linear(
+            t_grid, I_mod, Q_mod, d; points_per_segment=pps, degree=deg, taper_frac=tap,
+            segments=segments_det, cf_clip_mult=cf_clip_mult,
+        )
+        (pulse_new.k == pulse.k && pulse_new.n_coeff_A == pulse.n_coeff_A &&
+         pulse_new.n_coeff_f == pulse.n_coeff_f) || error(
+            "generate_interior_seed: preserve_shape=true expected (k=$(pulse.k), " *
+            "n_coeff_A=$(pulse.n_coeff_A), n_coeff_f=$(pulse.n_coeff_f)) but the fit " *
+            "produced (k=$(pulse_new.k), n_coeff_A=$(pulse_new.n_coeff_A), " *
+            "n_coeff_f=$(pulse_new.n_coeff_f)).",
+        )
+    else
+        pulse_new, u_new, fit_report, segments = fit_composite_pulse_from_samples(
+            t_grid, I_mod, Q_mod, d;
+            fit_mode=:linear, degree=deg, taper_frac=tap, param_budget=param_budget,
+            rel_thresh=rel_thresh, min_active_samples=min_active_samples,
+            min_silence_samples=min_silence_samples, cf_clip_mult=cf_clip_mult,
+        )
+    end
+
+    report = merge(fit_report, (
+        inversion_in=Float64(inversion),
+        silencing_in=S,
+        target_inversion=Float64(target_inversion),
+        amp_scale_factor=scale,
+        chirp_bandwidth=bw,
+        N_samples=N,
+        preserve_shape=preserve_shape,
+    ))
+    return pulse_new, u_new, report, segments
+end
+
+# ============================================================
 # TASK-PARALLEL GRADIENT (2 ICs, optional multi-GPU param chunks)
 #
 # pulse_cost's own scalar `cost` is LITERALLY additively separable into a

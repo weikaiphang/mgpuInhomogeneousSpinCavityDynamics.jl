@@ -67,6 +67,66 @@ end
     @test_throws ErrorException decode(pulse, vcat(u, 0.0))
 end
 
+@testset "generate_interior_seed" begin
+    @test _interior_amp_scale_factor(1.0, 0.5) ≈ 0.5
+    @test _interior_amp_scale_factor(0.5, 0.5) ≈ 1.0
+    @test _interior_amp_scale_factor(0.25, 0.5) ≈ (π / 2) / (2 * asin(0.5))
+    @test_throws ErrorException _interior_amp_scale_factor(0.0, 0.5)
+    @test_throws ErrorException _interior_amp_scale_factor(1.2, 0.5)
+    @test_throws ErrorException _interior_amp_scale_factor(0.5, 0.0)
+
+    pulse = CompositePulse(1, 4, 4, FAKE_D)
+    u = seed_canonical(pulse, :hs1)
+    N = 400
+    t0 = collect(range(0.0, pulse.T_max; length=N))
+    E0 = build_E_of_t(pulse, u).(t0)
+    A0 = maximum(abs.(E0))
+    A0 > 0 || error("test setup: HS1 seed reconstructed as silence")
+
+    @test_throws ErrorException generate_interior_seed(u[1:end-1], 1.0, 0.9, pulse, FAKE_D)
+    @test_throws ErrorException generate_interior_seed(u, 1.0, 1.5, pulse, FAKE_D)
+    @test_throws ErrorException generate_interior_seed(u, 1.0, 0.9, pulse, FAKE_D; N_samples=1)
+
+    pulse_new, u_new, report, segments = generate_interior_seed(
+        u, 1.0, 0.9, pulse, FAKE_D;
+        N_samples=N, param_budget=40,
+    )
+    @test report.amp_scale_factor ≈ 0.5
+    @test report.inversion_in == 1.0
+    @test report.silencing_in == 0.9
+    @test report.preserve_shape === false
+    @test length(u_new) == n_params(pulse_new)
+    @test !isempty(segments)
+    t1 = collect(range(0.0, pulse_new.T_max; length=N))
+    E1 = build_E_of_t(pulse_new, u_new).(t1)
+    A1 = maximum(abs.(E1))
+    @test A1 / A0 ≈ 0.5 rtol=0.2
+
+    A1v = abs.(E1)
+    _, f1 = _instantaneous_frequency(t1, real.(E1), imag.(E1))
+    active = A1v .> 0.05 * maximum(A1v)
+    @test count(active) >= 8
+    @test f1[findfirst(active)] < f1[findlast(active)]
+
+    # inversion already 0.5 → unit amplitude scale; chirp_bandwidth=0 keeps phase
+    pulse_amp, u_amp, report_amp, _ = generate_interior_seed(
+        u, 0.5, 0.5, pulse, FAKE_D;
+        N_samples=N, param_budget=40, chirp_bandwidth=0.0,
+    )
+    @test report_amp.amp_scale_factor ≈ 1.0
+    EA = build_E_of_t(pulse_amp, u_amp).(t0)
+    @test maximum(abs.(EA)) / A0 ≈ 1.0 rtol=0.2
+
+    pulse_same, u_same, report_same, _ = generate_interior_seed(
+        u, 1.0, 0.9, pulse, FAKE_D;
+        N_samples=N, preserve_shape=true, chirp_bandwidth=0.0,
+    )
+    @test report_same.preserve_shape === true
+    @test pulse_same.k == pulse.k
+    @test pulse_same.n_coeff_A == pulse.n_coeff_A
+    @test length(u_same) == n_params(pulse)
+end
+
 @testset "w_tmax default is identically zero" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D)
     # Large positive raw duration/gap so t_end can exceed T_max.

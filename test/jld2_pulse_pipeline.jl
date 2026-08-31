@@ -307,12 +307,14 @@ function e2e_opt_kwargs()
         save_log=true,
         fit_N=1001,
         param_budget=40,
+        use_interior=false,
     )
 end
 
 @testset "pipeline invocation signatures" begin
     @test jld2_pipeline_defaults().n_signal === nothing
     @test jld2_pipeline_defaults().use_signal === true
+    @test jld2_pipeline_defaults().use_interior === true
     @test hasmethod(try_parse_pulse_config, Tuple{NamedTuple})
     @test hasmethod(load_jld2_reference, Tuple{String})
     @test hasmethod(run_reference_forward, Tuple{Any})
@@ -332,8 +334,11 @@ end
     @test length(mlog) >= 1
     pipe, opt, verbose = _jld2_split_kwargs((;))
     @test pipe.n_signal === nothing
+    @test pipe.use_interior === true
     @test verbose === true
     @test haskey(opt, :num_epochs)
+    pipe_off, _, _ = _jld2_split_kwargs((; use_interior=false))
+    @test pipe_off.use_interior === false
     @test_throws ErrorException _jld2_split_kwargs((; not_a_real_knob=1))
 end
 
@@ -472,6 +477,7 @@ end
         ref = load_jld2_reference(path; verbose=false, fit_N=1001)
         @test ref.parse_ok
         @test ref.pulse_source === :pulse_config
+        @test ref.use_interior === true
         @test ref.n_signal == 1
         @test ref.n_signal_check === nothing
         @test ref.identification !== nothing
@@ -494,6 +500,8 @@ end
         ref_off = load_jld2_reference(path; use_signal=false, verbose=false, fit_N=501)
         @test ref_off.signal_E_of_t(15e-6) == 0
         @test e2e_iq_at(ref_off.signal_E_always, 15e-6) > 0
+        ref_no_int = load_jld2_reference(path; use_interior=false, verbose=false, fit_N=501)
+        @test ref_no_int.use_interior === false
 
         forward = run_reference_forward(ref; compute=:cpu, verbose=false)
         @test 0 <= forward.metrics.inversion <= 1
@@ -507,6 +515,17 @@ end
         @test pulse.k == 2
         @test length(segs) == 2
         @test length(u_fit) == n_params(pulse)
+
+        pulse_int, u_int, irep, segs_int = generate_interior_seed(
+            u_fit, forward.metrics.inversion, forward.metrics.silencing, pulse, ref.d;
+            preserve_shape=true, N_samples=max(length(ref.control_t), 2), param_budget=40,
+        )
+        @test pulse_int.k == pulse.k
+        @test length(u_int) == n_params(pulse)
+        @test length(segs_int) == 2
+        @test isfinite(irep.amp_scale_factor)
+        @test irep.inversion_in == forward.metrics.inversion
+        @test irep.silencing_in == forward.metrics.silencing
 
         # Count-check still works for ROSE; 3ARP-style n_signal=1 must not load.
         ref_n1 = load_jld2_reference(path; n_signal=1, verbose=false, fit_N=501)
@@ -525,12 +544,14 @@ end
         @test data.PULSE_CONFIG[1].kind === :gaussian
         @test seed_rep !== nothing
         @test length(seed_rep.u_fit) == n_params(pulse_opt)
+        @test !haskey(seed_rep, :interior_report)
         @test isfinite(ref_met.inversion)
         logp, pmat, ppara = optrunlog_paths(path; out_dir=tmp)
         @test isfile(logp) && isfile(pmat) && isfile(ppara)
         log = JLD2.load(logp, "data")
         @test log.n_signal == 1
         @test log.use_signal === true
+        @test log.optimizer_settings.use_interior === false
         @test length(log.final_u) == length(best_u)
         # Saved pulsemat is CONTROL only (no Gaussian lobe).
         t_end_csv, Exs, Eps = load_E_samples(pmat)
