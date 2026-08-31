@@ -1,8 +1,18 @@
 # Discrete Tsit5 adjoint tests. Existing Dual @testsets above are the
 # production CI contract and are not relaxed here.
 
+# Mixed absolute/relative max error. The 1e-6 absolute floor (raised from
+# 1e-8) covers STRUCTURAL zeros of the pulse_cost gradient -- notably the
+# global-drive-phase parameter, to which both the paper bright-mode
+# inversion and the per-frequency-slice silencing factor |F|_⋆ are exactly
+# invariant. Once |F|_⋆ clamps (a coherence-preserving pulse drives the
+# weak-excitation equator track well above its seed), the silencing track
+# contributes an exact 0 to that component, so the two backends differ only
+# by reverse- vs forward-mode roundoff on a genuine 0 (~1e-16). Every
+# component with a non-negligible gradient (|g| ≫ 1e-6) is still compared at
+# full relative strictness.
 function _relmax(g, fd)
-    return maximum(abs.(g .- fd) ./ max.(abs.(g), abs.(fd), 1e-8))
+    return maximum(abs.(g .- fd) ./ max.(abs.(g), abs.(fd), 1e-6))
 end
 
 function _toy_p(d; E=t -> 1.0 + 0.0im)
@@ -94,22 +104,22 @@ end
     # fidelity couples the two tracks outside the pullback, see
     # pulse_cost_grad_adjoint).
     λI = zeros(nR)
-    inversion_pullback!(λI, Sz, d.Nj)
+    inversion_pullback!(λI, Sz, d.g_b, d.Nj)
     zr0 = real.(Sz)
     gI = ForwardDiff.gradient(zr -> begin
         SzD = complex.(zr, imag.(Sz))
-        _weighted_inversion(SzD, d.Nj, eltype(zr))
+        _weighted_inversion(SzD, d.g_b, d.Nj, eltype(zr))
     end, zr0)
     @test [λI[_real_idx_zr(j, M)] for j in 1:M] ≈ gI atol=1e-10
     @test all(λI[_real_idx_zi(j, M)] == 0 for j in 1:M)
     @test λI[1] == 0 && λI[2] == 0
 
     λS = zeros(nR)
-    silencing_pullback!(λS, Sp, d.g_b, d.Nj)
+    silencing_pullback!(λS, Sp, d.g_b, d.Nj, d.delta_b)
     spr = vcat(real.(Sp), imag.(Sp))
     gS = ForwardDiff.gradient(q -> begin
         SpD = complex.(q[1:M], q[M+1:2M])
-        _weighted_silencing_factor(SpD, d.g_b, d.Nj, eltype(q))
+        _weighted_silencing_factor(SpD, d.g_b, d.Nj, d.delta_b, eltype(q))
     end, spr)
     @test [λS[_real_idx_pr(j, M)] for j in 1:M] ≈ gS[1:M] atol=1e-10
     @test [λS[_real_idx_pi(j, M)] for j in 1:M] ≈ gS[M+1:2M] atol=1e-10
@@ -147,7 +157,7 @@ end
     u1 = tsit5_forced_step(u0, p, t, dt)
     _, _, Sz = unpack_state_1st_order_u(u1, M)
     λx = zeros(real_state_length_1st_order(M))
-    inversion_pullback!(λx, Sz, d.Nj)
+    inversion_pullback!(λx, Sz, d.g_b, d.Nj)
     gθ = zeros(length(θ))
     ws = Tsit5DiscAdjWorkspace(M)
     tsit5_step_vjp!(copy(λx), gθ, λx, u0, t, dt, p, pulse, θ, ws)
@@ -157,7 +167,7 @@ end
         u0d = build_u0_1st_order_cpu(M, d.Nj, eltype(θθ), :ground)
         u1d = tsit5_forced_step(u0d, pd, t, dt)
         _, _, Szd = unpack_state_1st_order_u(u1d, M)
-        _weighted_inversion(Szd, d.Nj, eltype(θθ))
+        _weighted_inversion(Szd, d.g_b, d.Nj, eltype(θθ))
     end, θ)
     @test all(isfinite, gθ)
     @test all(isfinite, g_dual)

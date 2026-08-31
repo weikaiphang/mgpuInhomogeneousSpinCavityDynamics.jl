@@ -5,12 +5,16 @@
 # extended with a DUAL-TRAJECTORY cost (see pulse_metrics/pulse_cost below):
 # where pulse_optimizer.jl scores a candidate pulse from a single :ground
 # solve, this file runs the SAME pulse u from two independent initial
-# conditions -- :ground (inversion) and :equator (collective silencing
-# factor |F|, a cooperativity-weighted mode-overlap integral, NOT a
-# per-bin coherence average -- see _weighted_silencing_factor) -- and
-# optimises both simultaneously via a target_F-driven penalty (target_F=1
-# for RASE-style revival, target_F=0 for ROSE-style silencing), plus an
-# L2 power penalty on the decoded amplitude coefficients (w_power). This
+# conditions -- :ground (bright-mode / cooperativity-weighted inversion I,
+# paper App. H) and a WEAK-EXCITATION :equator seed (Sp = eps*Nj/2,
+# eps = _EQUATOR_WEAK_SEED << 1, so each bin evolves as an independent
+# driven TLS -- paper App. B) scored by the paper silencing factor
+# |F|_* = <|F(omega)|>, built PER FREQUENCY SLICE (Eq. 5 / A.132), NOT one
+# sum over all bins and NOT a per-bin coherence average -- see
+# _weighted_silencing_factor -- and optimises both simultaneously via a
+# target_F-driven penalty (target_F=1 for RASE-style revival / pure chirp,
+# target_F=0 for ROSE-style g-space silencing), plus an L2 power penalty
+# on the decoded amplitude coefficients (w_power). This
 # is the finalised, actively-maintained pulse-optimisation entry point
 # for this package (see InhomogeneousSpinCavityDynamics.jl's own include
 # list); pulse_optimizer.jl predates the dual-trajectory cost and is no
@@ -47,6 +51,23 @@
 # ============================================================
 
 """
+    _EQUATOR_WEAK_SEED
+
+Weak-excitation seed amplitude `ε` for the `:equator` track: each bin is
+started at `Sp = ε·Nj/2` on a near-`|g⟩` trajectory (`Sz = -Nj/2`) rather
+than at the old macroscopic Dicke state `Sp = Nj/2` (`ε = 1`). The paper
+(App. B) defines the silencing factor `F` as a property of the
+single-TLS propagator, so every bin must stay in the weak-excitation
+(Holstein–Primakoff) regime where the collective cavity source `Σ_j g_j
+Sp_j` it feeds back is negligible next to the control drive. `ε = 1e-3`
+is inside the `1e-3 … 1e-4` HP window the paper uses; `ε = 1` is
+explicitly rejected. [`_weighted_silencing_factor`](@ref) divides the
+initial per-slice overlap back out, so `|F| ∈ [0, 1]` and the
+`target_F ∈ {0, 1}` (RASE/ROSE) semantics are unchanged by the rescaling.
+"""
+const _EQUATOR_WEAK_SEED = 1.0e-3
+
+"""
     build_u0_1st_order_cpu(M, Nj, ::Type{T}, initial_condition=:ground) -> Vector{Complex{T}}
 
 Plain-`Vector` (not `CuArray`), element-type-generic analogue of
@@ -68,10 +89,19 @@ function build_u0_1st_order_cpu(M::Integer, Nj::AbstractVector, ::Type{T},
         # North pole: Sz = +Nj/2, Sp = 0
         u0[sz] .= Nj ./ 2
     elseif initial_condition == :equator
-        # +x equator: Sz = 0, Sp = Nj/2 (real). Same Bloch radius Nj/2 as
-        # :ground / :inverted, so a π_x pulse can invert z AND leave +x
-        # on the equator (the dual-trajectory π-pulse cost).
-        u0[sp] .= Nj ./ 2
+        # Weak-excitation equatorial seed (paper App. B "acceptable fallback
+        # inside the existing ODE"): a near-|g⟩ trajectory, Sz = -Nj/2, with
+        # only a TINY transverse coherence Sp = ε·Nj/2, ε = _EQUATOR_WEAK_SEED
+        # ≪ 1. Every bin then stays in the weak-excitation (Holstein–Primakoff)
+        # regime and evolves as an independent driven TLS -- the collective
+        # cavity source Σ_j g_j Sp_j it feeds back is negligible next to the
+        # control. This replaces the old macroscopic Dicke seed Sz = 0,
+        # Sp = Nj/2 (ε = 1), which radiates and sits outside HP, and is the
+        # state the paper explicitly says F is NOT defined from.
+        # `_weighted_silencing_factor` divides the initial per-slice overlap
+        # back out, so |F| keeps its [0, 1] scale.
+        u0[sz] .= .-Nj ./ 2
+        u0[sp] .= T(_EQUATOR_WEAK_SEED) .* Nj ./ 2
     elseif initial_condition == :custom
         # already zero
     else
@@ -552,91 +582,156 @@ function _solver_kwargs(kwargs)
     return nt
 end
 
-function _weighted_inversion(Sz, Nj, ::Type{T}) where {T}
-    length(Sz) == length(Nj) || error(
-        "_weighted_inversion: Sz length $(length(Sz)) != Nj length $(length(Nj))."
+"""
+    _weighted_inversion(Sz, g_b, Nj, ::Type{T}) -> T
+
+Paper-aligned ensemble inversion `I ∈ [0, 1]` from the `:ground` track's
+end-state `Sz = <S^z>` (App. H):
+
+    ι_j = clamp(real(Sz_j) / (Nj_j/2), -1, 1),   I_j = (1 + ι_j)/2 ∈ [0, 1]
+    I   = Σ_j Nj_j g_j² I_j  /  Σ_j Nj_j g_j²
+
+Each bin carries the bright-mode / cooperativity weight `|P(g)|² ∝ N g²`
+(the same `g2_avg`-style weighting used elsewhere in this package -- see
+`ensemble.jl`), NOT plain `Nj`: only the part of `ρ(g)` that overlaps the
+bright mode `P(g)` counts, so weak-`g` Landau–Zener failures that do not
+sit in the bright mode no longer pollute `I`. Same `1e-30` denominator
+epsilon as the silencing metric (`abs`/division through `Dual(0)`).
+"""
+function _weighted_inversion(Sz, g_b, Nj, ::Type{T}) where {T}
+    length(Sz) == length(Nj) == length(g_b) || error(
+        "_weighted_inversion: Sz/g_b/Nj lengths $(length(Sz))/$(length(g_b))/$(length(Nj)) must match."
     )
-    weight = Nj ./ sum(Nj)
+    w = Nj .* abs2.(g_b)                            # paper |P(g)|² ∝ N g² (App. H)
+    weight = w ./ (sum(w) + T(1e-30))              # normalise first (well-conditioned; no ~Σ(Nj g²) intermediate)
     Sz_fraction = real.(Sz) ./ (Nj ./ 2 .+ 1e-30)
-    return sum(weight .* clamp.((Sz_fraction .+ 1) ./ 2, zero(T), one(T)))
+    Ij = clamp.((Sz_fraction .+ 1) ./ 2, zero(T), one(T))
+    return sum(weight .* Ij)
 end
 
 """
-    _weighted_coherence(Sp, Nj, ::Type{T}) -> T
+    _weighted_coherence(Sp, Nj, ::Type{T}; eps_seed=_EQUATOR_WEAK_SEED) -> T
 
-Per-bin `Nj`-weighted mean of `|Sp_j|/(Nj_j/2)`, in `[0, 1]`. NOT used by
-[`pulse_cost`](@ref)/[`pulse_metrics`](@ref) (superseded there by
-[`_weighted_silencing_factor`](@ref)'s collective mode-overlap `|F|`) --
-kept only so [`save_optimisation_run_log`](@ref) can log this simpler,
-per-bin-average metric alongside the silencing factor actually being
-optimised, for comparison. Same `1e-30` epsilon pattern as
-`_weighted_inversion`'s denominator (`abs(Dual(0))` is `0/0` otherwise).
+Per-bin `Nj`-weighted mean of `|Sp_j|/(ε·Nj_j/2)`, in `[0, 1]` -- the
+retained fraction of the weak-excitation seed's per-bin coherence
+magnitude, `ε = eps_seed` = [`_EQUATOR_WEAK_SEED`](@ref) (so an
+undisturbed seed reads `1`, full local decoherence reads `0`). NOT used
+by [`pulse_cost`](@ref)/[`pulse_metrics`](@ref) (superseded there by
+[`_weighted_silencing_factor`](@ref)'s collective, per-frequency-slice
+mode-overlap `|F|`) -- kept only so [`save_optimisation_run_log`](@ref)
+can log this simpler, per-bin-average metric alongside the silencing
+factor actually being optimised, for comparison. Same `1e-30` epsilon
+pattern as `_weighted_inversion`'s denominator (`abs(Dual(0))` is `0/0`
+otherwise).
 """
-function _weighted_coherence(Sp, Nj, ::Type{T}) where {T}
+function _weighted_coherence(Sp, Nj, ::Type{T}; eps_seed::Real=_EQUATOR_WEAK_SEED) where {T}
     length(Sp) == length(Nj) || error(
         "_weighted_coherence: Sp length $(length(Sp)) != Nj length $(length(Nj))."
     )
     weight = Nj ./ sum(Nj)
     Sp_abs = sqrt.(abs2.(Sp) .+ 1e-30)
-    Sp_fraction = Sp_abs ./ (Nj ./ 2 .+ 1e-30)
+    Sp_fraction = Sp_abs ./ (convert(T, eps_seed) .* (Nj ./ 2) .+ 1e-30)
     return sum(weight .* clamp.(Sp_fraction, zero(T), one(T)))
 end
 
 """
-    _weighted_silencing_factor(Sp, g_b, Nj, ::Type{T}) -> T
+    _frequency_slice_indices(delta_b) -> Vector{Vector{Int}}
 
-Collective mode-overlap silencing factor `|F| ∈ [0, 1]` from the
-equatorial track's end-state `Sp = <S^+>`:
+Groups bin indices into frequency slices `B(ω) = {j : ω_j = ω}` by shared
+detuning `delta_b[j]`. On this package's product `(M_delta × M_g)` mesh
+(`build_2d_bins` in ensemble.jl) each distinct `delta_b_1d` value collects
+its whole `g`-column into one slice; with `M_g == 1` every slice is a
+single bin. `delta_b` is always a plain `Float64` ensemble vector (never a
+differentiated quantity), so this grouping is a constant of the ensemble,
+recomputed cheaply per call rather than cached.
 
-    F = (Σ_j Nj_j g_j² Sp_j) / (Σ_j Nj_j g_j² (Nj_j/2))
-
-The denominator is the maximum magnitude the numerator could reach if
-every bin retained full coherence (`|Sp_j| = Nj_j/2`, the standard
-Dicke-state bound this file already assumes elsewhere -- see
-[`_weighted_inversion`](@ref)'s `Sz_fraction` clamp) AND every bin's
-phase were perfectly aligned; `|Σ w_j Sp_j| <= Σ w_j |Sp_j| <= Σ w_j
-(Nj_j/2)` by the triangle inequality, so `|F| <= 1` always, matching a
-`|Sp|`-based coherence metric's own `[0, 1]` scale. `Nj_j g_j²`
-weighting (not plain `Nj_j`) is the standard cooperativity-style
-weighting (`g2_avg` in ensemble.jl) so bins that actually couple
-strongly to the cavity mode dominate the collective sum.
-
-The denominator is a FIXED (`u`-independent) constant built only from
-`g_b`/`Nj` -- deliberately not `Σ_j Nj_j g_j² |Sp_j|` or any other
-per-bin normalisation. Dividing each bin's `Sp_j` by ITS OWN `|Sp_j|`
-(extracting a per-bin unit phasor) was considered and rejected: `d(|z|^2)
-= 2*Re(z^* dz)`, which is exactly `0` AT `z=0` regardless of `dz`, so
-`Sp_j / sqrt(abs2(Sp_j)+eps)`'s derivative scales like `1/sqrt(eps) ~
-1e15` for any bin whose `Sp_j` passes near `0` -- routine across a wide
-inhomogeneous ensemble (many bins, wide detuning spread), not a rare
-edge case, and it would inject an enormously amplified, physically
-meaningless gradient component with no `NaN`/`Inf` to flag it (silent
-corruption, not a clean failure). Summing the raw (non-unit-normalised)
-`Sp_j` first and normalising the WHOLE sum by a constant afterward has
-no such singularity anywhere: the only division is by a fixed number
-that never depends on `u`.
-
-NOTE on physical interpretation: this is a COOPERATIVITY-weighted (`Nj g²`)
-collective overlap, matching `g2_avg` in ensemble.jl -- it is NOT directly
-proportional to the instantaneous field amplitude the cavity mode actually
-radiates, which is a LINEAR-in-`g` quantity (`ȧ ⊃ -i Σ_j g_j Sp_j^*` in
-`rhs_1st_order!`). For a wide `g`-inhomogeneity the two can rank pulses
-differently, since this metric over-weights strongly-coupled, high-`Nj`
-bins quadratically relative to their actual contribution to the emitted
-field. See [`_weighted_field_amplitude`](@ref) for the linearly-weighted,
-field-proportional diagnostic counterpart -- computed alongside this one
-wherever it's available, but never substituted into the optimised
-objective (`pulse_cost` continues to use THIS metric, unchanged).
+Used by [`_weighted_silencing_factor`](@ref) so `F` is built INSIDE
+frequency slices and never as one complex sum over the whole `(g, ω)` mesh
+-- a pure `ω²/κ` chirp then leaves every per-slice `|F(ω)| = 1` (ACE), and
+only a genuinely `g`-dependent phase spread drives `|F| → 0` (paper Eq. 5 /
+A.132; the single-global-sum form mixes the ACE chirp into `|F|` and is
+explicitly NOT what the paper computes).
 """
-function _weighted_silencing_factor(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector, ::Type{T}) where {T}
-    length(Sp) == length(g_b) == length(Nj) || error(
-        "_weighted_silencing_factor: Sp/g_b/Nj lengths $(length(Sp))/$(length(g_b))/$(length(Nj)) must match."
+function _frequency_slice_indices(delta_b::AbstractVector)
+    slices = Vector{Int}[]
+    slot = Dict{Float64,Int}()
+    @inbounds for j in eachindex(delta_b)
+        key = Float64(delta_b[j])
+        s = get(slot, key, 0)
+        if s == 0
+            push!(slices, Int[j])
+            slot[key] = length(slices)
+        else
+            push!(slices[s], j)
+        end
+    end
+    return slices
+end
+
+"""
+    _weighted_silencing_factor(Sp, g_b, Nj, delta_b, ::Type{T}; eps_seed=_EQUATOR_WEAK_SEED) -> T
+
+Paper silencing factor `|F|_⋆ ∈ [0, 1]` (Eq. 5 / A.132 / Eq. 6), built
+per frequency slice from the weak-excitation `:equator` track's end-state
+`Sp = <S^+>` and reduced to a scalar by the `⟨|F(ω)|⟩` average:
+
+    B(ω)     = {j : ω_j = ω}                                   (see _frequency_slice_indices)
+    F(ω)     = ( Σ_{j∈B(ω)} g_j² Sp_j )  /  ( Σ_{j∈B(ω)} g_j² Sp_j(0) )
+    n(ω)     = Σ_{j∈B(ω)} Nj_j g_j²                            (bright-mode density)
+    |F|_⋆    = Σ_ω n(ω) |F(ω)|  /  Σ_ω n(ω)
+
+Key points, all from "inversion and silencing":
+
+  * **Per frequency slice, never one sum over all bins.** A pure `ω²/κ`
+    chirp is a common phase to every bin in a slice, so `|F(ω)| = 1`
+    (ACE energy conserved); only a `g`-dependent phase spread WITHIN a
+    slice drives `|F(ω)| → 0`. One global `(g, ω)` sum would fold the
+    chirp into `|F|`.
+  * **Weight on the raw `Sp_j` is `g_j²`, not `Nj_j g_j²`.** `Sp_j` is
+    already extensive (`∝ Nj_j`); the extra `Nj_j` the old global-sum
+    form carried in both numerator and denominator is the one the paper
+    says "must go". After the ratio, the `Σ g_j² Sp_j(0) = ε Σ g_j² Nj_j/2`
+    denominator makes this a `Nj_j g_j²`-weighted phasor average of the
+    per-bin coherence, matching the paper's `Σ Nj g² e^{iφ}` form.
+  * **Denominator is the INITIAL per-slice overlap** `Σ g_j² Sp_j(0)`,
+    with `Sp_j(0) = ε·Nj_j/2` the [`_EQUATOR_WEAK_SEED`](@ref) seed
+    ([`build_u0_1st_order_cpu`](@ref)). The literal Eq.-6 denominator
+    `Σ g_j² (Nj_j/2)` assumes `|Sp_j| = Nj_j/2` (a fully coherent packet);
+    our seed is `ε ×` that, so an un-rescaled `F(ω)` would be `O(ε)` even
+    when every bin stays perfectly aligned. Dividing by the actual initial
+    overlap restores `|F|_⋆ → 1` for an ideal ACE / RASE phase-only pulse
+    and `→ 0` for full ROSE silencing, so `target_F ∈ {0, 1}` keeps its
+    meaning. Robust to a non-uniform seed (pass a matching `Sp0` implicitly
+    by changing `eps_seed`); it is a fixed, `u`-independent constant.
+  * **`clamp` is applied to `|F|_⋆` AFTER the ratio**, on the magnitude --
+    never to `Sp_j` components before summing, and NOT as a per-bin unit
+    phasor `Sp_j/|Sp_j|` (whose derivative blows up like `1/√eps` for any
+    bin passing near `Sp_j = 0`, routine across a wide ensemble).
+
+The `g`-linear, field-amplitude-proportional companion diagnostic is
+[`_weighted_field_amplitude`](@ref) (never fed into `pulse_cost`).
+"""
+function _weighted_silencing_factor(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector,
+        delta_b::AbstractVector, ::Type{T}; eps_seed::Real=_EQUATOR_WEAK_SEED) where {T}
+    length(Sp) == length(g_b) == length(Nj) == length(delta_b) || error(
+        "_weighted_silencing_factor: Sp/g_b/Nj/delta_b lengths " *
+        "$(length(Sp))/$(length(g_b))/$(length(Nj))/$(length(delta_b)) must match."
     )
-    weight = Nj .* abs2.(g_b)
-    max_coherent_sum = sum(weight .* Nj) / 2
-    F_complex = sum(weight .* Sp) / (max_coherent_sum + 1e-30)
-    abs_F = sqrt(abs2(F_complex) + 1e-30)
-    return clamp(abs_F, zero(T), one(T))
+    eps_seed > 0 || error("_weighted_silencing_factor: eps_seed must be > 0, got $eps_seed.")
+    slices = _frequency_slice_indices(delta_b)
+    num_acc = zero(T)     # Σ_ω n(ω) |F(ω)|
+    den_acc = zero(T)     # Σ_ω n(ω)
+    for idx in slices
+        wg = abs2.(g_b[idx])                                   # g_j²  (raw S₊ weight)
+        F_num = sum(wg .* Sp[idx])                             # complex, Σ g² S₊(final)
+        F_den = sum(wg .* (convert(T, eps_seed) .* (Nj[idx] ./ 2)))  # Σ g² S₊(0) = ε Σ g² Nj/2
+        F_omega = F_num / (F_den + 1e-30)
+        abs_F = sqrt(abs2(F_omega) + 1e-30)
+        n_omega = sum(Nj[idx] .* wg)                           # bright-mode density n(ω) = Σ N g²
+        num_acc += n_omega * abs_F
+        den_acc += n_omega
+    end
+    return clamp(num_acc / (den_acc + 1e-30), zero(T), one(T))
 end
 
 """
@@ -659,20 +754,26 @@ but the old `Nj_j g_j`-weighted metric gave `10000` for the same
 comparison -- corrected here.)
 
 Normalised to `[0, 1]` by the triangle-inequality bound `|Σ_j g_j Sp_j| <=
-Σ_j |g_j| |Sp_j| <= Σ_j |g_j| (Nj_j/2)` (the denominator, using `|g_j|`
-since a signed/complex coupling's SIGN cannot help the bound), same
-`1e-30` epsilon pattern for `Sp==0`/`g==0` degenerate cases.
+Σ_j |g_j| |Sp_j| <= Σ_j |g_j| (ε·Nj_j/2)` (the denominator, using `|g_j|`
+since a signed/complex coupling's SIGN cannot help the bound, and the
+weak-excitation seed scale `ε = eps_seed` = [`_EQUATOR_WEAK_SEED`](@ref)
+so an undisturbed seed reads `1`), same `1e-30` epsilon pattern for
+`Sp==0`/`g==0` degenerate cases. This is a SINGLE global sum by design --
+unlike `|F|`, the radiated field `Σ_j g_j Sp_j` genuinely is one sum over
+the whole ensemble (it IS the cavity source term), so no per-frequency
+slicing applies here.
 
 Never fed into [`pulse_cost`](@ref)'s optimised objective or its gradient
 backends -- recorded purely so callers/logs can compare it against the
 collective `|F|` actually being optimised, exactly the same role
 `_weighted_coherence` already plays relative to `_weighted_silencing_factor`.
 """
-function _weighted_field_amplitude(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector, ::Type{T}) where {T}
+function _weighted_field_amplitude(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector, ::Type{T};
+        eps_seed::Real=_EQUATOR_WEAK_SEED) where {T}
     length(Sp) == length(g_b) == length(Nj) || error(
         "_weighted_field_amplitude: Sp/g_b/Nj lengths $(length(Sp))/$(length(g_b))/$(length(Nj)) must match."
     )
-    max_field_sum = sum(abs.(g_b) .* Nj) / 2
+    max_field_sum = convert(T, eps_seed) * sum(abs.(g_b) .* Nj) / 2
     E_complex = sum(g_b .* Sp) / (max_field_sum + 1e-30)
     abs_E = sqrt(abs2(E_complex) + 1e-30)
     return clamp(abs_E, zero(T), one(T))
@@ -685,20 +786,20 @@ Dual-trajectory metrics used by [`pulse_cost`](@ref). `inversion` and
 `silencing` are both in `[0, 1]`, higher = better, and are NOT two
 coordinates of one Bloch vector:
 
-- `inversion`: from `:ground` (`Sz = -Nj/2`, `Sp = 0`). `Nj`-weighted mean
-  of `real(Sz)/(Nj/2)` mapped from `[-1, 1]` to `[0, 1]`. A π pulse scores
-  near 1.
-- `silencing`: from `:equator` (`Sz = 0`, `Sp = Nj/2` along +x). Collective,
-  cooperativity-weighted mode-overlap factor `|F|` (see
-  [`_weighted_silencing_factor`](@ref)) -- how much of the ensemble's
-  equatorial coherence survives IN PHASE with the cavity mode, not a
-  per-bin magnitude average. `F=1`: every bin coherent and phase-aligned
-  (RASE-style revival). `F=0`: fully decohered OR fully destructively
-  interfering (ROSE-style silencing) -- these are NOT distinguishable
-  from `|F|` alone, by design (both `target_F=0` and this metric only
-  ever measure the SIZE of the collective coherent sum).
+- `inversion`: from `:ground` (`Sz = -Nj/2`, `Sp = 0`). Bright-mode /
+  cooperativity (`Nj g²`) weighted mean of `real(Sz)/(Nj/2)` mapped from
+  `[-1, 1]` to `[0, 1]` (paper App. H -- see [`_weighted_inversion`](@ref)).
+  A π pulse scores near 1.
+- `silencing`: from the weak-excitation `:equator` track (`Sz = -Nj/2`,
+  `Sp = ε·Nj/2`, `ε = _EQUATOR_WEAK_SEED`). Paper silencing factor
+  `|F|_⋆ = ⟨|F(ω)|⟩` built PER FREQUENCY SLICE (see
+  [`_weighted_silencing_factor`](@ref)), NOT one sum over all bins and NOT
+  a per-bin magnitude average. `F=1`: every bin phase-aligned within its
+  slice, a pure `ω²/κ` chirp (RASE-style revival / ACE). `F=0`: `g`-space
+  phase spread cancels the collective sum (ROSE-style silencing) -- these
+  are NOT distinguishable from `|F|` alone, by design.
 - `coherence`: the OLDER, simpler per-bin `Nj`-weighted mean of
-  `|Sp|/(Nj/2)` (see [`_weighted_coherence`](@ref)), from the SAME
+  `|Sp|/(ε·Nj/2)` (see [`_weighted_coherence`](@ref)), from the SAME
   `:equator` solve as `silencing` (no extra ODE solve). DIAGNOSTIC ONLY --
   never fed into [`pulse_cost`](@ref)'s optimised objective, recorded
   purely so callers/logs can compare it against the collective `|F|`
@@ -709,10 +810,7 @@ coordinates of one Bloch vector:
   cavity field amplitude, unlike `silencing`'s cooperativity weighting;
   never fed into [`pulse_cost`](@ref)'s optimised objective.
 
-`Nj`-weighting for `inversion` (`Nj ./ sum(Nj)`, rather than the 1D
-`p_delta` this package's `prepare_derived` also returns) is used so this
-generalises correctly whether `M_g == 1` or not. Do not pass
-`initial_condition` — both ICs are fixed here. Solver kwargs
+Do not pass `initial_condition` — both ICs are fixed here. Solver kwargs
 (`signal_E_of_t`, `reltol`, ...) are forwarded to both solves.
 """
 function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; compute::Symbol=:auto, kwargs...)
@@ -720,9 +818,9 @@ function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; compute::Sym
     T = eltype(u)
     sk = _solver_kwargs(kwargs)
     _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
-    inversion = _weighted_inversion(Sz, Nj, T)
+    inversion = _weighted_inversion(Sz, d.g_b, Nj, T)
     _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:equator)
-    silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
+    silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, T)
     coherence = _weighted_coherence(Sp, Nj_eq, T)
     field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
     return inversion, silencing, coherence, field_amp
@@ -915,11 +1013,14 @@ end
 
 Scalar cost to be minimised. Inversion and silencing are scored on
 **two independent ODE solves** of the same pulse `u` (see
-[`pulse_metrics`](@ref)): `:ground` → inversion, `:equator` → collective
-silencing factor `|F|`. `target_F` picks which cavity-QED protocol this
-pulse is being optimised for: `target_F=1.0` (default) rewards
-preserving collective coherence (RASE-style revival); `target_F=0.0`
-rewards destroying it (ROSE-style echo silencing).
+[`pulse_metrics`](@ref)): `:ground` → bright-mode (`Nj g²`) weighted
+inversion `I` (paper App. H), weak-excitation `:equator` (`Sp = ε·Nj/2`)
+→ paper per-frequency-slice silencing factor `|F|_⋆ = ⟨|F(ω)|⟩` (Eq. 5 /
+A.132). `target_F` picks which cavity-QED protocol this pulse is being
+optimised for: `target_F=1.0` (default) rewards preserving collective
+coherence -- a pure `ω²/κ` chirp, `|F|→1` (RASE-style revival / ACE);
+`target_F=0.0` rewards `g`-space cancellation, `|F|→0` (ROSE-style echo
+silencing).
 
     silencing_success = 1 - (silencing - target_F)²
     fidelity_phys = inversion * silencing_success
@@ -993,10 +1094,10 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
     try
         # Both tracks must be simulated to compute the multiplicative physical fidelity
         _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
-        inversion = _weighted_inversion(Sz, Nj, T)
+        inversion = _weighted_inversion(Sz, d.g_b, Nj, T)
 
         _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:equator)
-        silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, T)
+        silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, T)
         coherence = _weighted_coherence(Sp, Nj_eq, T)
         field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
     catch e
@@ -2792,7 +2893,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         _, _, Sz, Nj = run_sim_1st_order_pure(
                             uu, pulse, d; compute=compute, sk..., initial_condition=:ground,
                         )
-                        inv_ = _weighted_inversion(Sz, Nj, eltype(uu))
+                        inv_ = _weighted_inversion(Sz, d.g_b, Nj, eltype(uu))
                         aux_ground[] = Float64(ForwardDiff.value(inv_))
                         return inv_
                     end
@@ -2804,7 +2905,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                             uu, pulse, d; compute=compute, sk..., initial_condition=:equator,
                         )
                         Tu = eltype(uu)
-                        sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
+                        sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
                         coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
                         famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
                         aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
@@ -2854,7 +2955,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         _, _, Sz, Nj = run_sim_1st_order_pure(
                             uu, pulse, d; compute=:gpu, sk..., initial_condition=:ground,
                         )
-                        inv_ = _weighted_inversion(Sz, Nj, eltype(uu))
+                        inv_ = _weighted_inversion(Sz, d.g_b, Nj, eltype(uu))
                         if first(job.idxs) == 1
                             aux_ground[] = Float64(ForwardDiff.value(inv_))
                         end
@@ -2872,7 +2973,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                             uu, pulse, d; compute=:gpu, sk..., initial_condition=:equator,
                         )
                         Tu = eltype(uu)
-                        sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, Tu)
+                        sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
                         coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
                         famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
                         if first(job.idxs) == 1

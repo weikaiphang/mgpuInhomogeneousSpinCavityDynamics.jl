@@ -162,11 +162,11 @@ function generate_3arp_pi_pulse(
 
     T = Float64
     _, _, Sp_g, Sz_g = run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:ground, reltol=reltol, abstol=abstol)
-    inversion = _weighted_inversion(Sz_g[end, :], d.Nj, T)
+    inversion = _weighted_inversion(Sz_g[end, :], d.g_b, d.Nj, T)
 
     _, _, Sp_e, Sz_e = run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:equator, reltol=reltol, abstol=abstol)
     coherence = _weighted_coherence(Sp_e[end, :], d.Nj, T)
-    silencing = _weighted_silencing_factor(Sp_e[end, :], d.g_b, d.Nj, T)
+    silencing = _weighted_silencing_factor(Sp_e[end, :], d.g_b, d.Nj, d.delta_b, T)
 
     report = (
         inversion=inversion, coherence=coherence, silencing=silencing,

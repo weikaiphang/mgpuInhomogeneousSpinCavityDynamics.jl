@@ -7,7 +7,7 @@
 # ============================================================
 
 """
-    inversion_pullback!(λx, Sz, Nj)
+    inversion_pullback!(λx, Sz, g_b, Nj)
 
 Seeds `λx` with the RAW `∂inversion/∂Re(Sz_j)` gradient (i.e. the pullback
 of [`_weighted_inversion`](@ref) alone, coefficient `+1` -- NOT weighted by
@@ -19,22 +19,29 @@ more; [`pulse_cost_grad_adjoint`](@ref) combines this RAW `∇inversion`
 with [`silencing_pullback!`](@ref)'s RAW `∇silencing` via the same
 analytical chain rule [`_pulse_cost_grad_threaded`](@ref) uses, only AFTER
 both tracks' adjoint sweeps have produced their own independent Jacobian.
+
+Matches [`_weighted_inversion`](@ref)'s paper (App. H) bright-mode /
+cooperativity weight `w_j = Nj_j g_j²` (was plain `Nj_j`).
 """
-function inversion_pullback!(λx::AbstractVector, Sz::AbstractVector, Nj::AbstractVector)
+function inversion_pullback!(λx::AbstractVector, Sz::AbstractVector, g_b::AbstractVector,
+                             Nj::AbstractVector)
     M = length(Nj)
-    length(Sz) == M || error("inversion_pullback!: Sz length $(length(Sz)) != Nj length $M.")
+    length(Sz) == length(g_b) == M || error(
+        "inversion_pullback!: Sz/g_b lengths $(length(Sz))/$(length(g_b)) != Nj length $M."
+    )
     length(λx) == real_state_length_1st_order(M) || error(
         "inversion_pullback!: λx length $(length(λx)) != $(real_state_length_1st_order(M))."
     )
     fill!(λx, 0)
-    wsum = sum(Nj)
+    w = Nj .* abs2.(g_b)
+    wsum = sum(w) + 1e-30
     @inbounds for j in 1:M
         den = Nj[j] / 2 + 1e-30
         frac = real(Sz[j]) / den
         s = (frac + 1) / 2
         # clamp(s,0,1) Dual derivative: 1 on [0,1], 0 strictly outside.
         ds = (0 <= s <= 1) ? 1.0 : 0.0
-        wj = Nj[j] / wsum
+        wj = w[j] / wsum
         # I = sum(wj * s),  dI/dRe(Sz_j) = wj * ds * (1/2) / den
         λx[_real_idx_zr(j, M)] = wj * ds * (0.5 / den)
     end
@@ -42,43 +49,75 @@ function inversion_pullback!(λx::AbstractVector, Sz::AbstractVector, Nj::Abstra
 end
 
 """
-    silencing_pullback!(λx, Sp, g_b, Nj)
+    silencing_pullback!(λx, Sp, g_b, Nj, delta_b; eps_seed=_EQUATOR_WEAK_SEED)
 
 Seeds `λx` with the RAW `∂silencing/∂Re(Sp_j)`/`∂silencing/∂Im(Sp_j)`
 gradient (the pullback of [`_weighted_silencing_factor`](@ref) alone,
-`|F|` itself -- NOT a `w_sil*(silencing-target_F)^2` cost term). See
+`|F|_⋆` itself -- NOT a `w_sil*(silencing-target_F)^2` cost term). See
 [`inversion_pullback!`](@ref)'s docstring for why the combining weight/
 `target_F` chain-rule factor now lives in [`pulse_cost_grad_adjoint`](@ref)
 instead of here.
+
+Analytic chain rule for the paper per-frequency-slice metric
+(`_weighted_silencing_factor`): with `B(ω) = _frequency_slice_indices`,
+`F(ω) = (Σ_{k∈B(ω)} g_k² Sp_k) / F_den(ω)`,
+`F_den(ω) = ε Σ_{k∈B(ω)} g_k² Nj_k/2` (real, `u`-independent),
+`n(ω) = Σ_{k∈B(ω)} Nj_k g_k²`, and
+`|F|_⋆ = clamp(Σ_ω n(ω)|F(ω)| / Σ_ω n(ω), 0, 1)`, so for a bin `j` in
+slice `ω(j)`:
+
+    ∂|F|_⋆/∂Re(Sp_j) = 𝟙_clamp · (n(ω(j))/Σn) · Re(F(ω(j)))/|F(ω(j))| · g_j²/F_den(ω(j))
+
+(and `Im` with `Im(F)` in place of `Re(F)`). No per-bin unit phasor
+anywhere -- the only divisions are by `F_den(ω)` and `|F(ω)|`, both
+bounded away from 0 by the `1e-30` floors.
 """
 function silencing_pullback!(λx::AbstractVector, Sp::AbstractVector, g_b::AbstractVector,
-                             Nj::AbstractVector)
+                             Nj::AbstractVector, delta_b::AbstractVector;
+                             eps_seed::Real=_EQUATOR_WEAK_SEED)
     M = length(Nj)
-    length(Sp) == length(g_b) == M || error(
-        "silencing_pullback!: Sp/g_b/Nj lengths $(length(Sp))/$(length(g_b))/$(length(Nj)) must match."
+    length(Sp) == length(g_b) == length(delta_b) == M || error(
+        "silencing_pullback!: Sp/g_b/delta_b lengths $(length(Sp))/$(length(g_b))/$(length(delta_b)) != Nj length $M."
     )
     length(λx) == real_state_length_1st_order(M) || error(
         "silencing_pullback!: λx length $(length(λx)) != $(real_state_length_1st_order(M))."
     )
     fill!(λx, 0)
-    weight = Nj .* abs2.(g_b)
-    den = sum(weight .* Nj) / 2 + 1e-30
-    Fr = 0.0
-    Fi = 0.0
-    @inbounds for j in 1:M
-        Fr += weight[j] * real(Sp[j])
-        Fi += weight[j] * imag(Sp[j])
+    slices = _frequency_slice_indices(delta_b)
+    nω = [sum(Nj[idx] .* abs2.(g_b[idx])) for idx in slices]
+    Nsum = sum(nω) + 1e-30
+
+    # First pass: per-slice F(ω) components + F_den(ω), and the aggregate
+    # |F|_⋆ needed to gate the outer clamp's derivative.
+    Fr = zeros(Float64, length(slices))
+    Fi = zeros(Float64, length(slices))
+    Fden = zeros(Float64, length(slices))
+    absF_star = 0.0
+    @inbounds for (s, idx) in enumerate(slices)
+        wg = abs2.(g_b[idx])
+        fd = eps_seed * sum(wg .* (Nj[idx] ./ 2)) + 1e-30
+        fr = 0.0
+        fi = 0.0
+        for (t, j) in enumerate(idx)
+            fr += wg[t] * real(Sp[j])
+            fi += wg[t] * imag(Sp[j])
+        end
+        fr /= fd
+        fi /= fd
+        Fr[s], Fi[s], Fden[s] = fr, fi, fd
+        absF_star += nω[s] * sqrt(fr * fr + fi * fi + 1e-30)
     end
-    Fr /= den
-    Fi /= den
-    abs_F = sqrt(Fr * Fr + Fi * Fi + 1e-30)
-    dsil = (0 <= abs_F <= 1) ? 1.0 : 0.0
-    # silencing = clamp(abs_F, 0, 1), dsilencing/dRe(Sp_j) = dsil * (Fr/abs_F) * weight[j]/den
-    scale = dsil / abs_F
-    @inbounds for j in 1:M
-        wj_den = weight[j] / den
-        λx[_real_idx_pr(j, M)] = scale * Fr * wj_den
-        λx[_real_idx_pi(j, M)] = scale * Fi * wj_den
+    absF_star /= Nsum
+    dstar = (0 <= absF_star <= 1) ? 1.0 : 0.0
+
+    @inbounds for (s, idx) in enumerate(slices)
+        absF = sqrt(Fr[s] * Fr[s] + Fi[s] * Fi[s] + 1e-30)
+        pref = dstar * (nω[s] / Nsum) / absF
+        for j in idx
+            gj2 = abs2(g_b[j])
+            λx[_real_idx_pr(j, M)] = pref * Fr[s] * gj2 / Fden[s]
+            λx[_real_idx_pi(j, M)] = pref * Fi[s] * gj2 / Fden[s]
+        end
     end
     return λx
 end
@@ -227,13 +266,13 @@ function pulse_cost_on_frozen_mesh(
     u0g = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :ground)
     usg = replay_tsit5_window(u0g, p, mesh_ground.t[1], mesh_ground.dt)
     _, _, Sz = unpack_state_1st_order_u(usg[end], Int(d.M))
-    inversion = _weighted_inversion(Sz, d.Nj, T)
+    inversion = _weighted_inversion(Sz, d.g_b, d.Nj, T)
 
     mesh_equator === nothing && error("pulse_cost_on_frozen_mesh: equator mesh required.")
     u0e = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :equator)
     use = replay_tsit5_window(u0e, p, mesh_equator.t[1], mesh_equator.dt)
     _, Sp, _ = unpack_state_1st_order_u(use[end], Int(d.M))
-    silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, T)
+    silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, T)
     coherence = _weighted_coherence(Sp, d.Nj, T)
     field_amp = _weighted_field_amplitude(Sp, d.g_b, d.Nj, T)
 
@@ -338,24 +377,24 @@ function pulse_cost_grad_adjoint(
     local inversion, silencing, coherence, field_amp, grad_I, grad_F
     try
         function pb_inv!(λx, a, Sp, Sz)
-            inversion_pullback!(λx, Sz, d.Nj)
+            inversion_pullback!(λx, Sz, d.g_b, d.Nj)
             return λx
         end
         grad_I, _, _, Sz, _, _ = _adjoint_one_track(
             uθ, pulse, d, :ground, pb_inv!,
             reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
         )
-        inversion = Float64(_weighted_inversion(Sz, d.Nj, Float64))
+        inversion = Float64(_weighted_inversion(Sz, d.g_b, d.Nj, Float64))
 
         function pb_sil!(λx, a, Sp, Sz)
-            silencing_pullback!(λx, Sp, d.g_b, d.Nj)
+            silencing_pullback!(λx, Sp, d.g_b, d.Nj, d.delta_b)
             return λx
         end
         grad_F, _, Sp, _, _, _ = _adjoint_one_track(
             uθ, pulse, d, :equator, pb_sil!,
             reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
         )
-        silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, Float64))
+        silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, Float64))
         coherence = Float64(_weighted_coherence(Sp, d.Nj, Float64))
         field_amp = Float64(_weighted_field_amplitude(Sp, d.g_b, d.Nj, Float64))
     catch e

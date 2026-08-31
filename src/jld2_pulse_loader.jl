@@ -15,8 +15,11 @@
 #      on that trace, and fit only the masked control envelope. If
 #      PULSE_CONFIG is present but identification rejects the sequence, error
 #      (do not fit a mixed drive into u).
-#   5. Forward-simulate the recorded drive (:ground and :equator).
-#      Those metrics are the reference metrics.
+#   5. Forward-simulate the recorded drive (:ground and the weak-excitation
+#      :equator seed, Sp = eps*Nj/2). Those metrics are the reference
+#      metrics: bright-mode (Nj g^2) weighted inversion I (paper App. H)
+#      and the per-frequency-slice silencing factor |F|_* = <|F(omega)|>
+#      (paper Eq. 5 / A.132).
 #   6. If the file stores results, reconcile this run's final-state
 #      outputs and metrics against them. If it stores none, auto-PASS.
 #      FAIL stops. PASS continues to 7 then 8 (pulse_optimizer2.jl).
@@ -1382,8 +1385,8 @@ function run_reference_forward(
 
     Sigma_p = sum(Sp)
     Sigma_z = sum(Sz)
-    inversion = _weighted_inversion(Sz, d.Nj, Float64)
-    silencing = _weighted_silencing_factor(Sp_eq, d.g_b, d.Nj, Float64)
+    inversion = _weighted_inversion(Sz, d.g_b, d.Nj, Float64)
+    silencing = _weighted_silencing_factor(Sp_eq, d.g_b, d.Nj, d.delta_b, Float64)
     coherence = _weighted_coherence(Sp_eq, d.Nj, Float64)
     duration = _recorded_control_duration(
         ref.identification, ref.control_t, ref.control_Ex, ref.control_Ep,

@@ -203,11 +203,13 @@ end
     @test Sz_g ≈ .-Nj ./ 2
     @test all(iszero, Sp_i)
     @test Sz_i ≈ Nj ./ 2
-    @test real.(Sp_e) ≈ Nj ./ 2
+    # :equator is now the weak-excitation seed: near-|g⟩ (Sz = -Nj/2) with a
+    # tiny transverse coherence Sp = ε·Nj/2, ε = _EQUATOR_WEAK_SEED ≪ 1
+    # (paper App. B). NOT the old macroscopic Dicke state Sz = 0, Sp = Nj/2.
+    @test real.(Sp_e) ≈ _EQUATOR_WEAK_SEED .* Nj ./ 2
     @test all(iszero, imag.(Sp_e))
-    @test all(iszero, Sz_e)
+    @test Sz_e ≈ .-Nj ./ 2
     @test abs2.(Sp_g) .+ abs2.(Sz_g) ≈ (Nj ./ 2) .^ 2
-    @test abs2.(Sp_e) .+ abs2.(Sz_e) ≈ (Nj ./ 2) .^ 2
     @test_throws ErrorException build_u0_1st_order_cpu(M, Nj, Float64, :nope)
     @test_throws ErrorException _forbid_initial_condition((initial_condition=:ground,))
 end
@@ -254,6 +256,13 @@ const FAKE_D_ODE = merge(FAKE_D, (
     # ForwardDiff.gradient through a real ODE solve, cross-checked against
     # finite differences (this is the claim CompositePulse's own module
     # docstring makes about raw_gap/the taper window -- verify it here too).
+    # The relerr denominator carries an absolute floor (as test/adjoint.jl's
+    # own `_relmax` does): the global-drive-phase parameter has a STRUCTURAL
+    # zero gradient (both inversion and the per-slice |F| are invariant to a
+    # common phase), so its one-sided FD estimate is pure solver-FP noise
+    # (~1e-11) that a bare `max(|g|, 1e-8)` would inflate into a false ~1e-3
+    # relative error. Any genuinely wrong component (|g| ≫ floor) is still
+    # checked strictly.
     g = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE)[1], u0)
     @test all(isfinite, g)
     eps = 1e-6
@@ -263,7 +272,7 @@ const FAKE_D_ODE = merge(FAKE_D, (
         up[i] += eps
         fd[i] = (pulse_cost(up, pulse, FAKE_D_ODE)[1] - cost) / eps
     end
-    relerr = abs.(g .- fd) ./ max.(abs.(g), 1e-8)
+    relerr = abs.(g .- fd) ./ max.(abs.(g), abs.(fd), 1e-6)
     @test maximum(relerr) < 1e-3
 
     # kappa_I=kappa_S=0.0 (explicit) must reproduce the legacy, unbarriered
@@ -286,19 +295,20 @@ const FAKE_D_ODE = merge(FAKE_D, (
             up[i] += eps
             fdb[i] = (pulse_cost(up, pulse, FAKE_D_ODE; I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1] - costb) / eps
         end
-        relerrb = abs.(gb .- fdb) ./ max.(abs.(gb), 1e-8)
+        relerrb = abs.(gb .- fdb) ./ max.(abs.(gb), abs.(fdb), 1e-6)
         @test maximum(relerrb) < 1e-3
     end
 
     # g_b = 0 decouples spins from the drive AND from the cavity mode
-    # entirely: :ground never inverts (inversion == 0), and the silencing
-    # factor -- weighted by Nj*g^2, see _weighted_silencing_factor -- has
-    # zero weight everywhere, so it collapses to its own epsilon floor
-    # (~0), NOT to 1.0: g=0 means no coupling channel into the cavity at
-    # all, which is a genuinely different statement than "the spins stay
-    # locally coherent" (they do, :equator's own Sp never decays here --
-    # this metric just doesn't measure that; it measures collective
-    # retrieval INTO the cavity mode specifically).
+    # entirely: :ground never inverts, and _weighted_inversion's own
+    # bright-mode weight Nj*g^2 is exactly zero everywhere -> inversion
+    # == 0.0. The per-frequency-slice silencing factor (see
+    # _weighted_silencing_factor) likewise has zero bright-mode density
+    # n(omega) = sum(Nj g^2) in every slice, so |F|_* collapses to its own
+    # epsilon floor (~0), NOT to 1.0: g=0 means no coupling channel into
+    # the cavity at all, a genuinely different statement than "the spins
+    # stay locally coherent" (they do -- :equator's own Sp never decays
+    # here -- this metric just doesn't measure that).
     d_nog = merge(FAKE_D_ODE, (g_b = zeros(FAKE_D_ODE.M),))
     inv_nog, sil_nog = pulse_metrics(u0, pulse, d_nog)
     @test inv_nog == 0.0
@@ -818,13 +828,20 @@ end
     # Penalty settings are NOT separate run_local_adam keywords -- they
     # travel through cost_kwargs, exactly like target_F/w_tmax/w_power/
     # w_time's own base values (see run_local_adam's own docstring).
-    cost_kwargs_default = (w_tmax=1.0, w_power=0.05, w_time=0.15)
-    cost_kwargs_off = (w_tmax=1.0, w_power=0.05, w_time=0.15, kappa_I=0.0, kappa_S=0.0)
+    #
+    # I_min=0.99 (kappa_I keeps pulse_cost's own default 50.0) so the
+    # inversion squared-hinge penalty is genuinely ACTIVE at the :hs1 seed
+    # (inversion ≈ 0.986 < 0.99): under the paper-aligned metrics the :hs1
+    # pulse retains full equatorial coherence, so its silencing |F|_⋆
+    # clamps to 1.0 and BOTH default floors (I_min=0.85, S_min=0.85) would
+    # otherwise be slack here -- this test is about the penalty MECHANISM
+    # biting, not about which floor a canonical seed happens to trip.
+    cost_kwargs_default = (w_tmax=1.0, w_power=0.05, w_time=0.15, I_min=0.99)
+    cost_kwargs_off = (w_tmax=1.0, w_power=0.05, w_time=0.15, I_min=0.99, kappa_I=0.0, kappa_S=0.0)
 
-    # default (pulse_cost's own I_min=0.85/kappa_I=50.0 etc, since
-    # cost_kwargs doesn't override them) vs kappa_I=kappa_S=0 (explicitly
-    # inert) must actually produce a DIFFERENT history -- the penalty is on
-    # by default and does something.
+    # default (kappa_I=50.0 from pulse_cost, I_min=0.99 active) vs
+    # kappa_I=kappa_S=0 (explicitly inert) must actually produce a
+    # DIFFERENT history -- the penalty is on by default and does something.
     baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
         num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-default]")
     off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_off;
