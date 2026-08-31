@@ -132,6 +132,9 @@ export jld2_pipeline_defaults, jld2_optimizer_defaults
 export run_sim_1st_order_trajectory, run_sim_1st_order_final
 export optrunlog_paths, save_optimisation_run_log, save_optimised_pulse_parameters
 export optimise_control_pulse_from_jld2
+export segment_signal_control, segment_signal_control_from_trace
+export identified_signal_control, control_envelope_E_of_t, signal_envelope_E_of_t
+export SignalControlRejected
 
 # Analytic composite ARP pulse exports
 export generate_3arp_pi_pulse

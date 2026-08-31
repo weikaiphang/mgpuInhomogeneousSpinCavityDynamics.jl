@@ -1,25 +1,782 @@
 # ============================================================
 # JLD2-DRIVEN SIGNAL/CONTROL PULSE OPTIMISATION
 #
+# Identification (waveforms, not tuple position) then optimisation of
+# ONE control envelope. Signal is a fixed background, never in `u`.
+#
 # Linear pipeline (optimise_control_pulse_from_jld2, and the same
 # helpers in examples/reference_run_workflow.ipynb):
 #
 #   1. Open a *.jld2 file.
 #   2. Extract SYSTEM_CONFIG, PULSE_CONFIG, SIM_SETTING.
-#   3. Parse those into the reference configs (ensemble `d`, pulse specs).
-#   4. If PULSE_CONFIG is missing/unparseable, load the sibling *_pulsemat.csv.
+#   3. Parse them into the reference configs (ensemble `d`, pulse specs).
+#      Signal vs control is identified by waveform (WURST / π / amplitude).
+#   4. If PULSE_CONFIG is absent, load the sibling *_pulsemat.csv, identify
+#      on that trace, and fit only the masked control envelope. If
+#      PULSE_CONFIG is present but identification rejects the sequence, error
+#      (do not fit a mixed drive into u).
 #   5. Forward-simulate the recorded drive (:ground and :equator).
 #      Those metrics are the reference metrics.
 #   6. If the file stores results, reconcile this run's final-state
 #      outputs and metrics against them. If it stores none, auto-PASS.
 #      FAIL stops. PASS continues to 7 then 8 (pulse_optimizer2.jl).
 #   7. On PASS, linear-fit (fit_mode=:linear) a CompositePulse seed of the
-#      CONTROL pulse only (PULSE_CONFIG control segments, or the CSV when
-#      PULSE_CONFIG was unavailable). Signal is never in the fit target.
+#      CONTROL envelope only. Signal is never in the fit target.
 #   8. optimise_composite_pulse (pulse_optimizer2.jl) optimises that same
-#      CONTROL pulse on the reference ensemble, warm-started from the seed.
-#      Parsed signal is a fixed background (never in `u`).
+#      CONTROL pulse. Identified signal is a fixed background (never in `u`).
 # ============================================================
+
+# ============================================================
+# SIGNAL vs CONTROL IDENTIFICATION
+#
+# From each sub-pulse's explicit waveform E(t), not from tuple position
+# and not from `name`. Pipeline (no circularity):
+#
+#   1. Per sub-pulse features: WURST?, π-phase?, π-area?, E[A], peak.
+#   2. Control_0 = WURST OR π (phase OR area/flip-angle).
+#   3. Remaining: signal iff peak ≤ a_signal * min{E[A_j] | Control_0},
+#      with a_signal = 0.1. Otherwise those leftovers are extra control.
+#   4. Time order must be signal* control+. Any signal after a control
+#      rejects the whole sequence. Signal support must end before the
+#      first control starts.
+#
+# When a PULSE_CONFIG is given, each entry is one sub-pulse (analytic
+# 3ARP stays three WURSTs; do not re-split). When only a sampled I/Q
+# trace is given, sub-pulses come from `_detect_subpulse_segments`
+# (same defaults as the seed fitter), with a multiscale pass so a
+# weak Gaussian is not hidden by a WURST peak.
+# ============================================================
+
+const _SC_A_SIGNAL = 0.1
+const _SC_N_SIGMA_SUPPORT = 5.0
+const _SC_N_SAMPLES = 4096
+const _SC_REL_THRESH = 1e-3
+const _SC_MIN_ACTIVE = 5
+const _SC_MIN_SILENCE = 3
+const _SC_PI_PHASE_FRAC = 0.15
+const _SC_PI_AREA_REL = 0.20
+const _SC_PI_N_MAX = 4
+const _SC_WURST_ENV_CORR = 0.85
+const _SC_WURST_CHIRP_R2 = 0.85
+const _SC_WURST_SWEEP_RAD = Float64(π)
+const _SC_FORM_FACTOR_CHIRP = 0.25
+const _SC_A_FLOOR = 1e-30
+
+struct SignalControlRejected <: Exception
+    reason::String
+end
+
+function Base.showerror(io::IO, e::SignalControlRejected)
+    print(io, "Signal/control identification rejected the sequence: ", e.reason)
+end
+
+"""
+    signal_control_defaults() -> NamedTuple
+
+Thresholds for [`segment_signal_control`](@ref). `a_signal=0.1` is the
+locked amplitude ratio. Detection knobs match
+[`_detect_subpulse_segments`](@ref).
+"""
+function signal_control_defaults()
+    return (
+        a_signal=_SC_A_SIGNAL,
+        n_sigma_support=_SC_N_SIGMA_SUPPORT,
+        n_samples=_SC_N_SAMPLES,
+        rel_thresh=_SC_REL_THRESH,
+        min_active_samples=_SC_MIN_ACTIVE,
+        min_silence_samples=_SC_MIN_SILENCE,
+        pi_phase_frac=_SC_PI_PHASE_FRAC,
+        pi_area_rel=_SC_PI_AREA_REL,
+        pi_n_max=_SC_PI_N_MAX,
+        wurst_env_corr=_SC_WURST_ENV_CORR,
+        wurst_chirp_r2=_SC_WURST_CHIRP_R2,
+        wurst_sweep_rad=_SC_WURST_SWEEP_RAD,
+        form_factor_chirp=_SC_FORM_FACTOR_CHIRP,
+    )
+end
+
+# ------------------------------------------------------------
+# Small numeric helpers (no Statistics.jl)
+# ------------------------------------------------------------
+
+_sc_mean(x) = sum(x) / length(x)
+
+function _sc_corr(x::AbstractVector, y::AbstractVector)
+    n = length(x)
+    n == length(y) || return 0.0
+    n < 3 && return 0.0
+    mx = _sc_mean(x)
+    my = _sc_mean(y)
+    sx = 0.0
+    sy = 0.0
+    sxy = 0.0
+    @inbounds for i in 1:n
+        dx = x[i] - mx
+        dy = y[i] - my
+        sx += dx * dx
+        sy += dy * dy
+        sxy += dx * dy
+    end
+    (sx > 0.0 && sy > 0.0) || return 0.0
+    return sxy / sqrt(sx * sy)
+end
+
+function _sc_trapz(t::AbstractVector, y::AbstractVector)
+    n = length(t)
+    n == length(y) || error("_sc_trapz: t/y lengths $(n)/$(length(y)).")
+    n < 2 && return 0.0
+    acc = 0.0
+    @inbounds for i in 1:n-1
+        acc += 0.5 * (y[i] + y[i+1]) * (t[i+1] - t[i])
+    end
+    return acc
+end
+
+function _sc_weighted_linear_fit(x::AbstractVector, y::AbstractVector, w::AbstractVector)
+    n = length(x)
+    n == length(y) == length(w) || error("_sc_weighted_linear_fit: length mismatch.")
+    W = sum(w)
+    W <= 0 && return (slope=0.0, intercept=0.0, r2=0.0)
+    xbar = 0.0
+    ybar = 0.0
+    @inbounds for i in 1:n
+        xbar += w[i] * x[i]
+        ybar += w[i] * y[i]
+    end
+    xbar /= W
+    ybar /= W
+    sxx = 0.0
+    sxy = 0.0
+    syy = 0.0
+    @inbounds for i in 1:n
+        dx = x[i] - xbar
+        dy = y[i] - ybar
+        sxx += w[i] * dx * dx
+        sxy += w[i] * dx * dy
+        syy += w[i] * dy * dy
+    end
+    slope = sxx > 0.0 ? sxy / sxx : 0.0
+    intercept = ybar - slope * xbar
+    ss_res = 0.0
+    @inbounds for i in 1:n
+        res = y[i] - (intercept + slope * x[i])
+        ss_res += w[i] * res * res
+    end
+    r2 = syy > 0.0 ? max(0.0, 1.0 - ss_res / syy) : 0.0
+    return (slope=slope, intercept=intercept, r2=r2)
+end
+
+_sc_phase_abs_diff(a, b) = abs(rem2pi(Float64(a) - Float64(b), RoundNearest))
+
+function _sc_omega_per_E(d)
+    d === nothing && return nothing
+    hasproperty(d, :g_mean) || return nothing
+    hasproperty(d, :sqrt_kappa_e) || return nothing
+    hasproperty(d, :kappa_t) || return nothing
+    kt = Float64(d.kappa_t)
+    kt > 0 || return nothing
+    g = Float64(d.g_mean)
+    s = Float64(d.sqrt_kappa_e)
+    (g > 0 && s > 0) || return nothing
+    # Steady-state |a| = 2√κe |E| / κt, Ω_spin = 2 g |a|  (rhs_1st_order!,
+    # CompositePulse amp_scale). Same map as amp_scale's Ω → E conversion.
+    return 4.0 * g * s / kt
+end
+
+# ------------------------------------------------------------
+# Support and sampling of one PULSE_CONFIG entry
+# ------------------------------------------------------------
+
+function _sc_cfg_kind(cfg)
+    hasproperty(cfg, :kind) || return :unknown
+    return cfg.kind
+end
+
+function _sc_cfg_support(cfg; n_sigma=_SC_N_SIGMA_SUPPORT)
+    kind = _sc_cfg_kind(cfg)
+    if kind === :gaussian
+        t0 = Float64(cfg.t0)
+        sig = Float64(cfg.sigma)
+        half = n_sigma * sig
+        return (t0 - half, t0 + half)
+    elseif kind === :wurst
+        tc = Float64(cfg.t_center)
+        dur = Float64(cfg.duration)
+        edge = hasproperty(cfg, :edge_frac) ?
+            max(dur * Float64(cfg.edge_frac), eps(Float64)) : max(dur * 1e-4, eps(Float64))
+        pad = 8.0 * edge
+        return (tc - dur / 2 - pad, tc + dur / 2 + pad)
+    elseif hasproperty(cfg, :t_start) && hasproperty(cfg, :t_end)
+        return (Float64(cfg.t_start), Float64(cfg.t_end))
+    else
+        return nothing
+    end
+end
+
+function _sc_sample_callable(E_of_t, t_lo::Float64, t_hi::Float64, n_samples::Integer)
+    t_hi > t_lo || error("_sc_sample_callable: empty interval [$t_lo, $t_hi].")
+    n = Int(n_samples)
+    n >= 8 || error("_sc_sample_callable: n_samples must be >= 8, got $n.")
+    t = collect(range(t_lo, t_hi; length=n))
+    I = Vector{Float64}(undef, n)
+    Q = Vector{Float64}(undef, n)
+    @inbounds for i in 1:n
+        z = ComplexF64(E_of_t(t[i]))
+        I[i] = real(z)
+        Q[i] = imag(z)
+    end
+    return t, I, Q
+end
+
+# ------------------------------------------------------------
+# Waveform tests
+# ------------------------------------------------------------
+
+function _sc_wurst_envelope_corr(t::AbstractVector, A::AbstractVector, t_s::Float64, t_e::Float64)
+    T = t_e - t_s
+    T > 0 || return 0.0
+    peak = maximum(A)
+    peak <= _SC_A_FLOOR && return 0.0
+    An = A ./ peak
+    τ = t .- t_s
+    best = -1.0
+    for n in (4.0, 8.0, 10.0, 16.0, 20.0, 32.0, 40.0)
+        e = similar(An)
+        @inbounds for i in eachindex(τ)
+            s = sin(pi * (τ[i] - T / 2) / T)
+            e[i] = 1.0 - abs(s)^n
+        end
+        c = _sc_corr(An, e)
+        best = max(best, c)
+    end
+    return best
+end
+
+function _sc_is_wurst_waveform(t, A, f, t_s, t_e, defs; form_factor::Real=1.0)
+    T = t_e - t_s
+    T > 0 || return false
+    env = _sc_wurst_envelope_corr(t, A, t_s, t_e)
+    w = A .^ 2
+    fit = _sc_weighted_linear_fit(t, f, w)
+    sweep = abs(fit.slope) * T
+    is_env = env >= defs.wurst_env_corr
+    is_chirp = (fit.r2 >= defs.wurst_chirp_r2) && (sweep >= defs.wurst_sweep_rad)
+    # Chirped ARP also has |∫E| ≪ ∫|E|; use that as a third vote so a
+    # Gaussian (form_factor ~ 1, sweep ~ 0) cannot pass on envelope luck.
+    is_stationary_phase = form_factor <= defs.form_factor_chirp
+    return is_env && is_chirp && is_stationary_phase
+end
+
+function _sc_is_pi_phase(phi::AbstractVector, A::AbstractVector, defs)
+    peak = maximum(A)
+    peak <= _SC_A_FLOOR && return false
+    floor = 0.05 * peak
+    i0 = findfirst(a -> a >= floor, A)
+    i1 = findlast(a -> a >= floor, A)
+    (i0 === nothing || i1 === nothing || i1 <= i0) && return false
+    ΔΦ = Float64(phi[i1] - phi[i0])
+    return _sc_phase_abs_diff(ΔΦ, π) <= defs.pi_phase_frac * π
+end
+
+function _sc_is_pi_area(t::AbstractVector, A::AbstractVector, d, defs)
+    ΩE = _sc_omega_per_E(d)
+    ΩE === nothing && return false
+    θ = ΩE * _sc_trapz(t, A)
+    θ <= 0 && return false
+    best_rel = Inf
+    @inbounds for n in 1:Int(defs.pi_n_max)
+        rel = abs(θ - n * π) / (n * π)
+        best_rel = min(best_rel, rel)
+    end
+    return best_rel <= defs.pi_area_rel
+end
+
+# ------------------------------------------------------------
+# Features of one sampled sub-pulse
+# ------------------------------------------------------------
+
+"""
+    subpulse_waveform_features(t, I, Q; d=nothing, t_start=nothing, t_end=nothing, defs=signal_control_defaults())
+
+Waveform features for one already-isolated sub-pulse (one detected
+segment, or one `PULSE_CONFIG` entry sampled on its own support).
+Uses [`_instantaneous_frequency`](@ref) for phase/frequency.
+"""
+function subpulse_waveform_features(
+    t::AbstractVector, I::AbstractVector, Q::AbstractVector;
+    d=nothing,
+    t_start::Union{Nothing,Real}=nothing,
+    t_end::Union{Nothing,Real}=nothing,
+    kind::Symbol=:unknown,
+    defs=signal_control_defaults(),
+    source_index::Integer=0,
+)
+    n = length(t)
+    n == length(I) == length(Q) || error(
+        "subpulse_waveform_features: t/I/Q lengths $(n)/$(length(I))/$(length(Q))."
+    )
+    n >= 2 || error("subpulse_waveform_features: need >= 2 samples, got $n.")
+    A = hypot.(I, Q)
+    peak = maximum(A)
+    ts = t_start === nothing ? Float64(t[1]) : Float64(t_start)
+    te = t_end === nothing ? Float64(t[end]) : Float64(t_end)
+    T = max(te - ts, eps(Float64))
+    mean_A = _sc_trapz(t, A) / T
+    area_A = _sc_trapz(t, A)
+    E_int_re = _sc_trapz(t, I)
+    E_int_im = _sc_trapz(t, Q)
+    form_factor = area_A > _SC_A_FLOOR ? hypot(E_int_re, E_int_im) / area_A : 0.0
+
+    phi, f = _instantaneous_frequency(t, I, Q)
+    is_wurst_kind = kind === :wurst
+    is_wurst_wave = peak > _SC_A_FLOOR &&
+        _sc_is_wurst_waveform(t, A, f, ts, te, defs; form_factor=form_factor)
+    is_wurst = is_wurst_kind || is_wurst_wave
+    is_pi_phase = peak > _SC_A_FLOOR && _sc_is_pi_phase(phi, A, defs)
+    is_pi_area = _sc_is_pi_area(t, A, d, defs)
+    is_pi = is_pi_phase || is_pi_area
+    ΩE = _sc_omega_per_E(d)
+    flip_angle = ΩE === nothing ? NaN : ΩE * area_A
+
+    return (
+        source_index=Int(source_index),
+        kind=kind,
+        t_start=ts,
+        t_end=te,
+        peak=Float64(peak),
+        mean_A=Float64(mean_A),
+        area_A=Float64(area_A),
+        form_factor=Float64(form_factor),
+        flip_angle=Float64(flip_angle),
+        is_wurst_kind=is_wurst_kind,
+        is_wurst_waveform=is_wurst_wave,
+        is_wurst=is_wurst,
+        is_pi_phase=is_pi_phase,
+        is_pi_area=is_pi_area,
+        is_pi=is_pi,
+    )
+end
+
+# ------------------------------------------------------------
+# Assemble labels: Control_0, amplitude, sequence
+# ------------------------------------------------------------
+
+function _sc_assemble(features::Vector, a_signal::Real)
+    n = length(features)
+    n >= 1 || return (
+        ok=false,
+        reason="No sub-pulses to classify.",
+        labels=Symbol[],
+        control0_idx=Int[],
+        signal_idx=Int[],
+        control_idx=Int[],
+        order=Int[],
+        min_control_mean_A=NaN,
+    )
+
+    control0 = Int[]
+    undetermined = Int[]
+    @inbounds for i in 1:n
+        f = features[i]
+        if f.is_wurst || f.is_pi
+            push!(control0, i)
+        else
+            push!(undetermined, i)
+        end
+    end
+
+    if isempty(control0)
+        return (
+            ok=false,
+            reason="No control sub-pulse: none is WURST or a π-pulse (phase or area/flip-angle). " *
+                   "Refusing to invent a signal from position.",
+            labels=fill(:rejected, n),
+            control0_idx=Int[],
+            signal_idx=Int[],
+            control_idx=Int[],
+            order=Int[],
+            min_control_mean_A=NaN,
+        )
+    end
+
+    min_ctrl_mean = minimum(features[j].mean_A for j in control0)
+    thresh = Float64(a_signal) * min_ctrl_mean
+    labels = Vector{Symbol}(undef, n)
+    @inbounds for i in control0
+        labels[i] = :control
+    end
+    signal_idx = Int[]
+    control_idx = copy(control0)
+    @inbounds for i in undetermined
+        if features[i].peak <= thresh + eps(Float64)
+            labels[i] = :signal
+            push!(signal_idx, i)
+        else
+            labels[i] = :control
+            push!(control_idx, i)
+        end
+    end
+    sort!(control_idx)
+    sort!(signal_idx)
+
+    order = sort(collect(1:n); by=i -> (features[i].t_start, i))
+    seen_control = false
+    @inbounds for i in order
+        if labels[i] === :control
+            seen_control = true
+        elseif labels[i] === :signal && seen_control
+            seq = join(string(labels[j]) * "@" * string(round(features[j].t_start * 1e6; digits=3)) * "us"
+                       for j in order)
+            return (
+                ok=false,
+                reason="Signal follows a control pulse (forbidden prefix rule). Time order: $seq.",
+                labels=labels,
+                control0_idx=control0,
+                signal_idx=signal_idx,
+                control_idx=control_idx,
+                order=order,
+                min_control_mean_A=min_ctrl_mean,
+            )
+        end
+    end
+
+    if !isempty(signal_idx) && !isempty(control_idx)
+        t_sig_end = maximum(features[i].t_end for i in signal_idx)
+        t_ctrl0 = minimum(features[i].t_start for i in control_idx)
+        if t_sig_end >= t_ctrl0
+            return (
+                ok=false,
+                reason="A signal's support overlaps or outlasts the first control start " *
+                       "(t_signal_end=$(t_sig_end)s, t_control_start=$(t_ctrl0)s). " *
+                       "Control must start strictly after the signal has ended.",
+                labels=labels,
+                control0_idx=control0,
+                signal_idx=signal_idx,
+                control_idx=control_idx,
+                order=order,
+                min_control_mean_A=min_ctrl_mean,
+            )
+        end
+    end
+
+    isempty(control_idx) && return (
+        ok=false,
+        reason="No control sub-pulse left after labelling.",
+        labels=labels,
+        control0_idx=control0,
+        signal_idx=signal_idx,
+        control_idx=control_idx,
+        order=order,
+        min_control_mean_A=min_ctrl_mean,
+    )
+
+    return (
+        ok=true,
+        reason="ok",
+        labels=labels,
+        control0_idx=control0,
+        signal_idx=signal_idx,
+        control_idx=control_idx,
+        order=order,
+        min_control_mean_A=min_ctrl_mean,
+    )
+end
+
+function _sc_finish(features, assembled, PULSE_CONFIG, a_signal; error_on_reject::Bool=false)
+    result = (
+        ok=assembled.ok,
+        reason=assembled.reason,
+        a_signal=Float64(a_signal),
+        min_control_mean_A=assembled.min_control_mean_A,
+        features=features,
+        labels=assembled.labels,
+        signal_idx=assembled.signal_idx,
+        control_idx=assembled.control_idx,
+        control0_idx=assembled.control0_idx,
+        order=assembled.order,
+        signal_cfg=PULSE_CONFIG === nothing ? nothing :
+            (isempty(assembled.signal_idx) ? () : tuple((PULSE_CONFIG[i] for i in assembled.signal_idx)...)),
+        control_cfg=PULSE_CONFIG === nothing ? nothing :
+            tuple((PULSE_CONFIG[i] for i in assembled.control_idx)...),
+    )
+    if !result.ok && error_on_reject
+        throw(SignalControlRejected(result.reason))
+    end
+    return result
+end
+
+"""
+    _sc_detect_subpulses_multiscale(t, A; rel_thresh, min_active_samples, min_silence_samples, max_passes=4)
+
+Calls [`_detect_subpulse_segments`](@ref) repeatedly. After each pass the
+detected samples are zeroed so a later pass can see a weaker pulse that
+the first pass treated as silence (the detector's threshold is
+`rel_thresh * maximum(A)` of the array it is given). This is required
+for ROSE-like traces: the Gaussian peak is ~10^{-4} of a WURST peak,
+below the default `1e-3` global floor, so a single call finds only the
+WURST. Each pass is still the existing detector, unchanged.
+"""
+function _sc_detect_subpulses_multiscale(
+    t::AbstractVector, A::AbstractVector;
+    rel_thresh::Real=_SC_REL_THRESH,
+    min_active_samples::Integer=_SC_MIN_ACTIVE,
+    min_silence_samples::Integer=_SC_MIN_SILENCE,
+    max_passes::Integer=4,
+)
+    Awork = Float64.(A)
+    found = Tuple{Int,Int}[]
+    for _ in 1:max_passes
+        maximum(Awork) <= _SC_A_FLOOR && break
+        segs = _detect_subpulse_segments(
+            t, Awork;
+            rel_thresh=rel_thresh,
+            min_active_samples=min_active_samples,
+            min_silence_samples=min_silence_samples,
+        )
+        isempty(segs) && break
+        for (i0, i1) in segs
+            push!(found, (i0, i1))
+            @inbounds Awork[i0:i1] .= 0.0
+        end
+    end
+    sort!(found; by=first)
+    return found
+end
+
+# ------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------
+
+"""
+    segment_signal_control(PULSE_CONFIG; d=nothing, a_signal=0.1, error_on_reject=false, kwargs...)
+
+Identify signal vs control from a `PULSE_CONFIG` tuple. Each entry is
+one sub-pulse. Optional `d` (`prepare_derived`) enables the physical
+flip-angle test `θ = (4 g_mean √κe / κt) ∫|E| dt`.
+
+Returns a NamedTuple: `ok`, `reason`, `signal_cfg`, `control_cfg`,
+`signal_idx`, `control_idx`, `features`, `labels`. If `ok=false` the
+sequence must not be optimised. `error_on_reject=true` throws
+[`SignalControlRejected`](@ref) instead of returning.
+"""
+function segment_signal_control(
+    PULSE_CONFIG;
+    d=nothing,
+    a_signal::Real=signal_control_defaults().a_signal,
+    n_sigma_support::Real=signal_control_defaults().n_sigma_support,
+    n_samples::Integer=signal_control_defaults().n_samples,
+    error_on_reject::Bool=false,
+    defs=signal_control_defaults(),
+)
+    n = length(PULSE_CONFIG)
+    n >= 1 || error("segment_signal_control: PULSE_CONFIG is empty.")
+    a_signal > 0 || error("a_signal must be positive, got $a_signal.")
+    defs = merge(defs, (a_signal=Float64(a_signal), n_sigma_support=Float64(n_sigma_support),
+                         n_samples=Int(n_samples)))
+
+    t_span_hi = 0.0
+    if d !== nothing && hasproperty(d, :timespan)
+        t_span_hi = Float64(d.timespan[2] - d.timespan[1])
+    end
+
+    features = Vector{Any}(undef, n)
+    for i in 1:n
+        cfg = PULSE_CONFIG[i]
+        kind = _sc_cfg_kind(cfg)
+        supp = _sc_cfg_support(cfg; n_sigma=defs.n_sigma_support)
+        if supp === nothing
+            t_span_hi > 0 || error(
+                "PULSE_CONFIG[$i] kind=$kind has no analytic support; pass d with timespan " *
+                "or give the entry t_start/t_end."
+            )
+            t_lo, t_hi = 0.0, t_span_hi
+        else
+            t_lo, t_hi = supp
+            if t_span_hi > 0
+                t_lo = max(t_lo, 0.0)
+                t_hi = min(t_hi, t_span_hi)
+            else
+                t_lo = max(t_lo, 0.0)
+            end
+        end
+        t_hi > t_lo || error("PULSE_CONFIG[$i] has empty support [$t_lo, $t_hi].")
+        E = build_drive_pulse(cfg)
+        t, I, Q = _sc_sample_callable(E, t_lo, t_hi, defs.n_samples)
+        if kind !== :gaussian && kind !== :wurst
+            A = hypot.(I, Q)
+            segs = _detect_subpulse_segments(
+                t, A;
+                rel_thresh=defs.rel_thresh,
+                min_active_samples=defs.min_active_samples,
+                min_silence_samples=defs.min_silence_samples,
+            )
+            if !isempty(segs)
+                i0 = segs[1][1]
+                i1 = segs[end][2]
+                t = t[i0:i1]
+                I = I[i0:i1]
+                Q = Q[i0:i1]
+                t_lo = Float64(t[1])
+                t_hi = Float64(t[end])
+            end
+        end
+        features[i] = subpulse_waveform_features(
+            t, I, Q; d=d, t_start=t_lo, t_end=t_hi, kind=kind, defs=defs, source_index=i,
+        )
+    end
+    assembled = _sc_assemble(features, defs.a_signal)
+    return _sc_finish(features, assembled, PULSE_CONFIG, defs.a_signal; error_on_reject=error_on_reject)
+end
+
+"""
+    segment_signal_control_from_trace(t, I, Q; d=nothing, a_signal=0.1, error_on_reject=false, kwargs...)
+
+Same labelling as [`segment_signal_control`](@ref), but sub-pulses are
+exactly the segments of [`_detect_subpulse_segments`](@ref) on
+`A=hypot.(I,Q)` (seed-fitter defaults unless overridden). Back-to-back
+3ARP with unresolved edge zeros may merge into one segment -- that is
+this detector's own behaviour; pass `PULSE_CONFIG` when the analytic
+entries are known.
+"""
+function segment_signal_control_from_trace(
+    t::AbstractVector, I::AbstractVector, Q::AbstractVector;
+    d=nothing,
+    a_signal::Real=signal_control_defaults().a_signal,
+    error_on_reject::Bool=false,
+    rel_thresh::Real=signal_control_defaults().rel_thresh,
+    min_active_samples::Integer=signal_control_defaults().min_active_samples,
+    min_silence_samples::Integer=signal_control_defaults().min_silence_samples,
+    defs=signal_control_defaults(),
+)
+    n = length(t)
+    n == length(I) == length(Q) || error(
+        "segment_signal_control_from_trace: t/I/Q lengths $(n)/$(length(I))/$(length(Q))."
+    )
+    n >= 2 || error("segment_signal_control_from_trace: need >= 2 samples, got $n.")
+    a_signal > 0 || error("a_signal must be positive, got $a_signal.")
+    defs = merge(defs, (a_signal=Float64(a_signal), rel_thresh=Float64(rel_thresh),
+                         min_active_samples=Int(min_active_samples),
+                         min_silence_samples=Int(min_silence_samples)))
+
+    A = hypot.(I, Q)
+    segments = _sc_detect_subpulses_multiscale(
+        t, A;
+        rel_thresh=defs.rel_thresh,
+        min_active_samples=defs.min_active_samples,
+        min_silence_samples=defs.min_silence_samples,
+    )
+    isempty(segments) && return _sc_finish(
+        Any[],
+        (
+            ok=false,
+            reason="Existing sub-pulse detector found no active segments.",
+            labels=Symbol[],
+            control0_idx=Int[],
+            signal_idx=Int[],
+            control_idx=Int[],
+            order=Int[],
+            min_control_mean_A=NaN,
+        ),
+        nothing,
+        defs.a_signal;
+        error_on_reject=error_on_reject,
+    )
+
+    features = Vector{Any}(undef, length(segments))
+    for (k, (i0, i1)) in enumerate(segments)
+        ts = view(t, i0:i1)
+        Is = view(I, i0:i1)
+        Qs = view(Q, i0:i1)
+        features[k] = subpulse_waveform_features(
+            collect(ts), collect(Is), collect(Qs);
+            d=d,
+            t_start=Float64(t[i0]),
+            t_end=Float64(t[i1]),
+            kind=:unknown,
+            defs=defs,
+            source_index=k,
+        )
+    end
+    assembled = _sc_assemble(features, defs.a_signal)
+    return _sc_finish(features, assembled, nothing, defs.a_signal; error_on_reject=error_on_reject)
+end
+
+"""
+    identified_signal_control(PULSE_CONFIG; kwargs...) -> (signal_cfg, control_cfg)
+
+Throws [`SignalControlRejected`](@ref) unless identification and the
+prefix rule both pass. Replacement for positional `split_signal_control`
+that does not use `n_signal`.
+"""
+function identified_signal_control(PULSE_CONFIG; kwargs...)
+    r = segment_signal_control(PULSE_CONFIG; error_on_reject=true, kwargs...)
+    return r.signal_cfg, r.control_cfg
+end
+
+"""
+    control_envelope_E_of_t(result) -> (t -> Complex)
+
+ONE cavity-input envelope equal to the sum of every identified **control**
+sub-pulse. This is the only drive that may be sampled, fit, or stored in
+`u`. Signal lobes are not in this callable.
+"""
+function control_envelope_E_of_t(result)
+    cfg = result.control_cfg
+    (cfg === nothing || isempty(cfg)) && error(
+        "control_envelope_E_of_t: identification produced no control pulses. " *
+        (result.ok ? "" : result.reason)
+    )
+    return build_E_of_t(cfg)
+end
+
+"""
+    signal_envelope_E_of_t(result; use_signal=true) -> (t -> Complex)
+
+Fixed background equal to the sum of identified **signal** sub-pulses.
+Never parameterized. `use_signal=false` returns [`_zero_drive`](@ref).
+Empty signal (3ARP, RASE) is also `_zero_drive`.
+"""
+function signal_envelope_E_of_t(result; use_signal::Bool=true)
+    (!use_signal || result.signal_cfg === nothing || isempty(result.signal_cfg)) &&
+        return _zero_drive
+    return build_E_of_t(result.signal_cfg)
+end
+
+"""
+    mask_control_envelope_samples(t, I, Q, result) -> (Ex, Ep)
+
+From a mixed I/Q trace, keep samples that fall inside an identified
+control support and zero the rest (signal times and silence). The
+result is one control envelope on the original grid, suitable as a
+seed-fit target. Does not copy signal samples into the envelope.
+"""
+function mask_control_envelope_samples(
+    t::AbstractVector, I::AbstractVector, Q::AbstractVector, result,
+)
+    n = length(t)
+    n == length(I) == length(Q) || error(
+        "mask_control_envelope_samples: t/I/Q lengths $(n)/$(length(I))/$(length(Q))."
+    )
+    Ex = zeros(Float64, n)
+    Ep = zeros(Float64, n)
+    isempty(result.control_idx) && return Ex, Ep
+    @inbounds for j in 1:n
+        tj = t[j]
+        keep = false
+        for i in result.control_idx
+            f = result.features[i]
+            if tj >= f.t_start && tj <= f.t_end
+                keep = true
+                break
+            end
+        end
+        if keep
+            Ex[j] = Float64(I[j])
+            Ep[j] = Float64(Q[j])
+        end
+    end
+    return Ex, Ep
+end
 
 """
     load_jld2_run(path) -> data
@@ -59,13 +816,9 @@ end
 """
     split_signal_control(PULSE_CONFIG; n_signal=1) -> (signal_cfg, control_cfg)
 
-Splits a `PULSE_CONFIG` tuple (as saved in a `.jld2` run, or built by
-hand) into its leading `n_signal` pulse(s) (the SIGNAL) and the remaining
-ones (the CONTROL) -- matching this package's own convention (see
-`examples/sweep_1st_order.jl`/`run_demo.jl`) of one fixed "input signal"
-pulse (typically Gaussian) followed by one or more WURST "echo"/control
-pulses. Both returned pieces are themselves `PULSE_CONFIG`-shaped tuples,
-directly usable with the existing [`build_E_of_t`](@ref).
+Deprecated positional split (leading `n_signal` entries). The jld2
+pipeline uses [`segment_signal_control`](@ref) / [`identified_signal_control`](@ref)
+instead: one control envelope, signal never in `u`.
 """
 function split_signal_control(PULSE_CONFIG; n_signal::Integer=1)
     n_signal >= 1 || error("n_signal must be >= 1, got $n_signal.")
@@ -89,7 +842,8 @@ calling convention every other drive in this package uses -- this is the
 out completely for whatever uses the returned closure next.
 """
 function build_signal_E_of_t(signal_cfg, use_signal::Bool)
-    return use_signal ? build_E_of_t(signal_cfg) : _zero_drive
+    (!use_signal || signal_cfg === nothing || isempty(signal_cfg)) && return _zero_drive
+    return build_E_of_t(signal_cfg)
 end
 
 """
@@ -136,7 +890,7 @@ this NamedTuple; it does not hardcode a second copy).
 """
 function jld2_pipeline_defaults()
     return (
-        n_signal=1,
+        n_signal=nothing,
         use_signal=true,
         rtol_check=1e-3,
         atol_check=nothing,
@@ -241,51 +995,54 @@ function _call_optimise_composite_pulse(k, n_coeff_A, n_coeff_f, d, signal_E_of_
 end
 
 """
-    try_parse_pulse_config(data; n_signal=1)
-        -> (ok, signal_cfg, control_cfg, message)
+    try_parse_pulse_config(data; d=nothing, n_signal=nothing)
+        -> (ok, signal_cfg, control_cfg, message, identification)
 
-Attempts to read `data.PULSE_CONFIG`, split it with
-[`split_signal_control`](@ref), and build both halves via
-[`build_E_of_t`](@ref). `ok=false` (with `message` explaining why)
-means the jld2 pipeline must not use `PULSE_CONFIG` as the pulse
-source -- [`load_jld2_reference`](@ref) then falls back to a sibling
-`_pulsemat.csv`.
+Reads `data.PULSE_CONFIG` and identifies signal vs control with
+[`segment_signal_control`](@ref) (waveforms, not tuple position).
+`n_signal` is an optional count check only. On success the pipeline
+parameterizes one control envelope; signal is never in `u`.
+When `PULSE_CONFIG` is present but identification rejects the sequence,
+[`load_jld2_reference`](@ref) errors rather than fitting a mixed CSV.
 """
-function try_parse_pulse_config(data; n_signal::Integer=1)
-    hasproperty(data, :PULSE_CONFIG) || return (
-        ok=false, signal_cfg=nothing, control_cfg=nothing,
-        message="PULSE_CONFIG is unavailable in the .jld2 data NamedTuple.",
+function try_parse_pulse_config(data; n_signal::Union{Nothing,Integer}=nothing, d=nothing)
+    fail(msg) = (
+        ok=false, signal_cfg=nothing, control_cfg=nothing, message=msg, identification=nothing,
+    )
+    hasproperty(data, :PULSE_CONFIG) || return fail(
+        "PULSE_CONFIG is unavailable in the .jld2 data NamedTuple.",
     )
     pc = data.PULSE_CONFIG
-    pc === nothing && return (
-        ok=false, signal_cfg=nothing, control_cfg=nothing,
-        message="PULSE_CONFIG is `nothing`.",
-    )
-    local signal_cfg, control_cfg
+    pc === nothing && return fail("PULSE_CONFIG is `nothing`.")
+    local ident
     try
-        signal_cfg, control_cfg = split_signal_control(pc; n_signal=n_signal)
+        ident = segment_signal_control(pc; d=d)
     catch e
         e isa InterruptException && rethrow()
-        return (
-            ok=false, signal_cfg=nothing, control_cfg=nothing,
-            message="split_signal_control failed: $e",
+        return fail("segment_signal_control failed: $e")
+    end
+    ident.ok || return fail("signal/control identification rejected: $(ident.reason)")
+    if n_signal !== nothing && Int(n_signal) != _sc_n_signal(ident)
+        return fail(
+            "n_signal=$n_signal does not match identified signal count " *
+            "$(_sc_n_signal(ident)) (identification is by waveform, not position).",
         )
     end
+    signal_cfg = ident.signal_cfg
+    control_cfg = ident.control_cfg
     try
-        build_E_of_t(signal_cfg)
-        build_E_of_t(control_cfg)
+        control_envelope_E_of_t(ident)
+        signal_envelope_E_of_t(ident)
     catch e
         e isa InterruptException && rethrow()
-        return (
-            ok=false, signal_cfg=nothing, control_cfg=nothing,
-            message="build_E_of_t failed on parsed PULSE_CONFIG: $e",
-        )
+        return fail("failed to build signal/control envelopes: $e")
     end
-    n_sig = length(signal_cfg)
+    n_sig = signal_cfg === nothing ? 0 : length(signal_cfg)
     n_ctrl = length(control_cfg)
     return (
-        ok=true, signal_cfg=signal_cfg, control_cfg=control_cfg,
-        message="Parsed PULSE_CONFIG: $n_sig signal pulse(s), $n_ctrl control pulse(s).",
+        ok=true, signal_cfg=signal_cfg, control_cfg=control_cfg, identification=ident,
+        message="Identified PULSE_CONFIG: $n_sig signal pulse(s), $n_ctrl control pulse(s) " *
+                "(one control envelope; signal not in u).",
     )
 end
 
@@ -345,15 +1102,17 @@ function build_E_of_t_from_samples(t::AbstractVector, Ex::AbstractVector, Ep::Ab
     end
 end
 
-function _recorded_control_duration(control_cfg, t, Ex, Ep;
+function _sc_n_signal(ident)
+    ident === nothing && return 0
+    idx = ident.signal_idx
+    return idx === nothing ? 0 : length(idx)
+end
+
+function _recorded_control_duration(ident, t, Ex, Ep;
     rel_thresh::Real=1e-3, min_active_samples::Integer=5, min_silence_samples::Integer=3,
 )
-    if control_cfg !== nothing
-        try
-            return maximum(Float64(cfg.t_center) + Float64(cfg.duration) / 2 for cfg in control_cfg)
-        catch e
-            e isa InterruptException && rethrow()
-        end
+    if ident !== nothing && !isempty(ident.control_idx)
+        return maximum(Float64(ident.features[i].t_end) for i in ident.control_idx)
     end
     A = hypot.(Ex, Ep)
     segments = _detect_subpulse_segments(
@@ -413,7 +1172,8 @@ function _print_reference_audit(ref)
     println("  parse message         = $(ref.parse_message)")
     println("  pulse source          = $(ref.pulse_source)")
     println("  pulse source reason   = $(ref.pulse_source_reason)")
-    println("  n_signal              = $(ref.n_signal)")
+    println("  n_signal (identified) = $(ref.n_signal)")
+    println("  n_signal_check        = $(ref.n_signal_check)")
     println("  USE_SIGNAL            = $(ref.use_signal)")
     println("  USE_SIGNAL note       = $(ref.use_signal_note)")
     println("  control trace         = $(ref.control_trace_note)")
@@ -426,7 +1186,7 @@ function _print_reference_audit(ref)
 end
 
 """
-    load_jld2_reference(path; n_signal=1, use_signal=true, fit_N=nothing, verbose=true)
+    load_jld2_reference(path; n_signal=nothing, use_signal=true, fit_N=nothing, verbose=true)
         -> NamedTuple
 
 Steps 1–4 of the jld2 pipeline:
@@ -435,17 +1195,17 @@ Steps 1–4 of the jld2 pipeline:
   2. Extract `SIM_SETTING`, `SYSTEM_CONFIG`, `PULSE_CONFIG`.
   3. Parse them into the reference configs (`d` via `build_full_config` /
      `prepare_derived`; pulse specs via [`try_parse_pulse_config`](@ref)).
-  4. If `PULSE_CONFIG` is missing or unparseable, load the sibling
-     `*_pulsemat.csv` as the recorded drive and as the seed-fit target.
+  4. If `PULSE_CONFIG` is absent, load the sibling `*_pulsemat.csv`, identify
+     signal vs control on that trace, and fit only the masked control envelope.
 
-When `PULSE_CONFIG` parses, the seed is fit to the CONTROL segments only
-and the recorded drive is analytic signal+control. When it does not, the
-full CSV is both the recorded drive and the seed target, and there is no
-separate signal (`use_signal` is ignored).
+When `PULSE_CONFIG` is present but identification fails, this errors (no mixed
+CSV fit). Seed I/Q is the summed control envelope; `signal_E_of_t` is the
+fixed background (never in `u`). `n_signal` is an optional identified-count
+check, not a positional split.
 """
 function load_jld2_reference(
     path::AbstractString;
-    n_signal::Integer=jld2_pipeline_defaults().n_signal,
+    n_signal::Union{Nothing,Integer}=jld2_pipeline_defaults().n_signal,
     use_signal::Bool=jld2_pipeline_defaults().use_signal,
     fit_N::Union{Nothing,Integer}=jld2_pipeline_defaults().fit_N,
     verbose::Bool=true,
@@ -461,11 +1221,19 @@ function load_jld2_reference(
     CONFIG = build_full_config(data.SIM_SETTING, data.SYSTEM_CONFIG)
     d = prepare_derived(CONFIG)
 
-    parse_result = try_parse_pulse_config(data; n_signal=n_signal)
+    pc_present = hasproperty(data, :PULSE_CONFIG) && data.PULSE_CONFIG !== nothing
+    parse_result = try_parse_pulse_config(data; n_signal=n_signal, d=d)
+    if pc_present && !parse_result.ok
+        error(
+            "PULSE_CONFIG is present but signal/control identification refused to " *
+            "build a control envelope: $(parse_result.message) — not falling back to a " *
+            "mixed CSV fit (that would parameterize the signal)."
+        )
+    end
 
     if parse_result.ok
         pulse_source = :pulse_config
-        pulse_source_reason = "parsed PULSE_CONFIG from $(basename(jld2_path))"
+        pulse_source_reason = "identified PULSE_CONFIG from $(basename(jld2_path)): $(parse_result.message)"
         sibling_n = _sibling_pulsemat_n_samples(jld2_path)
         fit_N_use = fit_N !== nothing ? Int(fit_N) : something(sibling_n, _DEFAULT_CONTROL_FIT_N)
         if fit_N !== nothing
@@ -477,24 +1245,20 @@ function load_jld2_reference(
         end
         fit_N_use >= 2 || error("fit_N must be >= 2, got $fit_N_use.")
         t, Ex, Ep = _sample_control_cfg(parse_result.control_cfg, d, fit_N_use)
-        signal_E_rec = build_E_of_t(parse_result.signal_cfg)
-        control_E_rec = build_E_of_t(parse_result.control_cfg)
+        signal_E_rec = signal_envelope_E_of_t(parse_result.identification; use_signal=true)
+        control_E_rec = control_envelope_E_of_t(parse_result.identification)
         recorded_E_of_t = (tt -> signal_E_rec(tt) + control_E_rec(tt))
-        control_trace_note = "resampled from PULSE_CONFIG control segments"
+        control_trace_note = "one control envelope (sum of identified control sub-pulses; signal excluded)"
         signal_E_always = signal_E_rec
-        signal_E_of_t = build_signal_E_of_t(parse_result.signal_cfg, use_signal)
+        signal_E_of_t = signal_envelope_E_of_t(parse_result.identification; use_signal=use_signal)
         use_signal_note = use_signal ?
-            "USE_SIGNAL=true: recorded signal layered as fixed background (not in optimised u)" :
+            "USE_SIGNAL=true: identified signal is a fixed background (not in optimised u)" :
             "USE_SIGNAL=false: signal zeroed for optimisation; reference forward-sim still uses the recorded signal"
     else
         pulsemat_path !== nothing && isfile(pulsemat_path) || error(
-            "PULSE_CONFIG unavailable/unparseable ($(parse_result.message)) and no sibling " *
+            "PULSE_CONFIG unavailable ($(parse_result.message)) and no sibling " *
             "_pulsemat.csv next to $jld2_path — cannot build a recorded drive."
         )
-        pulse_source = :pulsemat_csv
-        pulse_source_reason =
-            "PULSE_CONFIG unavailable/unparseable; using sibling _pulsemat.csv. " *
-            "Parse message: $(parse_result.message)"
         t_end, Ex_full, Ep_full = load_E_samples(pulsemat_path)
         N = length(Ex_full)
         N >= 2 || error("load_jld2_reference: $pulsemat_path has $N sample(s); need >= 2.")
@@ -505,19 +1269,43 @@ function load_jld2_reference(
             "$(d.timespan[2]-d.timespan[1])s, but $pulsemat_path's own metadata says " *
             "t_end=$(t_end)s — these two files don't actually belong together."
         )
+        ident_tr = segment_signal_control_from_trace(t, Ex_full, Ep_full; d=d)
+        ident_tr.ok || error(
+            "CSV fallback: signal/control identification rejected the recorded trace: " *
+            "$(ident_tr.reason) — refusing to fit the mixed drive into u."
+        )
+        if n_signal !== nothing && Int(n_signal) != _sc_n_signal(ident_tr)
+            error(
+                "n_signal=$n_signal does not match identified signal count " *
+                "$(_sc_n_signal(ident_tr)) (CSV fallback identification is by waveform)."
+            )
+        end
+        Ex, Ep = mask_control_envelope_samples(t, Ex_full, Ep_full, ident_tr)
+        pulse_source = :pulsemat_csv
+        pulse_source_reason =
+            "PULSE_CONFIG unavailable; control envelope extracted from sibling _pulsemat.csv. " *
+            "Parse message: $(parse_result.message)"
         if fit_N !== nothing && Int(fit_N) != N
             println("load_jld2_reference: fit_N=$fit_N ignored in CSV-fallback mode; using the file's own $N samples.")
         end
         fit_N_use = N
         fit_N_source = "CSV file sample count"
-        Ex, Ep = collect(Float64, Ex_full), collect(Float64, Ep_full)
-        recorded_E_of_t = build_E_of_t_from_samples(t, Ex, Ep)
-        control_trace_note = "full CSV I/Q (PULSE_CONFIG did not parse)"
-        signal_E_always = _zero_drive
-        signal_E_of_t = _zero_drive
-        use_signal_note =
-            "USE_SIGNAL=$(use_signal) ignored: no parseable signal pulse; " *
-            "optimisation drive is the CSV/control trace alone"
+        recorded_E_of_t = build_E_of_t_from_samples(t, Ex_full, Ep_full)
+        control_trace_note = "CSV I/Q with signal times zeroed (one control envelope only)"
+        if _sc_n_signal(ident_tr) > 0
+            Ex_sig = Ex_full .- Ex
+            Ep_sig = Ep_full .- Ep
+            signal_E_always = build_E_of_t_from_samples(t, Ex_sig, Ep_sig)
+        else
+            signal_E_always = _zero_drive
+        end
+        signal_E_of_t = use_signal ? signal_E_always : _zero_drive
+        use_signal_note = use_signal ?
+            "USE_SIGNAL=true: CSV-identified signal is a fixed interpolant (not in optimised u)" :
+            "USE_SIGNAL=false: signal zeroed for optimisation; reconcile still uses the mixed recorded drive"
+        parse_result = merge(parse_result, (
+            signal_cfg=nothing, control_cfg=nothing, identification=ident_tr,
+        ))
     end
 
     ref = (
@@ -535,7 +1323,9 @@ function load_jld2_reference(
         control_cfg=parse_result.control_cfg,
         data=data,
         d=d,
-        n_signal=n_signal,
+        identification=parse_result.identification,
+        n_signal=_sc_n_signal(parse_result.identification),
+        n_signal_check=n_signal,
         use_signal=use_signal,
         use_signal_note=use_signal_note,
         signal_E_of_t=signal_E_of_t,
@@ -589,7 +1379,7 @@ function run_reference_forward(
     silencing = _weighted_silencing_factor(Sp_eq, d.g_b, d.Nj, Float64)
     coherence = _weighted_coherence(Sp_eq, d.Nj, Float64)
     duration = _recorded_control_duration(
-        ref.control_cfg, ref.control_t, ref.control_Ex, ref.control_Ep,
+        ref.identification, ref.control_t, ref.control_Ex, ref.control_Ep,
     )
     metrics = (
         inversion=inversion, silencing=silencing, coherence=coherence, duration=duration,
@@ -1121,7 +1911,7 @@ convention [`load_jld2_run`](@ref) already reads):
 """
 function save_optimisation_run_log(
     path::AbstractString, data, d, pulse::CompositePulse, signal_E_of_t,
-    n_signal::Integer, use_signal::Bool,
+    n_signal::Union{Nothing,Integer}, use_signal::Bool,
     u0::AbstractVector, initial_metrics,
     best_u::AbstractVector, final_metrics, history, optimizer_settings;
     out_dir=nothing, pulsemat_N=nothing, benchmark_metrics=nothing,
@@ -1279,11 +2069,11 @@ function optimise_control_pulse_from_jld2(
             (pulse_source=ref.pulse_source, rtol_check=pipe.rtol_check, atol_check=pipe.atol_check,
              check_reltol=pipe.check_reltol, check_abstol=pipe.check_abstol,
              fit_seed_from_file=pipe.fit_seed_from_file, fit_N=ref.fit_N,
-             param_budget=pipe.param_budget),
+             param_budget=pipe.param_budget, n_signal_check=pipe.n_signal),
             optimizer_settings,
         )
         save_optimisation_run_log(
-            ref.jld2_path, data, d, pulse, signal_E_of_t, pipe.n_signal, pipe.use_signal,
+            ref.jld2_path, data, d, pulse, signal_E_of_t, ref.n_signal, pipe.use_signal,
             u0, initial_metrics, best_u, final_metrics, history, full_settings;
             out_dir=pipe.log_out_dir, pulsemat_N=pipe.pulsemat_N,
             benchmark_metrics=reference_metrics,
