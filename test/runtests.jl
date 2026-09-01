@@ -847,7 +847,7 @@ end
     # I_min=0.99 (kappa_I keeps pulse_cost's own default 50.0) so the
     # inversion squared-hinge penalty is genuinely ACTIVE at the :hs1 seed
     # (inversion ≈ 0.986 < 0.99): under the paper-aligned metrics the :hs1
-    # pulse retains full equatorial coherence on the :weak track, so its silencing |F|_⋆
+    # pulse keeps the :weak track's coherence well above its ε seed, so its |F|_⋆
     # clamps to 1.0 and BOTH default floors (I_min=0.85, S_min=0.85) would
     # otherwise be slack here -- this test is about the penalty MECHANISM
     # biting, not about which floor a canonical seed happens to trip.

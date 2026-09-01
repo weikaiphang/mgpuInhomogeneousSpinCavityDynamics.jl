@@ -2905,7 +2905,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
     direct_val = direct_only(u)
 
     aux_ground = Ref{Float64}(0.0)
-    aux_equator = Ref{NTuple{3,Float64}}((0.0, 0.0, 0.0))
+    aux_weak = Ref{NTuple{3,Float64}}((0.0, 0.0, 0.0))
 
     if !use_gpu_pool
         grads = Vector{Vector{Float64}}(undef, 2)
@@ -2925,7 +2925,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                     grads[1] = ForwardDiff.gradient(ground_only, u, ForwardDiff.GradientConfig(ground_only, u, chunk))
                 else
                     # Extract ∇|F| independently
-                    function equator_only(uu)
+                    function weak_only(uu)
                         _, Sp, _, Nj_eq = run_sim_1st_order_pure(
                             uu, pulse, d; compute=compute, sk..., initial_condition=:weak,
                         )
@@ -2933,10 +2933,10 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
                         coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
                         famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
-                        aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
+                        aux_weak[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
                         return sil_
                     end
-                    grads[2] = ForwardDiff.gradient(equator_only, u, ForwardDiff.GradientConfig(equator_only, u, chunk))
+                    grads[2] = ForwardDiff.gradient(weak_only, u, ForwardDiff.GradientConfig(weak_only, u, chunk))
                 end
             catch e
                 e isa PulseSolveFailed || rethrow()
@@ -2946,7 +2946,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
         any(failed) && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN
 
         inversion = aux_ground[]
-        silencing, coherence, field_amp = aux_equator[]
+        silencing, coherence, field_amp = aux_weak[]
         grad_I = grads[1]
         grad_F = grads[2]
 
@@ -2970,7 +2970,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
         grad_F = zeros(n)
         failed = Threads.Atomic{Bool}(false)
         ground_lock = ReentrantLock()
-        equator_lock = ReentrantLock()
+        weak_lock = ReentrantLock()
 
         _run_pulse_jobs!(jobs, (job, _dev) -> begin
             failed[] && return nothing
@@ -2993,7 +2993,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         grad_I .+= g
                     end
                 else
-                    function equator_gpu(uu)
+                    function weak_gpu(uu)
                         _, Sp, _, Nj_eq = run_sim_1st_order_pure(
                             uu, pulse, d; compute=:gpu, sk..., initial_condition=:weak,
                         )
@@ -3002,14 +3002,14 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
                         famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
                         if first(job.idxs) == 1
-                            aux_equator[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
+                            aux_weak[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
                         end
                         return sil_
                     end
                     g = length(job.idxs) == n ?
-                        ForwardDiff.gradient(equator_gpu, u, ForwardDiff.GradientConfig(equator_gpu, u, chunk)) :
-                        _gradient_on_indices(equator_gpu, u, job.idxs)
-                    lock(equator_lock) do
+                        ForwardDiff.gradient(weak_gpu, u, ForwardDiff.GradientConfig(weak_gpu, u, chunk)) :
+                        _gradient_on_indices(weak_gpu, u, job.idxs)
+                    lock(weak_lock) do
                         grad_F .+= g
                     end
                 end
@@ -3023,7 +3023,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
 
         failed[] && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN
         inversion = aux_ground[]
-        silencing, coherence, field_amp = aux_equator[]
+        silencing, coherence, field_amp = aux_weak[]
     end
 
     # Explicit analytical application of the non-linear chain rule coupling the two tracks
