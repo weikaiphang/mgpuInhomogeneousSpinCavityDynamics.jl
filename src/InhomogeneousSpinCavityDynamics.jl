@@ -138,7 +138,8 @@ export identified_signal_control, control_envelope_E_of_t, signal_envelope_E_of_
 export SignalControlRejected
 
 # Analytic composite ARP pulse exports
-export generate_3arp_pi_pulse
+export generate_2n1_arp_pi_pulse
+export generate_3arp_pi_pulse  # DEPRECATED alias -> generate_2n1_arp_pi_pulse(d; n_pairs=1, ...)
 
 # Noise exports
 export NoiseSimulationData

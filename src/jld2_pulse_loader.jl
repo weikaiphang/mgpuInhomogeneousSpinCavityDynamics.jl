@@ -1709,7 +1709,7 @@ reuses the SAME `rhs_1st_order!`/ensemble machinery, just saving every
 requested time point instead of one. `Sp`/`Sz` are returned as `(Nt, M)`
 matrices (one row per saved time point, matching this package's own
 `Sp_sol`/`Sz_sol` orientation from `run_sim_1st_order`). Used by
-[`generate_3arp_pi_pulse`](@ref) and datagen; the jld2 reconcile path
+[`generate_2n1_arp_pi_pulse`](@ref) and datagen; the jld2 reconcile path
 uses [`run_sim_1st_order_final`](@ref) (endpoint only).
 """
 function run_sim_1st_order_trajectory(
