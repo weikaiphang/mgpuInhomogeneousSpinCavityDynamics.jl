@@ -2108,6 +2108,37 @@ is recovered into it EXACTLY here (not re-fit, not approximated -- see
 same 3-ARP reference, `rel_l2_complex` now measures `0.0004`, matching
 `rel_l2_A` rather than sitting two orders of magnitude worse.
 
+RESOLVED (a second, independent gap the above fix did not close) -- even
+with `raw_phi0` recovered exactly, `rel_l2_complex` could still sit at
+`~1.4 (~sqrt(2))` regardless of fit resolution (`phi_rms_rad` from `~0.04`
+down to `~1e-13`), while the pointwise reconstructed phase
+(`build_E_of_t(pulse,u_fit)` vs the target, sample by sample) swept a full
+extra `2*pi` across each sub-pulse rather than sitting at one constant
+offset -- so no single per-segment phase realignment could fix it either
+(measured directly: the closed-form global-phase-alignment correction
+that minimises `‖e^{i*delta}*E_pred - E_tar‖^2` per segment came out at a
+fraction of a degree and left `rel_l2_complex` completely unchanged).
+Root cause: this loop built each sub-pulse's knot vector / taper window /
+antiderivative from the raw SAMPLE bounds `(t_s, t_e) = (t[i_start],
+t[i_end])`, but [`_encode_scaled_softplus`](@ref) floors `gap`/`dur_arg`
+up to `_GRAD_SAFE_FRAC*scale` before encoding -- so whenever a sub-pulse's
+true leading gap is smaller than that floor (the common case for a
+sub-pulse starting at/near `t=0`), [`decode`](@ref)'s cumulative-sum
+`t_start`/`t_end` for THAT sub-pulse, and (because the sum is cumulative)
+every LATER sub-pulse too, is shifted from `(t_s, t_e)` by the floored
+amount. [`build_E_of_t`](@ref) reconstructs on `decode`'s shifted knots
+but is sampled at the trace's own unshifted physical `t` -- for a chirped
+drive a pure time shift is `offset*f(t)`, not a phase constant, which is
+exactly the sweeping-2*pi symptom above. Fixed by recomputing `(t_s, t_e)`
+right after `raw_gap[idx]`/`raw_dur[idx]` are encoded, from that SAME
+encoding (`t_prev_end + scale*softplus(raw)[+floor]` -- `decode`'s own
+round trip, no second pass), and carrying the decoded end forward as
+`t_prev_end` for the next sub-pulse -- so every downstream design matrix
+in this loop is built on exactly the domain `build_E_of_t` will actually
+reconstruct on, for any gap/dur (floored or not). Verified on the 3-ARP
+`run_105_3ARP_M20000` reference: `rel_l2_complex` drops from `~1.4` to
+match `rel_l2_A`'s own scale at the same fit resolution.
+
 Pass `param_budget` (e.g. `60`) instead of hand-picking `points_per_segment`
 to instead cap the resulting `n_params = 3*k + 2*k*n_coeff` directly -- see
 [`points_per_segment_for_budget`](@ref), which this calls internally (after
@@ -2176,6 +2207,49 @@ function _fit_composite_pulse_from_samples_linear(
         dur_arg = max(duration - pulse.dur_floor, 0.0)
         raw_gap[idx] = _encode_scaled_softplus(gap, pulse.gap_scale)
         raw_dur[idx] = _encode_scaled_softplus(dur_arg, pulse.dur_scale)
+
+        # decode()'s OWN round trip of the encoding just above -- NOT
+        # necessarily (t_s, t_e) themselves. _encode_scaled_softplus floors
+        # its physical argument up to _GRAD_SAFE_FRAC*scale before encoding
+        # (a deliberate decode-gradient-safety floor, see that function's
+        # own docstring); whenever gap/dur_arg is smaller than that floor --
+        # the common case for a sub-pulse whose true leading gap is only a
+        # sample or two, e.g. sub-pulse 1 starting at/near t=0 -- decode(u)
+        # reconstructs a t_start/t_end for THIS sub-pulse shifted from
+        # (t_s, t_e) by the floored amount. Because decode's t_start is a
+        # CUMULATIVE sum, that shift then carries forward UNCHANGED into
+        # every later sub-pulse's own t_start/t_end too (their own gap/dur
+        # encode exactly; they just inherit the previous sub-pulse's
+        # shifted t_end as their own base). build_E_of_t evaluates each
+        # sub-pulse's B-spline/antiderivative on knots built from those
+        # DECODED times, sampled at the trace's own UNSHIFTED physical t --
+        # so a fit built on knots spanning the raw sample bounds (t_s, t_e)
+        # is silently evaluated by build_E_of_t on knots spanning
+        # (t_s+shift, t_e+shift) instead: the same spline SHAPE, offset in
+        # time. For a chirped drive (dPhi/dt not constant) a pure time
+        # offset is NOT a constant phase error -- it is offset*f(t), which
+        # sweeps across the sub-pulse exactly as fast as the chirp itself.
+        # Verified directly on this package's own 3-ARP WURST reference
+        # (run_105_3ARP_M20000): an unflagged ~1.17us leading-gap floor on
+        # sub-pulse 1 -- invisible to rel_l2_A/rel_l2_f/phi_rms_rad, which
+        # are computed from THIS loop's own (self-consistent but
+        # wrongly-anchored) Phi_pred, never from build_E_of_t itself --
+        # propagated onto every sub-pulse and produced a reconstructed
+        # phase that swept a full extra 2*pi across each one
+        # (rel_l2_complex~1.4 regardless of fit resolution). A GLOBAL
+        # per-segment phase realignment cannot fix this: the residual
+        # isn't a constant (confirmed: the optimal such correction came
+        # out at a fraction of a degree and left rel_l2_complex unchanged)
+        # -- only matching the fit's own domain to decode's actual domain
+        # does. Recomputing (t_s, t_e) here from the SAME encode this loop
+        # just performed (not from decode(pulse,u_fit) after the fact, so
+        # no second pass / no extra CompositePulse-shaped allocation) makes
+        # every downstream knot vector, taper window and antiderivative in
+        # THIS sub-pulse's own fit exactly the domain build_E_of_t will
+        # actually reconstruct on, for ANY gap/dur (floored or not) --
+        # closing the gap at its root instead of its symptom.
+        t_s = t_prev_end + pulse.gap_scale * _softplus(raw_gap[idx])
+        t_e = t_s + pulse.dur_scale * _softplus(raw_dur[idx]) + pulse.dur_floor
 
         t_seg = view(t, i_start:i_end)
         A_seg = view(A, i_start:i_end)
@@ -2250,12 +2324,38 @@ function _fit_composite_pulse_from_samples_linear(
         # exactly `phase_const`) -- recover the DISCRETE JUMP `raw_phi0`
         # build_E_of_t actually adds (`phase_offset[i] = running+phi0[i]`)
         # by subtracting off what `running` will be at this point, tracked
-        # here with the SAME recipe (`running = phase_offset[i]+d_f[end]`),
-        # using `Phi_pred[end]-phase_const` as `d_f[end]` -- exact, since
-        # `t_seg[end] == t_e` is precisely the antiderivative spline's own
-        # right knot (bspline_basis's closed-right-boundary convention).
+        # here with the SAME recipe (`running = phase_offset[i]+d_f[end]`).
+        # `d_f[end]` is [`bspline_antiderivative`](@ref)'s own last
+        # coefficient -- by that function's cumulative-sum construction,
+        # EXACTLY `bspline_area(cf_seg, knots, degree)` (the degree-`degree`
+        # spline's full-domain integral, `Σ cf_seg[j]*width_j/(degree+1)`),
+        # regardless of where any SAMPLE falls. Computed that way here too
+        # (not as `Phi_pred[end]-phase_const`, a SAMPLE-point evaluation
+        # that silently assumed `t_seg[end] == t_e` -- true only when this
+        # sub-pulse's own `t_s` was NOT shifted by `_encode_scaled_softplus`'s
+        # floor above; when it was, `t_e` moves but `t_seg[end]` (the raw
+        # last sample) does not, so that sample no longer sits at the
+        # spline's own right knot, and `Phi_pred[end]` silently stopped
+        # being `d_f[end]` -- this broke `running_phase`, and hence every
+        # LATER sub-pulse's own `raw_phi0`, exactly the same way the
+        # `(t_s, t_e)` domain fix above addresses the WITHIN-sub-pulse
+        # reconstruction: both are instances of the same root cause,
+        # closed the same way -- match `build_E_of_t`'s own construction
+        # exactly rather than a sample-grid coincidence).
+        # `bspline_area` must be fed the ACTUAL coefficients `decode` will
+        # hand back to `build_E_of_t` -- i.e. `raw_cf[:, idx]` (just clipped
+        # above by `_clip_cf_raw`, for the rare coefficient that lands
+        # outside `±cf_clip_mult*freq_scale`, typically a poorly-constrained
+        # edge coefficient where `f_weight~0`), not the raw unclipped
+        # `cf_seg` the LS solve returned. Using `cf_seg` here would silently
+        # reintroduce this same function's own root cause one level up:
+        # `running_phase` -- and hence every LATER sub-pulse's own
+        # `raw_phi0` -- would accumulate a chirp integral `build_E_of_t`
+        # never actually reconstructs, whenever this sub-pulse's own fit
+        # triggered clipping.
         raw_phi0[idx] = phase_const - running_phase
-        d_f_end = Phi_pred[end] - phase_const
+        cf_seg_used = raw_cf[:, idx] .* pulse.freq_scale
+        d_f_end = bspline_area(cf_seg_used, knots, degree)
         running_phase = phase_const + d_f_end
 
         t_prev_end = t_e
