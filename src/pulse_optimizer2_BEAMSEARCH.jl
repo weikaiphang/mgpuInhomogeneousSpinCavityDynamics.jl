@@ -145,7 +145,7 @@ end
         k_max=nothing, num_epochs=30, learning_rate=0.05, patience=5,
         tol=1e-3, n_hops=3, hop_patience=2, hop_step_size=0.5,
         temperature=1.0, degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
-        w_inv=1.0, w_sil=0.7, target_F=1.0, w_time=0.15, seed=42,
+        target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, threaded=true, label_prefix="", solve_kwargs...)
         -> NamedTuple
 
@@ -247,8 +247,10 @@ the level spreading work across threads.
 
 Returns a `NamedTuple`: `best_u`/`best_cost`/`best_k`/`pulse` (the global
 best, `pulse` matching `best_u`'s own `k`), `u0`/`initial_metrics` (the
-root branch's own starting point/metrics, `(cost, inversion, silencing,
-duration, coherence)` from `pulse_cost`), `final_metrics` (same shape,
+root branch's own starting point/metrics -- the full `pulse_cost` return
+`(cost, inversion, silencing, duration, coherence, field_amp,
+weak_seed_retention)`, everything after `silencing` diagnostic-only),
+`final_metrics` (same shape,
 recomputed fresh at `best_u`, NOT necessarily equal to the global best
 branch's own cached `cost` since that branch's own `optimise_composite_pulse`
 call may have used different `solve_kwargs` -- mirrors
@@ -270,7 +272,7 @@ function optimise_composite_pulse_beamsearch(
     num_epochs::Integer=30, learning_rate::Real=0.05, patience::Integer=5, tol::Real=1e-3,
     n_hops::Integer=3, hop_patience::Integer=2, hop_step_size::Real=0.5, temperature::Real=1.0,
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
-    w_inv::Real=1.0, w_sil::Real=0.7, target_F::Real=1.0, w_time::Real=0.15,
+    target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, threaded::Bool=true,
     label_prefix::AbstractString="", solve_kwargs...,
 )
@@ -312,7 +314,7 @@ function optimise_composite_pulse_beamsearch(
             num_epochs=budget.epochs, learning_rate=learning_rate, patience=patience, tol=tol,
             n_hops=budget.hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
             degree=degree, taper_frac=taper_frac, w_tmax=w_tmax, w_power=w_power,
-            w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time,
+            target_F=target_F, w_time=w_time,
             seed=seed + 1000 * id, warm_start_u=seed_u, label_prefix=prefix, solve_kwargs...,
         )
         phys_cost = _extract_physics_cost(best_cost, best_u, pulse_out, w_power)
@@ -335,7 +337,7 @@ function optimise_composite_pulse_beamsearch(
         num_epochs=mature_budget.epochs, learning_rate=learning_rate, patience=patience, tol=tol,
         n_hops=mature_budget.hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
         degree=degree, taper_frac=taper_frac, w_tmax=w_tmax, w_power=w_power,
-        w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time,
+        target_F=target_F, w_time=w_time,
         seed=seed, warm_start_u=warm_start_u, label_prefix=root_prefix, solve_kwargs...,
     )
     root_id = next_id()
@@ -425,7 +427,7 @@ function optimise_composite_pulse_beamsearch(
     final_ids = Set(b.id for b in alive)
     branch_log = [merge(row, (alive_at_end=(row.id in final_ids),)) for row in branch_log]
 
-    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time)
+    cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time)
     final_metrics = pulse_cost(global_best.u, global_best.pulse, d; cost_kwargs..., solve_kwargs...)
 
     solve_settings = NamedTuple(kv for kv in pairs(solve_kwargs) if !(kv[2] isa Function))
@@ -436,7 +438,7 @@ function optimise_composite_pulse_beamsearch(
          new_branch_hop_multiplier=new_branch_hop_multiplier, k_max=k_max,
          num_epochs=num_epochs, learning_rate=learning_rate, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
-         w_tmax=w_tmax, w_power=w_power, w_inv=w_inv, w_sil=w_sil, target_F=target_F, w_time=w_time, seed=seed),
+         w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed),
         solve_settings,
     )
 
