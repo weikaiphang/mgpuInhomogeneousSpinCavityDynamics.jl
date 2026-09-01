@@ -85,6 +85,41 @@ ts = @testset verbose = true "datagen selftest" begin
         @test opt.run.ics == (:ground,)
         @test opt.run.n_sizes == 1
 
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "weak,weak_inverted"])
+        @test opt.run.ics == (:weak, :weak_inverted)
+
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "all"])
+        @test opt.run.ics == DG.DATAGEN_TRACKS
+
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "cannon,weak"])
+        @test opt.run.ics == (:ground, :equator, :weak)
+
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "poles"])
+        @test opt.run.ics == (:ground, :inverted)
+
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "precess"])
+        @test opt.run.ics == (:weak, :weak_inverted)
+
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "approx"])
+        @test opt.run.ics == (:ground, :weak)
+
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "inverted"])
+        @test opt.run.ics == (:inverted,)
+
+        opt = DG.parse_args(["--phase", "simulate", "--tracks", "weak-inverted"])
+        @test opt.run.ics == (:weak_inverted,)
+
+        @test DG.parse_tracks("weak,weak_inverted") == (:weak, :weak_inverted)
+        @test DG.parse_tracks("weak, weak") == (:weak,)
+        @test DG.parse_tracks("all") == DG.DATAGEN_TRACKS
+        @test DG.parse_tracks("cannon") == DG.DATAGEN_ICS
+        @test DG.parse_default_conditions("cannon") == DG.DATAGEN_ICS
+        @test DG.DATAGEN_TRACKS == (:ground, :inverted, :equator, :weak, :weak_inverted)
+        runi = DG.make_run_params(; ics = (:inverted,), M_cap = 8, Nt_save = 11)
+        @test runi.ics == (:inverted,)
+        runw = DG.make_run_params(; ics = (:weak, :weak_inverted), M_cap = 8, Nt_save = 11)
+        @test runw.ics == (:weak, :weak_inverted)
+
         @test_throws ErrorException DG.parse_args(["--nope"])
         @test_throws ErrorException DG.parse_args(["--phase", "nope"])
         @test_throws ErrorException DG.parse_args(["--phase", "simulate", "--dry-run"])
@@ -92,7 +127,8 @@ ts = @testset verbose = true "datagen selftest" begin
         @test_throws ErrorException DG.parse_args(["--phase", "configs", "--limit", "-1"])
         @test_throws ErrorException DG.parse_args(["--phase"])
         @test_throws ErrorException DG.parse_args(["--M-sizing", "0"])
-        @test_throws ErrorException DG.parse_args(["--phase", "simulate", "--default-conditions", "inverted"])
+        @test_throws ErrorException DG.parse_args(["--phase", "simulate", "--tracks", "both"])
+        @test_throws ErrorException DG.parse_args(["--phase", "simulate", "--tracks", ""])
         @test_throws ErrorException DG.parse_args(["--phase", "simulate", "--NT-save", "1"])
     end
 
@@ -113,13 +149,25 @@ ts = @testset verbose = true "datagen selftest" begin
         @test DG.uniquify_stem("x", used) == "x_3"
 
         @test DG.result_signature(:ground, 60000, 1, 5001) == "ground_Md60000_Mg1_Nt5001"
+        @test DG.result_signature(:inverted, 8, 1, 11) == "inverted_Md8_Mg1_Nt11"
         @test DG.result_signature(:equator, 8, 2, 11) == "equator_Md8_Mg2_Nt11"
-        @test_throws ErrorException DG.result_signature(:inverted, 8, 1, 11)
+        @test DG.result_signature(:weak, 8, 1, 11) == "weak_Md8_Mg1_Nt11"
+        @test DG.result_signature(:weak_inverted, 8, 2, 11) == "weak_inverted_Md8_Mg2_Nt11"
+        @test_throws ErrorException DG.result_signature(:custom, 8, 1, 11)
         @test_throws ErrorException DG.result_signature(:ground, 0, 1, 11)
 
         path, key = DG.result_target("stem", :ground, 8, 1, 11)
         @test key == "ground_Md8_Mg1_Nt11"
         @test endswith(path, "stem_ground_Md8_Mg1_Nt11.jld2")
+        pathi, keyi = DG.result_target("stem", :inverted, 8, 1, 11)
+        @test keyi == "inverted_Md8_Mg1_Nt11"
+        @test endswith(pathi, "stem_inverted_Md8_Mg1_Nt11.jld2")
+        pathw, keyw = DG.result_target("stem", :weak, 8, 1, 11)
+        @test keyw == "weak_Md8_Mg1_Nt11"
+        @test endswith(pathw, "stem_weak_Md8_Mg1_Nt11.jld2")
+        pathwi, keywi = DG.result_target("stem", :weak_inverted, 8, 1, 11)
+        @test keywi == "weak_inverted_Md8_Mg1_Nt11"
+        @test endswith(pathwi, "stem_weak_inverted_Md8_Mg1_Nt11.jld2")
         @test DG.pulsemat_from_result(path) == replace(path, ".jld2" => "_pulsemat.csv")
         @test DG.stem_from_simulconfig_path("/tmp/abc_simulconfig.jld2") == "abc"
         @test_throws ErrorException DG.stem_from_simulconfig_path("nope.jld2")
@@ -132,6 +180,9 @@ ts = @testset verbose = true "datagen selftest" begin
         sig = DG.result_signature(:ground, DG.RULE_M_CAP, 1, DG.RULE_NT_SAVE)
         @test ncodeunits("$(stem)_$(sig).jld2") < 255
         @test ncodeunits("$(stem)_$(sig)_pulsemat.csv") < 255
+        sigw = DG.result_signature(:weak_inverted, DG.RULE_M_CAP, 1, DG.RULE_NT_SAVE)
+        @test ncodeunits("$(stem)_$(sigw).jld2") < 255
+        @test ncodeunits("$(stem)_$(sigw)_pulsemat.csv") < 255
 
         sys = DG.canonical_system()
         sig_amps = String[]
@@ -476,7 +527,7 @@ ts = @testset verbose = true "datagen selftest" begin
                 sys, spec = canonical_rase_spec()
                 Ttotal = DG.derive_ttotal(sys, spec)
                 run = DG.make_run_params(;
-                    ics = (:ground,),
+                    ics = (:ground, :inverted, :weak, :weak_inverted),
                     M_cap = 700,
                     M_g_max = 1,
                     n_sizes = 1,
@@ -485,16 +536,20 @@ ts = @testset verbose = true "datagen selftest" begin
                 splits = DG.splits_for_run(sys, Ttotal, run)
                 @test length(splits) == 1
                 @test splits[1].safety_factor >= DG.RULE_SAFETY_MIN
-                out = joinpath(dir, "tiny_ground_Md$(splits[1].M_delta)_Mg1_Nt11.jld2")
                 compute = DG.datagen_gpu_count() > 0 ? :gpu : :cpu
                 println("  tiny ODE compute=$compute  M=$(splits[1].M_total)  Nt=11")
-                elapsed = DG.run_one_ic(
-                    sys, spec, :ground, out, splits[1], run, Ttotal;
-                    compute = compute,
-                )
-                @test elapsed > 0
-                @test DG.result_is_complete(out)
-                DG.datagen_reclaim_current_gpu!()
+                for ic in run.ics
+                    out = joinpath(dir, "tiny_$(ic)_Md$(splits[1].M_delta)_Mg1_Nt11.jld2")
+                    elapsed = DG.run_one_ic(
+                        sys, spec, ic, out, splits[1], run, Ttotal;
+                        compute = compute,
+                    )
+                    @test elapsed > 0
+                    @test DG.result_is_complete(out)
+                    data = JLD2.load(out, "data")
+                    @test data.SIM_SETTING.initial_condition === ic
+                    DG.datagen_reclaim_current_gpu!()
+                end
                 DG.datagen_reclaim_all_gpus!(DG.datagen_cuda_devices())
             end
         end

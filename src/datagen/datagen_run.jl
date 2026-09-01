@@ -45,7 +45,7 @@ function parse_args(args)
     start_id = 1
     stop_id = 0
     skip_existing = true
-    conditions = "both"
+    conditions = "cannon"
     M_cap = RULE_M_CAP
     M_g_max = RULE_M_G_MAX
     m_sizing = "default"
@@ -73,7 +73,7 @@ function parse_args(args)
         elseif a == "--no-skip"
             skip_existing = false
             i += 1
-        elseif a == "--default-conditions" || a == "--conditions"
+        elseif a == "--tracks" || a == "--default-conditions" || a == "--conditions"
             conditions, i = _need_value(args, i, a)
         elseif a == "--M-cap"
             val, i = _need_value(args, i, a)
@@ -113,7 +113,7 @@ function parse_args(args)
         stop_id = stop_id,
         skip_existing = skip_existing,
         run = make_run_params(;
-            ics = parse_default_conditions(conditions),
+            ics = parse_tracks(conditions),
             M_cap = M_cap,
             M_g_max = M_g_max,
             n_sizes = parse_m_sizing(m_sizing),
@@ -136,7 +136,7 @@ function print_usage()
 
         configs  replaces data/datagen/configs/ with a new simulconfig catalog.
                  Do not use it to resume a simulate.
-        simulate loads that catalog and runs pending (IC, split) jobs.
+        simulate loads that catalog and runs pending (track, split) jobs.
                  Exits 1 if any entry or trajectory failed.
                  Resume with the same flags; skip is filename-based.
         all      configs then simulate. --limit applies to both (it is not
@@ -145,7 +145,11 @@ function print_usage()
         Simulate options:
           --start IDX --stop IDX   1-based window into the sorted configs listing
           --limit N --no-skip
-          --default-conditions ground|equatorial|both     (default both)
+          --tracks T[,T...]   ICs to integrate (default cannon = ground,equator)
+                              T: ground, inverted, equator (alias equatorial),
+                              weak, weak_inverted.
+                              groups: poles, precess, cannon, approx, all
+          --default-conditions / --conditions   aliases of --tracks
           --M-cap N --M-g-cap N --M-sizing default|N --NT-save N
 
         Default --M-cap 60000 and --NT-save 5001 need on the order of 10 GB
@@ -166,7 +170,7 @@ function main(args)
     if opt.phase in ("simulate", "all") && !(opt.dry_run && opt.phase == "all")
         r = opt.run
         println(
-            "Run params: conditions=$(r.ics)  M-cap=$(r.M_cap)  M-g-cap=$(r.M_g_max)  " *
+            "Run params: tracks=$(r.ics)  M-cap=$(r.M_cap)  M-g-cap=$(r.M_g_max)  " *
             "M-sizing=$(r.n_sizes == 1 ? "default" : r.n_sizes)  NT-save=$(r.Nt_save)"
         )
     end

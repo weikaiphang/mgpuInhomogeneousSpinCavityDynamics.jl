@@ -3,35 +3,57 @@
 #
 # The small block is tiny, so it is built on the host and broadcast to every
 # shard.  The O(M²) block is written directly on the device: the only
-# non-zero entry is <Sz_j Sz_k> = Nj_j Nj_k / 4 off the diagonal, so no host
-# buffer of that size is ever allocated.
+# non-zero entry for pole ICs is <Sz_j Sz_k> = Nj_j Nj_k / 4 off the
+# diagonal, so no host buffer of that size is ever allocated.
+#
+# IC symbols match `build_u0_1st_order_cpu` in pulse_optimizer2.jl.
+# :ground / :inverted / :custom small-block assignments are unchanged.
 # ============================================================
 
 """
     small_block_initial(M, Nj, kind, T)
 
 Host vector of length `3 + 9M` holding the replicated part of the initial
-state for `kind ∈ (:ground, :inverted, :custom)`.
+state for `kind ∈ (:ground, :inverted, :equator, :weak, :weak_inverted, :custom)`.
 """
 function small_block_initial(M::Int, Nj::AbstractVector, kind::Symbol, ::Type{T}) where {T}
     u = zeros(Complex{T}, small_length(M))
 
-    Sz0 = if kind === :ground
-        -Nj ./ 2
+    if kind === :ground
+        Sz0 = -Nj ./ 2
+        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
+        u[small_range(M, F_SzSz_s)] .= Complex{T}.((Nj .^ 2) ./ 4)
     elseif kind === :inverted
-        Nj ./ 2
+        Sz0 = Nj ./ 2
+        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
+        u[small_range(M, F_SzSz_s)] .= Complex{T}.((Nj .^ 2) ./ 4)
     elseif kind === :custom
-        zeros(length(Nj))
+        # all zero
+    elseif kind === :equator || kind === :weak || kind === :weak_inverted
+        Sp0, Sz0 = _mgpu_spin_means(Nj, kind)
+        u[small_range(M, F_Sp)]     .= Complex{T}.(Sp0)
+        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
+        u[small_range(M, F_SpSp_s)] .= Complex{T}.(Sp0 .* Sp0)
+        u[small_range(M, F_SzSp_s)] .= Complex{T}.(Sz0 .* Sp0)
+        u[small_range(M, F_SmSp_s)] .= Complex{T}.(abs2.(Sp0))
+        u[small_range(M, F_SzSz_s)] .= Complex{T}.(Sz0 .* Sz0)
     else
-        error("Unknown initial_condition = $(kind). Use :ground, :inverted or :custom.")
+        _unknown_initial_condition(kind)
     end
 
-    SzSz0 = kind === :custom ? zeros(length(Nj)) : (Nj .^ 2) ./ 4
-
-    u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
-    u[small_range(M, F_SzSz_s)] .= Complex{T}.(SzSz0)
-
     return u
+end
+
+function _mgpu_spin_means(Nj, kind::Symbol)
+    if kind === :equator
+        return Nj ./ 2, zero.(Nj)
+    elseif kind === :weak
+        return _WEAK_SEED .* Nj ./ 2, -Nj ./ 2
+    elseif kind === :weak_inverted
+        return _WEAK_SEED .* Nj ./ 2, Nj ./ 2
+    else
+        _unknown_initial_condition(kind)
+    end
 end
 
 """
@@ -43,7 +65,9 @@ function set_initial_condition!(prob::MGPUProblem{T}, Nj::AbstractVector,
                                 kind::Symbol) where {T}
     M = prob.M
     small = small_block_initial(M, Nj, kind, T)
-    fill_diag = kind !== :custom
+    fill_szsz = kind === :ground || kind === :inverted ||
+                kind === :weak || kind === :weak_inverted
+    fill_sp_cross = kind === :equator || kind === :weak || kind === :weak_inverted
 
     each_shard(prob.shards, prob.exec) do s
         u = s.regs[1]
@@ -57,10 +81,31 @@ function set_initial_condition!(prob::MGPUProblem{T}, Nj::AbstractVector,
             copyto!(u, 1, small, 1, length(small))
         end
 
-        if fill_diag
-            n = M * s.mloc
-            @cuda threads=256 blocks=min(cld(n, 256), 4096) stream=s.stream init_szsz_cross_kernel!(
+        n = M * s.mloc
+        nblocks = min(cld(n, 256), 4096)
+        if fill_szsz
+            @cuda threads=256 blocks=nblocks stream=s.stream init_szsz_cross_kernel!(
                 u, s.Nj, M, s.mloc, s.joff, s.lo)
+        end
+        if fill_sp_cross
+            sp_scale = kind === :equator ? T(0.5) : T(_WEAK_SEED) / T(2)
+            sz_scale = if kind === :equator
+                T(0)
+            elseif kind === :weak
+                T(-0.5)
+            else
+                T(0.5)
+            end
+            @cuda threads=256 blocks=nblocks stream=s.stream init_nj_scale_cross_kernel!(
+                u, s.Nj, sp_scale, sp_scale, B_SpSp, M, s.mloc, s.joff, s.lo)
+            @cuda threads=256 blocks=nblocks stream=s.stream init_nj_scale_cross_kernel!(
+                u, s.Nj, sp_scale, sp_scale, B_SmSp, M, s.mloc, s.joff, s.lo)
+            if sz_scale != 0
+                @cuda threads=256 blocks=nblocks stream=s.stream init_nj_scale_cross_kernel!(
+                    u, s.Nj, sz_scale, sp_scale, B_SzSp, M, s.mloc, s.joff, s.lo)
+                @cuda threads=256 blocks=nblocks stream=s.stream init_nj_scale_cross_kernel!(
+                    u, s.Nj, sp_scale, sz_scale, B_SzSpT, M, s.mloc, s.joff, s.lo)
+            end
         end
         CUDA.synchronize(s.stream)
     end

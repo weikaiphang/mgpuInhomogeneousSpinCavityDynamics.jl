@@ -183,7 +183,7 @@ function phase_configs(; dry_run::Bool = false, limit::Int = 0)
     pairs, n_reject = enumerate_pairs(systems, designs)
     println("  unique validated (system, pulse) pairs: $(length(pairs))")
     println("  rejected at bind/Ttotal/pulse-validate: $n_reject")
-    println("  ICs at simulate time: --default-conditions ground|equatorial|both")
+    println("  ICs at simulate time: --tracks ground,inverted,equator,weak,weak_inverted (default cannon)")
 
     if dry_run
         n, n_write, stems = write_catalog!(pairs; dry_run = true, limit = limit)

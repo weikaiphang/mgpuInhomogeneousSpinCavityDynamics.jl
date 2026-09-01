@@ -19,7 +19,19 @@ const RULE_M_CAP = 60000
 const RULE_M_G_MAX = 30
 const RULE_SAFETY_MIN = 3.0
 
+# Allowed simulate-time ICs. These are pulse_optimizer2.jl's named
+# initial conditions (`build_u0_1st_order_cpu`), not the cost-mode
+# `track=:dual|:weak`. Default is cannon = ground+equator.
+const DATAGEN_TRACKS = (:ground, :inverted, :equator, :weak, :weak_inverted)
 const DATAGEN_ICS = (:ground, :equator)
+const DATAGEN_TRACK_POLES = (:ground, :inverted)
+const DATAGEN_TRACK_PRECESS = (:weak, :weak_inverted)
+const DATAGEN_TRACK_CANNON = DATAGEN_ICS
+const DATAGEN_TRACK_APPROX = (:ground, :weak)
+
+function is_datagen_track(ic::Symbol)
+    return ic in DATAGEN_TRACKS
+end
 
 function ensure_datagen_dirs()
     mkpath(DATAGEN_CONFIG_DIR)
@@ -219,7 +231,7 @@ function simulconfig_path(stem::AbstractString, dir::AbstractString=DATAGEN_CONF
 end
 
 function result_signature(ic::Symbol, M_delta, M_g, Nt_save)
-    ic in (:ground, :equator) || error("unknown initial condition $ic.")
+    is_datagen_track(ic) || error("unknown initial condition $ic.")
     md = Int(M_delta)
     mg = Int(M_g)
     nt = Int(Nt_save)

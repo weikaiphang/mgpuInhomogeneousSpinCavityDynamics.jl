@@ -12,7 +12,8 @@
 #   4. M-sizing n>1 adds extra grids at safeties equally spaced on
 #      (3, S], including S; the floor 3 itself is not a sample.
 # Caps, ICs, Nt_save, and n_sizes come from simulate-time run params.
-# Result files are named {stem}_{ic}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2;
+# Result files are named {stem}_{ic}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2
+# with ic in DATAGEN_TRACKS (ground, inverted, equator, weak, weak_inverted);
 # skip if that path and its pulsemat csv both exist and are non-empty.
 #
 # Trajectories are dispatched one-per-functional-CUDA-device (CPU if none).
@@ -317,18 +318,67 @@ function save_datagen_result(filename, data, E_of_t)
     return filename
 end
 
-function parse_default_conditions(s::AbstractString)
-    t = lowercase(strip(String(s)))
-    if t == "ground"
-        return (:ground,)
-    elseif t == "equatorial" || t == "equator"
-        return (:equator,)
-    elseif t == "both"
-        return (:ground, :equator)
-    else
-        error("--default-conditions must be ground, equatorial, or both, got $(s).")
-    end
+const _TRACK_TOKEN_ALIASES = Dict{String, Tuple{Vararg{Symbol}}}(
+    "ground" => (:ground,),
+    "inverted" => (:inverted,),
+    "equator" => (:equator,),
+    "equatorial" => (:equator,),
+    "weak" => (:weak,),
+    "weak_inverted" => (:weak_inverted,),
+    "weak-inverted" => (:weak_inverted,),
+    "poles" => DATAGEN_TRACK_POLES,
+    "precess" => DATAGEN_TRACK_PRECESS,
+    "cannon" => DATAGEN_TRACK_CANNON,
+    "approx" => DATAGEN_TRACK_APPROX,
+    "all" => DATAGEN_TRACKS,
+)
+
+function _tracks_help_tokens()
+    return "ground, inverted, equator (alias equatorial), weak, weak_inverted; " *
+        "groups: poles (=ground,inverted), precess (=weak,weak_inverted), " *
+        "cannon (=ground,equator), approx (=ground,weak), all"
 end
+
+"""
+    parse_tracks(s) -> Tuple{Vararg{Symbol}}
+
+Parse `--tracks` / `--default-conditions`. Comma-separated tokens,
+order-preserving, duplicates dropped. Tokens: `ground`, `inverted`,
+`equator` (`equatorial`), `weak`, `weak_inverted`. Groups: `poles`,
+`precess`, `cannon`, `approx`, `all`. These are ICs, not the optimizer
+cost-mode `track=:dual|:weak`.
+"""
+function parse_tracks(s::AbstractString)
+    raw = strip(String(s))
+    isempty(raw) && error(
+        "--tracks must be a non-empty list of $(_tracks_help_tokens())."
+    )
+    out = Symbol[]
+    seen = Set{Symbol}()
+    for part in split(raw, ',')
+        t = lowercase(strip(part))
+        isempty(t) && continue
+        aliases = get(_TRACK_TOKEN_ALIASES, t, nothing)
+        if aliases === nothing
+            error(
+                "unknown --tracks token $(repr(part)). Allowed: $(_tracks_help_tokens())."
+            )
+        end
+        for ic in aliases
+            is_datagen_track(ic) || error("internal: alias $(t) produced illegal track $ic.")
+            if ic ∉ seen
+                push!(out, ic)
+                push!(seen, ic)
+            end
+        end
+    end
+    isempty(out) && error(
+        "--tracks must name at least one track ($(_tracks_help_tokens())), got $(repr(s))."
+    )
+    return Tuple(out)
+end
+
+parse_default_conditions(s::AbstractString) = parse_tracks(s)
 
 function parse_m_sizing(s::AbstractString)
     t = lowercase(strip(String(s)))
@@ -348,7 +398,7 @@ function make_run_params(;
 )
     isempty(ics) && error("run ics must be non-empty.")
     for ic in ics
-        ic in (:ground, :equator) || error("unknown initial condition $ic.")
+        is_datagen_track(ic) || error("unknown initial condition $ic.")
     end
     M_cap >= 1 || error("M_cap must be positive, got $M_cap.")
     M_g_max >= 1 || error("M_g_max must be positive, got $M_g_max.")

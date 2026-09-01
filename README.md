@@ -552,7 +552,8 @@ campaign. Start Julia with at least as many threads as CUDA GPUs
 julia --project=. src/datagen/datagen_run.jl --help
 julia --project=. src/datagen/datagen_run.jl --phase configs --dry-run
 julia --project=. src/datagen/datagen_run.jl --phase configs
-julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate --start 1 --stop 1
+julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate --start 1 --stop 1 --tracks ground
+julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate --tracks precess
 julia --project=. src/datagen/datagen_selftest.jl
 ```
 

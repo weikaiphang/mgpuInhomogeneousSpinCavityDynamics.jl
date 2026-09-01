@@ -54,7 +54,7 @@ function get_initial_condition(CONFIG)
     if hasproperty(CONFIG, :initial_condition)
         return CONFIG.initial_condition
     else
-        error("Unknown initial_condition. Use :ground or :inverted.")
+        error("Unknown initial_condition. Use :ground, :inverted, :equator, :weak, :weak_inverted, or :custom.")
         return nothing
     end
 end

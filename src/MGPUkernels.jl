@@ -573,6 +573,31 @@ function init_szsz_cross_kernel!(u, Nj, M::Int, mloc::Int, joff::Int, lo::Int)
     return nothing
 end
 
+"""
+    init_nj_scale_cross_kernel!(u, Nj, scale_j, scale_k, block, M, mloc, joff, lo)
+
+Fill large-block `block` (1-based, `B_SpSp`…`B_SzSz`) with
+`(scale_j * Nj[j]) * (scale_k * Nj[k])` off the diagonal. Same layout as
+[`init_szsz_cross_kernel!`](@ref): owned bin `j = joff+jl`, partner `k`.
+"""
+function init_nj_scale_cross_kernel!(
+    u, Nj, scale_j, scale_k, block::Int, M::Int, mloc::Int, joff::Int, lo::Int,
+)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    stride = blockDim().x * gridDim().x
+    n = M * mloc
+    base = lo + (block - 1) * n
+    @inbounds while i <= n
+        jl = (i - 1) ÷ M + 1
+        k  = (i - 1) % M + 1
+        j  = joff + jl
+        u[base + i] = j == k ? zero(eltype(u)) :
+                      eltype(u)((scale_j * Nj[j]) * (scale_k * Nj[k]))
+        i += stride
+    end
+    return nothing
+end
+
 function sum_partials_kernel!(out, partial, n::Int)
     sh = CuStaticSharedArray(eltype(out), 32)
     acc = zero(eltype(out))

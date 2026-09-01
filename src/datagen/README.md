@@ -68,14 +68,14 @@ and Fourier safety are **not** stored.
 
 **`simulate`** loads those files, derives `Ttotal`, chooses
 `(M_delta, M_g)` from the **current** CLI flags, and runs each pending
-`(IC, split)` job. If any catalog entry failed to plan or any trajectory
+`(track, split)` job. If any catalog entry failed to plan or any trajectory
 failed, the process **exits 1**.
 
 Resume a killed simulate with `--phase simulate` and the **same** flags
-(`--M-cap`, `--M-g-cap`, `--M-sizing`, `--NT-save`,
-`--default-conditions`). Do **not** re-run `--phase configs` to resume:
-that replaces the catalog. Result JLD2s are not deleted by configs;
-stems that still match will skip on the next simulate.
+(`--M-cap`, `--M-g-cap`, `--M-sizing`, `--NT-save`, `--tracks`). Do
+**not** re-run `--phase configs` to resume: that replaces the catalog.
+Result JLD2s are not deleted by configs; stems that still match will skip
+on the next simulate.
 
 ### CLI
 
@@ -88,8 +88,9 @@ stems that still match will skip on the next simulate.
 | `--start IDX` | simulate | `1` | 1-based index into the **sorted** `configs/` listing |
 | `--stop IDX` | simulate | `0` | inclusive end index; `0` means last file |
 | `--no-skip` | simulate | skip on | overwrite complete result pairs |
-| `--default-conditions ground\|equatorial\|both` | simulate | `both` | ICs. CLI `equatorial` is solver `:equator` |
-| `--conditions` | simulate | same | alias of `--default-conditions` |
+| `--tracks T[,T…]` | simulate | `cannon` (`ground,equator`) | ICs to integrate. Tokens: `ground`, `inverted`, `equator` (alias `equatorial`), `weak`, `weak_inverted`. Groups: `poles` = ground+inverted, `precess` = weak+weak_inverted, `cannon` = ground+equator, `approx` = ground+weak, `all` = all five. These are `pulse_optimizer2.jl` ICs, not cost-mode `track=:dual` |
+| `--default-conditions` | simulate | same | alias of `--tracks` |
+| `--conditions` | simulate | same | alias of `--tracks` |
 | `--M-cap N` | simulate | `60000` | `M_delta * M_g ≤ N` |
 | `--M-g-cap N` | simulate | `30` | `M_g ≤ N` when *g* is not constant |
 | `--M-sizing default\|N` | simulate | `default` | `default` or `1`: one max-safety split. integer `N>1`: *N* target safeties on `(3, S]` |
@@ -104,7 +105,15 @@ Smoke one catalog file after configs exists (cheap IC, one stem):
 
 ```bash
 julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate \
-  --start 1 --stop 1 --default-conditions ground
+  --start 1 --stop 1 --tracks ground
+```
+
+Weak-excitation tracks (`:weak` near ground, `:weak_inverted` near the
+excited pole, `ε = 10⁻³` as in `pulse_optimizer2.jl`):
+
+```bash
+julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate \
+  --start 1 --stop 1 --tracks precess
 ```
 
 Default `--M-cap 60000` and `--NT-save 5001` make host `Sp`/`Sz` on the
@@ -139,8 +148,8 @@ pinned to 1 thread for the pool.
 data/datagen/
   configs/{stem}_simulconfig.jld2
   configs.staging/          # ephemeral; sibling of configs/, not inside it
-  results/{stem}_{ground|equator}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2
-  results/{stem}_{ground|equator}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}_pulsemat.csv
+  results/{stem}_{ground|inverted|equator|weak|weak_inverted}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2
+  results/{stem}_{ground|inverted|equator|weak|weak_inverted}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}_pulsemat.csv
   manifest.json
 ```
 
@@ -300,7 +309,14 @@ not a sample. Duplicate `(M_delta, M_g)` pairs collapse; the last
 (highest-safety / default) metadata wins. If collapse happens, simulate
 prints how many unique grids remain.
 
-Solver ICs are `:ground` and/or `:equator`.
+Solver ICs (`--tracks`) are `pulse_optimizer2.jl`'s
+`build_u0_1st_order_cpu` symbols: `:ground`, `:inverted`, `:equator`,
+`:weak`, `:weak_inverted`. Default is `cannon` (`:ground` and
+`:equator`). `:weak` is the Holstein–Primakoff silencing seed
+(`Sp = ε·Nj/2`, `Sz = -Nj/2`); `:weak_inverted` is the same seed on the
+north pole; `:inverted` is the north pole with `Sp = 0`. The identifier
+in the result basename is the solver symbol. `SIM_SETTING.initial_condition`
+stores the same symbol.
 
 ---
 
@@ -309,8 +325,8 @@ Solver ICs are `:ground` and/or `:equator`.
 A job is skipped when **both** paths exist and `filesize > 0`:
 
 ```text
-{stem}_{ground|equator}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2
-{stem}_{ground|equator}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}_pulsemat.csv
+{stem}_{ground|inverted|equator|weak|weak_inverted}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2
+{stem}_{ground|inverted|equator|weak|weak_inverted}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}_pulsemat.csv
 ```
 
 Skip does not open the JLD2. A non-empty truncated file counts as
@@ -421,7 +437,11 @@ is truncated and tagged with a process-stable FNV-1a 8-hex digest
 | `RULE_M_CAP` | `60000` | default `--M-cap` |
 | `RULE_M_G_MAX` | `30` | default `--M-g-cap` |
 | `RULE_SAFETY_MIN` | `3.0` | Fourier safety floor |
-| `DATAGEN_ICS` | `(:ground, :equator)` | default IC pair |
+| `DATAGEN_TRACKS` | `(:ground, :inverted, :equator, :weak, :weak_inverted)` | allowed `--tracks` ICs |
+| `DATAGEN_ICS` / `DATAGEN_TRACK_CANNON` | `(:ground, :equator)` | default `--tracks` (`cannon`) |
+| `DATAGEN_TRACK_POLES` | `(:ground, :inverted)` | `--tracks poles` |
+| `DATAGEN_TRACK_PRECESS` | `(:weak, :weak_inverted)` | `--tracks precess` |
+| `DATAGEN_TRACK_APPROX` | `(:ground, :weak)` | `--tracks approx` |
 | `DATAGEN_STEM_MAXLEN` | `180` | stem truncation threshold (bytes) |
 
 ---

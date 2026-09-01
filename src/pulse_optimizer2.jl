@@ -76,7 +76,9 @@ Plain-`Vector` (not `CuArray`), element-type-generic analogue of
 parameter vector `u` is being solved/differentiated with (`Float64` for
 an ordinary forward solve, `ForwardDiff.Dual` when differentiating),
 so the initial state promotes correctly alongside the ODE's `E_of_t`-
-driven trajectory.
+driven trajectory. The same IC set is accepted by
+`build_u0_gpu_1st_order`, `build_u0_gpu_2nd_order`, and
+`set_initial_condition!`.
 
 `initial_condition`:
   * `:ground`         -- south pole, `Sz = -Nj/2`, `Sp = 0`
