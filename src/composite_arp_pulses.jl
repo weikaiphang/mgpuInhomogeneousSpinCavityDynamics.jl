@@ -99,13 +99,14 @@ Returns `(PULSE_CONFIG, report)`:
   `pulses.jl`'s [`build_E_of_t`](@ref)/`run_sim_1st_order` already
   expect), ready to concatenate with a signal pulse tuple and simulate/
   save as-is.
-- `report`: `(inversion, coherence, silencing, total_duration, t_start,
-  t_end, bandwidth, duration1, duration2, amp1, amp2)` --
-  `inversion`/`coherence` are the SAME per-bin metrics
-  `pulse_optimizer2.jl` computes ([`_weighted_inversion`](@ref)/
-  [`_weighted_coherence`](@ref)); `silencing` is the collective,
-  cooperativity-weighted mode-overlap factor
-  ([`_weighted_silencing_factor`](@ref)); `total_duration` is
+- `report`: `(inversion, coherence, silencing, weak_seed_retention,
+  total_duration, t_start, t_end, bandwidth, duration1, duration2, amp1,
+  amp2)` -- the SAME metrics `pulse_optimizer2.jl` computes:
+  `inversion` ([`_weighted_inversion`](@ref)), the paper silencing factor
+  `silencing` ([`_weighted_silencing_factor`](@ref)), its per-slice
+  magnitude companion `coherence` ([`_weighted_coherence`](@ref)) and the
+  un-clamped `weak_seed_retention` ([`_weak_seed_retention`](@ref));
+  `total_duration` is
   `t_end - t_start` (the composite pulse's own span), NOT `d`'s full
   simulated window.
 """
@@ -165,11 +166,13 @@ function generate_3arp_pi_pulse(
     inversion = _weighted_inversion(Sz_g[end, :], d.g_b, d.Nj, T)
 
     _, _, Sp_e, Sz_e = run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:weak, reltol=reltol, abstol=abstol)
-    coherence = _weighted_coherence(Sp_e[end, :], d.Nj, T)
+    coherence = _weighted_coherence(Sp_e[end, :], d.g_b, d.Nj, d.delta_b, T)
     silencing = _weighted_silencing_factor(Sp_e[end, :], d.g_b, d.Nj, d.delta_b, T)
+    weak_seed_retention = _weak_seed_retention(Sp_e[end, :], d.g_b, d.Nj, d.delta_b, T)
 
     report = (
         inversion=inversion, coherence=coherence, silencing=silencing,
+        weak_seed_retention=weak_seed_retention,
         total_duration=t3_end - t1_start,
         t_start=t1_start, t_end=t3_end,
         bandwidth=bw, duration1=dur1, duration2=dur2, amp1=amp1, amp2=amp2,

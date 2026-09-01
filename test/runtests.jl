@@ -258,13 +258,22 @@ const FAKE_D_ODE = merge(FAKE_D, (
     @test length(Sz) == FAKE_D_ODE.M
     @test Nj == FAKE_D_ODE.Nj
 
-    inv, sil = pulse_metrics(u0, pulse, FAKE_D_ODE)
+    inv, sil, coh, famp, ret = pulse_metrics(u0, pulse, FAKE_D_ODE)
     @test 0 <= inv <= 1
     @test 0 <= sil <= 1
+    @test 0 <= coh <= 1
+    @test 0 <= famp <= 1
+    # coherence is the per-slice MAGNITUDE bound on |F|_⋆ (triangle ineq)
+    @test coh >= sil - 1e-12
+    # weak_seed_retention is coherence's un-clamped value: equal while ≤ 1,
+    # and ≥ coherence always (clamp only ever lowers).
+    @test ret >= coh - 1e-12
+    @test isfinite(ret) && ret >= 0
 
-    cost, inv2, sil2, dur = pulse_cost(u0, pulse, FAKE_D_ODE)
+    cost, inv2, sil2, dur, coh2, famp2, ret2 = pulse_cost(u0, pulse, FAKE_D_ODE)
     @test isfinite(cost)
     @test inv2 == inv
+    @test coh2 == coh && famp2 == famp && ret2 == ret
     @test sil2 == sil
     @test dur ≈ pulse_duration(pulse, u0)
 

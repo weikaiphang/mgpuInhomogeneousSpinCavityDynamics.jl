@@ -635,28 +635,84 @@ function _weighted_inversion(Sz, g_b, Nj, ::Type{T}) where {T}
 end
 
 """
-    _weighted_coherence(Sp, Nj, ::Type{T}; eps_seed=_WEAK_SEED) -> T
+    _weak_seed_retention(Sp, g_b, Nj, delta_b, ::Type{T}; eps_seed=_WEAK_SEED) -> T
 
-Per-bin `Nj`-weighted mean of `|Sp_j|/(ε·Nj_j/2)`, in `[0, 1]` -- the
-retained fraction of the weak-excitation seed's per-bin coherence
-magnitude, `ε = eps_seed` = [`_WEAK_SEED`](@ref) (so an
-undisturbed seed reads `1`, full local decoherence reads `0`). NOT used
-by [`pulse_cost`](@ref)/[`pulse_metrics`](@ref) (superseded there by
-[`_weighted_silencing_factor`](@ref)'s collective, per-frequency-slice
-mode-overlap `|F|`) -- kept only so [`save_optimisation_run_log`](@ref)
-can log this simpler, per-bin-average metric alongside the silencing
-factor actually being optimised, for comparison. Same `1e-30` epsilon
-pattern as `_weighted_inversion`'s denominator (`abs(Dual(0))` is `0/0`
-otherwise).
+UNCLAMPED cooperativity-weighted, per-frequency-slice, ε-normalised
+MAGNITUDE ratio of the `:weak` track's end-state -- the same construction
+as [`_weighted_silencing_factor`](@ref) but with `|Sp_j|` taken INSIDE the
+per-slice sum (no phase cancellation), so it is the triangle-inequality
+upper bound on that factor's aggregate:
+
+    B(ω)  = {j : ω_j = ω}                             (see _frequency_slice_indices)
+    C(ω)  = ( Σ_{j∈B(ω)} g_j² |Sp_j| ) / ( ε · Σ_{j∈B(ω)} g_j² Nj_j/2 )
+    n(ω)  = Σ_{j∈B(ω)} Nj_j g_j²
+    ret   = Σ_ω n(ω) C(ω) / Σ_ω n(ω)                  (NOT clamped)
+
+Interpretation -- a weak-excitation VALIDITY check for the paper's App. B
+single-TLS-propagator picture:
+
+  * `ret ≈ 1`  -- every bin stayed at its `Sp_j(0) = ε·Nj_j/2` seed; the
+    pulse acts as a (near) phase-only operation, so the
+    `_weighted_silencing_factor` / `_weighted_coherence` initial-overlap
+    normalisation is exact and `|F|_⋆` is fully trustworthy.
+  * `ret ≫ 1`  (up to ~`1/ε`) -- the pulse has PUMPED transverse coherence
+    far above the seed (it is not operating in the Holstein–Primakoff
+    regime). `|F|_⋆` and `coherence` are still bounded in `[0, 1]` by their
+    own clamps, but their normalisation is being stretched by this factor
+    -- read them with care.
+  * `ret < 1`  -- net transverse decay below the seed.
+
+Diagnostic only; never part of `pulse_cost`'s objective. Same `1e-30`
+epsilons as the silencing factor.
 """
-function _weighted_coherence(Sp, Nj, ::Type{T}; eps_seed::Real=_WEAK_SEED) where {T}
-    length(Sp) == length(Nj) || error(
-        "_weighted_coherence: Sp length $(length(Sp)) != Nj length $(length(Nj))."
+function _weak_seed_retention(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector,
+        delta_b::AbstractVector, ::Type{T}; eps_seed::Real=_WEAK_SEED) where {T}
+    length(Sp) == length(g_b) == length(Nj) == length(delta_b) || error(
+        "_weak_seed_retention: Sp/g_b/Nj/delta_b lengths " *
+        "$(length(Sp))/$(length(g_b))/$(length(Nj))/$(length(delta_b)) must match."
     )
-    weight = Nj ./ sum(Nj)
-    Sp_abs = sqrt.(abs2.(Sp) .+ 1e-30)
-    Sp_fraction = Sp_abs ./ (convert(T, eps_seed) .* (Nj ./ 2) .+ 1e-30)
-    return sum(weight .* clamp.(Sp_fraction, zero(T), one(T)))
+    eps_seed > 0 || error("_weak_seed_retention: eps_seed must be > 0, got $eps_seed.")
+    slices = _frequency_slice_indices(delta_b)
+    num_acc = zero(T)     # Σ_ω n(ω) C(ω)
+    den_acc = zero(T)     # Σ_ω n(ω)
+    for idx in slices
+        wg = abs2.(g_b[idx])                                             # g_j²
+        C_num = sum(wg .* sqrt.(abs2.(Sp[idx]) .+ 1e-30))                # Σ g² |Sp|  (magnitudes)
+        C_den = sum(wg .* (convert(T, eps_seed) .* (Nj[idx] ./ 2)))      # ε Σ g² Nj/2
+        n_omega = sum(Nj[idx] .* wg)                                     # n(ω) = Σ N g²
+        num_acc += n_omega * (C_num / (C_den + 1e-30))
+        den_acc += n_omega
+    end
+    return num_acc / (den_acc + 1e-30)
+end
+
+"""
+    _weighted_coherence(Sp, g_b, Nj, delta_b, ::Type{T}; eps_seed=_WEAK_SEED) -> T
+
+`clamp([`_weak_seed_retention`](@ref), 0, 1)` -- the per-frequency-slice
+MAGNITUDE companion to [`_weighted_silencing_factor`](@ref), on the SAME
+`:weak` solve, with the SAME `Nj g²` slice weighting and the SAME `ε`
+initial-overlap normalisation. By the triangle inequality `|Σ z| ≤ Σ|z|`
+applied slice by slice, `coherence ≥ silencing` always, so
+
+    coherence − silencing  ∈  [0, coherence]
+
+is exactly the fraction of the surviving transverse magnitude that was
+lost to `g`-space PHASE SPREAD rather than to decoherence:
+
+  * `silencing ≈ coherence ≈ 1`  -- RASE / ACE (pure `ω²/κ` chirp).
+  * `silencing ≈ 0`, `coherence ≈ 1`  -- ROSE ideal: magnitude intact,
+    the collective sum killed purely by destructive interference.
+  * `silencing ≈ 0`, `coherence ≈ 0`  -- decoherence (`|Sp_j| → 0`).
+
+Diagnostic only; never fed into [`pulse_cost`](@ref)'s objective. See
+[`_weak_seed_retention`](@ref) for the un-clamped value (a validity check
+on the weak-excitation assumption itself).
+"""
+function _weighted_coherence(Sp::AbstractVector, g_b::AbstractVector, Nj::AbstractVector,
+        delta_b::AbstractVector, ::Type{T}; eps_seed::Real=_WEAK_SEED) where {T}
+    return clamp(_weak_seed_retention(Sp, g_b, Nj, delta_b, T; eps_seed=eps_seed),
+                 zero(T), one(T))
 end
 
 """
@@ -805,7 +861,8 @@ function _weighted_field_amplitude(Sp::AbstractVector, g_b::AbstractVector, Nj::
 end
 
 """
-    pulse_metrics(u, pulse, d; kwargs...) -> (inversion, silencing, coherence, field_amp)
+    pulse_metrics(u, pulse, d; kwargs...)
+        -> (inversion, silencing, coherence, field_amp, weak_seed_retention)
 
 Dual-trajectory metrics used by [`pulse_cost`](@ref). `inversion` and
 `silencing` are both in `[0, 1]`, higher = better, and are NOT two
@@ -823,17 +880,23 @@ coordinates of one Bloch vector:
   slice, a pure `ω²/κ` chirp (RASE-style revival / ACE). `F=0`: `g`-space
   phase spread cancels the collective sum (ROSE-style silencing) -- these
   are NOT distinguishable from `|F|` alone, by design.
-- `coherence`: the OLDER, simpler per-bin `Nj`-weighted mean of
-  `|Sp|/(ε·Nj/2)` (see [`_weighted_coherence`](@ref)), from the SAME
-  `:weak` solve as `silencing` (no extra ODE solve). DIAGNOSTIC ONLY --
-  never fed into [`pulse_cost`](@ref)'s optimised objective, recorded
-  purely so callers/logs can compare it against the collective `|F|`
-  actually being optimised.
+- `coherence`: the per-frequency-slice MAGNITUDE companion to `silencing`
+  (see [`_weighted_coherence`](@ref)) -- SAME `:weak` solve, SAME `Nj g²`
+  slice weighting, SAME `ε` initial-overlap normalisation, but with
+  `|Sp_j|` inside the per-slice sum. `coherence ≥ silencing` always, and
+  `coherence − silencing` is the fraction of surviving magnitude lost to
+  `g`-space PHASE SPREAD (vs. decoherence). DIAGNOSTIC ONLY -- never fed
+  into [`pulse_cost`](@ref)'s objective.
 - `field_amp`: the linearly-`g`-weighted counterpart of `silencing` (see
-  [`_weighted_field_amplitude`](@ref)), from the SAME `:weak` solve (no
-  extra ODE solve). DIAGNOSTIC ONLY -- proportional to the actual emitted
-  cavity field amplitude, unlike `silencing`'s cooperativity weighting;
-  never fed into [`pulse_cost`](@ref)'s optimised objective.
+  [`_weighted_field_amplitude`](@ref)), from the SAME `:weak` solve.
+  DIAGNOSTIC ONLY -- proportional to the actual emitted cavity field
+  amplitude, unlike `silencing`'s cooperativity weighting.
+- `weak_seed_retention`: the UN-clamped value `coherence` clamps (see
+  [`_weak_seed_retention`](@ref)) -- a validity check on the App. B
+  weak-excitation assumption. `≈ 1`: pulse is (near) phase-only, `|F|_⋆`
+  normalisation exact. `≫ 1`: pulse pumped coherence above the `ε` seed,
+  `|F|_⋆`/`coherence` normalisation stretched -- interpret with care.
+  DIAGNOSTIC ONLY.
 
 Do not pass `initial_condition` — both ICs are fixed here. Solver kwargs
 (`signal_E_of_t`, `reltol`, ...) are forwarded to both solves.
@@ -846,9 +909,10 @@ function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; compute::Sym
     inversion = _weighted_inversion(Sz, d.g_b, Nj, T)
     _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
     silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, T)
-    coherence = _weighted_coherence(Sp, Nj_eq, T)
+    coherence = _weighted_coherence(Sp, d.g_b, Nj_eq, d.delta_b, T)
     field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
-    return inversion, silencing, coherence, field_amp
+    weak_seed_retention = _weak_seed_retention(Sp, d.g_b, Nj_eq, d.delta_b, T)
+    return inversion, silencing, coherence, field_amp, weak_seed_retention
 end
 
 # ============================================================
@@ -1034,7 +1098,7 @@ end
 
 """
     pulse_cost(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
-        -> (cost, inversion, silencing, duration, coherence, field_amp)
+        -> (cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention)
 
 Scalar cost to be minimised. Inversion and silencing are scored on
 **two independent ODE solves** of the same pulse `u` (see
@@ -1078,19 +1142,26 @@ formula bit-for-bit.
 coefficients (i.e. `softplus.(raw_cA)`). Failed solves return `Inf`.
 Do not pass `initial_condition`.
 
-`coherence` is the OLDER, simpler per-bin `Nj`-weighted mean of
-`|Sp|/(Nj/2)` (see [`_weighted_coherence`](@ref)/[`pulse_metrics`](@ref)),
-computed from the SAME `:weak` solve as `silencing` (no extra ODE
-solve). It is DIAGNOSTIC ONLY -- recorded for comparison, never part of
-`cost`, which depends only on `inversion` and `silencing`.
+`coherence`, `field_amp` and `weak_seed_retention` are all DIAGNOSTIC
+ONLY -- computed from the SAME `:weak` solve as `silencing` (no extra ODE
+solve), never part of `cost`, which depends only on `inversion` and
+`silencing`:
 
-`field_amp` (see [`_weighted_field_amplitude`](@ref)) is likewise
-DIAGNOSTIC ONLY, from the SAME `:weak` solve -- the linearly-`g`-weighted,
-field-amplitude-proportional counterpart of the cooperativity-weighted
-`silencing`; never part of `cost`. Appended at the END of the return tuple
-specifically so existing positional-unpacking callers (`cost, inv, sil,
-dur, coh = pulse_cost(...)`) keep working unchanged (Julia's tuple
-destructuring ignores extra trailing values).
+  * `coherence` (see [`_weighted_coherence`](@ref)/[`pulse_metrics`](@ref))
+    -- the per-frequency-slice MAGNITUDE companion to `silencing`, same
+    weighting/normalisation; `coherence ≥ silencing` and the gap is the
+    magnitude lost to `g`-space phase spread.
+  * `field_amp` (see [`_weighted_field_amplitude`](@ref)) -- the
+    linearly-`g`-weighted, radiated-field-proportional counterpart.
+  * `weak_seed_retention` (see [`_weak_seed_retention`](@ref)) -- the
+    un-clamped magnitude ratio `coherence` clamps; a validity check on the
+    App. B weak-excitation assumption (`≈ 1` good, `≫ 1` the pulse pumped
+    the ensemble and the `|F|_⋆` normalisation is stretched).
+
+All are appended at the END of the return tuple so existing
+positional-unpacking callers (`cost, inv, sil, dur = pulse_cost(...)`)
+keep working unchanged (Julia's tuple destructuring ignores extra
+trailing values).
 """
 function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
                      target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
@@ -1115,6 +1186,7 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
     silencing = zero(T)
     coherence = zero(T)
     field_amp = zero(T)
+    weak_seed_retention = zero(T)
 
     try
         # Both tracks must be simulated to compute the multiplicative physical fidelity
@@ -1123,19 +1195,20 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
 
         _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
         silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, T)
-        coherence = _weighted_coherence(Sp, Nj_eq, T)
+        coherence = _weighted_coherence(Sp, d.g_b, Nj_eq, d.delta_b, T)
         field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
+        weak_seed_retention = _weak_seed_retention(Sp, d.g_b, Nj_eq, d.delta_b, T)
     catch e
         e isa PulseSolveFailed || rethrow()
         infT = convert(T, Inf)
         nanT = convert(T, NaN)
-        return infT, nanT, nanT, duration, nanT, nanT
+        return infT, nanT, nanT, duration, nanT, nanT, nanT
     end
 
     physics_cost, _, _ = _fidelity_physics_cost(inversion, silencing, target_F, I_min, kappa_I, S_min, kappa_S)
 
     cost = physics_cost + w_time * (duration / pulse.T_max) + tmax_penalty + power_penalty
-    return cost, inversion, silencing, duration, coherence, field_amp
+    return cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention
 end
 
 # ============================================================
@@ -2813,7 +2886,7 @@ end
 
 """
     _pulse_cost_grad_threaded(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, compute=:auto, kwargs...)
-        -> (grad::Vector{Float64}, cost, inversion, silencing, duration, coherence, field_amp)
+        -> (grad::Vector{Float64}, cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention)
 
 Task-parallel drop-in for `ForwardDiff.gradient(uu -> pulse_cost(uu, pulse,
 d; kwargs...)[1], u)` plus `pulse_cost`'s own aux outputs -- mathematically
@@ -2905,7 +2978,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
     direct_val = direct_only(u)
 
     aux_ground = Ref{Float64}(0.0)
-    aux_weak = Ref{NTuple{3,Float64}}((0.0, 0.0, 0.0))
+    aux_weak = Ref{NTuple{4,Float64}}((0.0, 0.0, 0.0, 0.0))  # (silencing, coherence, field_amp, weak_seed_retention)
 
     if !use_gpu_pool
         grads = Vector{Vector{Float64}}(undef, 2)
@@ -2931,9 +3004,11 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         )
                         Tu = eltype(uu)
                         sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
-                        coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
+                        coh_ = _weighted_coherence(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
                         famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
-                        aux_weak[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
+                        ret_ = _weak_seed_retention(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
+                        aux_weak[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)),
+                                      Float64(ForwardDiff.value(famp_)), Float64(ForwardDiff.value(ret_)))
                         return sil_
                     end
                     grads[2] = ForwardDiff.gradient(weak_only, u, ForwardDiff.GradientConfig(weak_only, u, chunk))
@@ -2943,10 +3018,10 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                 failed[i] = true
             end
         end
-        any(failed) && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN
+        any(failed) && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN, NaN
 
         inversion = aux_ground[]
-        silencing, coherence, field_amp = aux_weak[]
+        silencing, coherence, field_amp, weak_seed_retention = aux_weak[]
         grad_I = grads[1]
         grad_F = grads[2]
 
@@ -2999,10 +3074,12 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                         )
                         Tu = eltype(uu)
                         sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
-                        coh_ = _weighted_coherence(Sp, Nj_eq, Tu)
+                        coh_ = _weighted_coherence(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
                         famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
+                        ret_ = _weak_seed_retention(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
                         if first(job.idxs) == 1
-                            aux_weak[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)), Float64(ForwardDiff.value(famp_)))
+                            aux_weak[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)),
+                                          Float64(ForwardDiff.value(famp_)), Float64(ForwardDiff.value(ret_)))
                         end
                         return sil_
                     end
@@ -3021,9 +3098,9 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
         end)
         _reclaim_gpu_memory()
 
-        failed[] && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN
+        failed[] && return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN, NaN
         inversion = aux_ground[]
-        silencing, coherence, field_amp = aux_weak[]
+        silencing, coherence, field_amp, weak_seed_retention = aux_weak[]
     end
 
     # Explicit analytical application of the non-linear chain rule coupling the two tracks
@@ -3037,7 +3114,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
 
     grad = grad_physics .+ grad_direct
     cost = physics_cost + direct_val
-    return grad, cost, inversion, silencing, duration, coherence, field_amp
+    return grad, cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention
 end
 
 # ============================================================
@@ -3107,7 +3184,8 @@ basins (a basin's local best is not necessarily better than a previous
 basin's) -- plus `history`, a `Vector{<:NamedTuple}` with one entry per
 epoch actually run
 (`hop, epoch, k, cost, inversion, silencing, duration, coherence,
-improved, x_tune, schedule_factor`), tagged with the
+field_amp, weak_seed_retention, improved, x_tune, schedule_factor`),
+tagged with the
 caller-supplied `hop` index so a caller accumulating history across many
 basins can tell which hop each row came from. `k` (the sub-pulse count,
 from `pulse.k`) is recorded on every row too, even though it's constant
@@ -3294,7 +3372,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         pulse, ones(pulse.k), ones(pulse.k), ones(pulse.k), ones(pulse.n_coeff_A, pulse.k),
         fill(cf_lr_scale, pulse.n_coeff_f, pulse.k),
     )
-    aux = Ref{NTuple{6,Float64}}((NaN, NaN, NaN, NaN, NaN, NaN))
+    aux = Ref{NTuple{7,Float64}}((NaN, NaN, NaN, NaN, NaN, NaN, NaN))  # cost, inv, sil, dur, coh, field_amp, weak_seed_retention
     base_w_time = haskey(cost_kwargs, :w_time) ? Float64(cost_kwargs.w_time) : 0.15
     target_F_val = haskey(cost_kwargs, :target_F) ? Float64(cost_kwargs.target_F) : 1.0
 
@@ -3352,12 +3430,12 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     history = NamedTuple[]
     last_good_u = copy(u_start)
     last_good_grad = zeros(n)
-    # (cost, inversion, silencing, duration, coherence, field_amp). cost stays
+    # (cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention). cost stays
     # NaN so the moving-target isfinite(last_good_aux[1]) guard skips at epoch 1
     # and a failed epoch-1 solve still degrades to the revert loop. inversion/
     # silencing carry the calibration seed (or NaN when none was taken) -- these
     # are the only two slots _curriculum_fidelity_weight reads.
-    last_good_aux = (NaN, seed_inv, seed_sil, NaN, NaN, NaN)
+    last_good_aux = (NaN, seed_inv, seed_sil, NaN, NaN, NaN, NaN)
     adam_m0 = zeros(n)
     adam_v0 = zeros(n)
     adam_t0 = 0
@@ -3433,7 +3511,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
             if isfinite(last_good_aux[1])
                 shifted_last_cost = last_good_aux[1] + w_diff * (last_good_aux[4] / pulse.T_max)
                 last_good_aux = (shifted_last_cost, last_good_aux[2], last_good_aux[3],
-                                 last_good_aux[4], last_good_aux[5], last_good_aux[6])
+                                 last_good_aux[4], last_good_aux[5], last_good_aux[6], last_good_aux[7])
             end
         end
         prev_dyn_w_time = dyn_w_time
@@ -3453,21 +3531,21 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # changed this epoch -- read it back directly, do not re-evaluate.
         if just_reverted
             grad = last_good_grad
-            cost, inv_, sil_, dur_, coh_, famp_ = last_good_aux
+            cost, inv_, sil_, dur_, coh_, famp_, ret_ = last_good_aux
             adam.m .= adam_m0
             adam.v .= adam_v0
             adam.t = adam_t0
         elseif grad_mode === :adjoint
-            grad, cost, inv_, sil_, dur_, coh_, famp_ = pulse_cost_grad_adjoint(
+            grad, cost, inv_, sil_, dur_, coh_, famp_, ret_ = pulse_cost_grad_adjoint(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
         elseif threaded_grad
-            grad, cost, inv_, sil_, dur_, coh_, famp_ = _pulse_cost_grad_threaded(
+            grad, cost, inv_, sil_, dur_, coh_, famp_, ret_ = _pulse_cost_grad_threaded(
                 u, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...,
             )
         else
             function cost_only(uu)
-                c, inv_2, sil_2, dur_2, coh_2, famp_2 = pulse_cost(uu, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...)
+                c, inv_2, sil_2, dur_2, coh_2, famp_2, ret_2 = pulse_cost(uu, pulse, d; epoch_cost_kwargs..., compute=compute, solve_kwargs...)
                 aux[] = (
                     Float64(ForwardDiff.value(c)),
                     Float64(ForwardDiff.value(inv_2)),
@@ -3475,16 +3553,18 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
                     Float64(ForwardDiff.value(dur_2)),
                     Float64(ForwardDiff.value(coh_2)),
                     Float64(ForwardDiff.value(famp_2)),
+                    Float64(ForwardDiff.value(ret_2)),
                 )
                 return c
             end
             grad = ForwardDiff.gradient(cost_only, u)
-            cost, inv_, sil_, dur_, coh_, famp_ = aux[]
+            cost, inv_, sil_, dur_, coh_, famp_, ret_ = aux[]
         end
         if !isfinite(cost)
             epochs_since_improve += 1
             push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
-                             silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_, improved=false,
+                             silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_,
+                             weak_seed_retention=ret_, improved=false,
                              x_tune=x_tune_eff, schedule_factor=factor))
             elapsed = time() - t_wall
             u .= last_good_u
@@ -3505,7 +3585,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         lr = min(lr * 1.5, learning_rate)
         last_good_u .= u
         last_good_grad .= grad
-        last_good_aux = (cost, inv_, sil_, dur_, coh_, famp_)
+        last_good_aux = (cost, inv_, sil_, dur_, coh_, famp_, ret_)
         adam_m0 .= adam.m
         adam_v0 .= adam.v
         adam_t0 = adam.t
@@ -3521,7 +3601,8 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         end
 
         push!(history, (hop=hop, epoch=epoch, k=pulse.k, cost=cost, inversion=inv_,
-                         silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_, improved=improved,
+                         silencing=sil_, duration=dur_, coherence=coh_, field_amp=famp_,
+                         weak_seed_retention=ret_, improved=improved,
                          x_tune=x_tune_eff, schedule_factor=factor))
 
         adam_step!(u, grad, adam; lr=lr, lr_scale=lr_scale)
@@ -3615,12 +3696,13 @@ keywords so they are NOT passed through to the ODE solver. Do not pass
 Besides the optimised `(best_u, best_cost, pulse)`, also returns: `u0`
 (the initial/candidate parameterisation hop 0 actually started from --
 either a fresh random guess or `warm_start_u`, see below),
-`initial_metrics` (`(cost, inversion, silencing, duration, coherence)` at
-`u0`, from [`pulse_cost`](@ref) -- `coherence` is diagnostic only, never
-part of `cost`), `history` -- the [`run_local_adam`](@ref) per-epoch
+`initial_metrics` (the full [`pulse_cost`](@ref) return at `u0`:
+`(cost, inversion, silencing, duration, coherence, field_amp,
+weak_seed_retention)` -- everything after `silencing` is diagnostic only,
+never part of `cost`), `history` -- the [`run_local_adam`](@ref) per-epoch
 log from EVERY hop, concatenated in run order (each row tagged with its
-own `hop`/`epoch`) -- `final_metrics` (the same `(cost, inversion,
-silencing, duration, coherence)` shape, for `best_u` specifically -- NOT necessarily
+own `hop`/`epoch`) -- `final_metrics` (the same `pulse_cost`-tuple
+shape, for `best_u` specifically -- NOT necessarily
 `history[end]`, since `best_u` can come from an earlier epoch than the
 last one run), and `optimizer_settings`, a `NamedTuple` of every setting
 that actually affected this run: `k`/`n_coeff_A`/`n_coeff_f`/`degree`/

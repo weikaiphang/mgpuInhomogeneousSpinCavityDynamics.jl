@@ -1359,7 +1359,8 @@ end
 Step 5: final-state forward simulation of `ref.recorded_E_of_t` on
 `:ground` and the weak-excitation `:weak` seed. Returns `ground` outputs
 (`a`, `Σp`, `Σz`), the `weak` track's `Sp`, and
-`metrics = (inversion, silencing, coherence, duration)`.
+`metrics = (inversion, silencing, coherence, weak_seed_retention, duration)`
+(everything after `silencing` is diagnostic -- see [`pulse_metrics`](@ref)).
 Those metrics are the reference metrics for later optimisation comparison.
 `reltol`/`abstol` default to `ref.SIM_SETTING`.
 """
@@ -1388,12 +1389,14 @@ function run_reference_forward(
     Sigma_z = sum(Sz)
     inversion = _weighted_inversion(Sz, d.g_b, d.Nj, Float64)
     silencing = _weighted_silencing_factor(Sp_eq, d.g_b, d.Nj, d.delta_b, Float64)
-    coherence = _weighted_coherence(Sp_eq, d.Nj, Float64)
+    coherence = _weighted_coherence(Sp_eq, d.g_b, d.Nj, d.delta_b, Float64)
+    weak_seed_retention = _weak_seed_retention(Sp_eq, d.g_b, d.Nj, d.delta_b, Float64)
     duration = _recorded_control_duration(
         ref.identification, ref.control_t, ref.control_Ex, ref.control_Ep,
     )
     metrics = (
-        inversion=inversion, silencing=silencing, coherence=coherence, duration=duration,
+        inversion=inversion, silencing=silencing, coherence=coherence,
+        weak_seed_retention=weak_seed_retention, duration=duration,
     )
     forward = (
         ground=(a=a, Sigma_p=Sigma_p, Sigma_z=Sigma_z, Sp=Sp, Sz=Sz),
@@ -1408,7 +1411,9 @@ function run_reference_forward(
         println("  :ground   inversion=$(round(inversion, sigdigits=6))  a=$(a)  Σz=$(Sigma_z)")
         println(
             "  :weak     silencing=$(round(silencing, sigdigits=6))  " *
-            "coherence=$(round(coherence, sigdigits=6))  duration=$(round(duration, sigdigits=6))s"
+            "coherence=$(round(coherence, sigdigits=6))  " *
+            "weak_seed_retention=$(round(weak_seed_retention, sigdigits=6))  " *
+            "duration=$(round(duration, sigdigits=6))s"
         )
     end
     return forward
@@ -1482,8 +1487,13 @@ function reconcile_reference(
             ok = ok && rel_sil < rtol
         end
         if stored_met.coherence !== nothing
+            # Recorded for information only -- NOT gated into `ok`. `coherence`
+            # is a pure diagnostic (like `field_amp`/`weak_seed_retention`,
+            # neither of which is compared here), and its definition changed
+            # with the paper alignment (now the per-frequency-slice magnitude
+            # companion to |F|_⋆), so a run saved under the old per-bin
+            # definition would spuriously fail an equality check.
             rel_coh = abs(m.coherence - stored_met.coherence) / (abs(stored_met.coherence) + atol_use)
-            ok = ok && rel_coh < rtol
         end
         if stored_met.duration !== nothing
             rel_dur = abs(m.duration - stored_met.duration) / (abs(stored_met.duration) + atol_use)
@@ -1936,14 +1946,16 @@ function save_optimisation_run_log(
     final_output = (a=a1, Sigma_p=sum(Sp1), Sigma_z=sum(Sz1))
 
     # Diagnostic only -- NOT part of the optimised cost (pulse_cost uses
-    # the silencing factor |F|, not this per-bin coherence average).
-    # Logged purely so a saved run can be compared against the old
-    # coherence-based metric without re-running anything: two extra
-    # :weak solves at u0/best_u, done once here, not every epoch.
+    # the silencing factor |F|_⋆). Logged as top-level keys for convenience:
+    # two extra :weak solves at u0/best_u, done once here, not every epoch.
+    # `coherence` is the per-slice magnitude companion to |F|_⋆; `retention`
+    # is its un-clamped value (weak-excitation validity check).
     _, Sp0_eq, _, Nj0_eq = run_sim_1st_order_pure(u0, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:weak)
-    initial_coherence = _weighted_coherence(Sp0_eq, Nj0_eq, Float64)
+    initial_coherence = _weighted_coherence(Sp0_eq, d.g_b, Nj0_eq, d.delta_b, Float64)
+    initial_weak_seed_retention = _weak_seed_retention(Sp0_eq, d.g_b, Nj0_eq, d.delta_b, Float64)
     _, Sp1_eq, _, Nj1_eq = run_sim_1st_order_pure(best_u, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:weak)
-    final_coherence = _weighted_coherence(Sp1_eq, Nj1_eq, Float64)
+    final_coherence = _weighted_coherence(Sp1_eq, d.g_b, Nj1_eq, d.delta_b, Float64)
+    final_weak_seed_retention = _weak_seed_retention(Sp1_eq, d.g_b, Nj1_eq, d.delta_b, Float64)
 
     full_settings = merge((n_signal=n_signal, USE_SIGNAL=use_signal), optimizer_settings)
 
@@ -1955,9 +1967,11 @@ function save_optimisation_run_log(
         benchmark_metrics=benchmark_metrics,
         initial_u=collect(u0), initial_metrics=initial_metrics, initial_output=initial_output,
         initial_coherence=initial_coherence,
+        initial_weak_seed_retention=initial_weak_seed_retention,
         history=history,
         final_u=collect(best_u), final_metrics=final_metrics, final_output=final_output,
         final_coherence=final_coherence,
+        final_weak_seed_retention=final_weak_seed_retention,
     )
     JLD2.save(optrunlog_path, "data", run_log)
     println("Saved optimisation run log to $optrunlog_path")

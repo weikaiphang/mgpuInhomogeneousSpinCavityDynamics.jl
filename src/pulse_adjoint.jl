@@ -273,18 +273,19 @@ function pulse_cost_on_frozen_mesh(
     use = replay_tsit5_window(u0e, p, mesh_weak.t[1], mesh_weak.dt)
     _, Sp, _ = unpack_state_1st_order_u(use[end], Int(d.M))
     silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, T)
-    coherence = _weighted_coherence(Sp, d.Nj, T)
+    coherence = _weighted_coherence(Sp, d.g_b, d.Nj, d.delta_b, T)
     field_amp = _weighted_field_amplitude(Sp, d.g_b, d.Nj, T)
+    weak_seed_retention = _weak_seed_retention(Sp, d.g_b, d.Nj, d.delta_b, T)
 
     direct = _direct_cost_term(u, pulse, w_time, w_power, w_tmax)
     physics_cost, _, _ = _fidelity_physics_cost(inversion, silencing, target_F, I_min, kappa_I, S_min, kappa_S)
     cost = physics_cost + direct
-    return cost, inversion, silencing, duration, coherence, field_amp
+    return cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention
 end
 
 """
     pulse_cost_grad_adjoint(u, pulse, d; kwargs...)
-        -> (grad, cost, inversion, silencing, duration, coherence, field_amp)
+        -> (grad, cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention)
 
 Frozen-mesh discrete Tsit5 adjoint of [`pulse_cost`](@ref). Dual-Tsit5
 gradients are a different object; this is not a drop-in bit-identical
@@ -374,7 +375,7 @@ function pulse_cost_grad_adjoint(
     compute_eff === :auto && (compute_eff = :cpu)
     compute_eff === :gpu && @warn "pulse_cost_grad_adjoint v1 reverses on CPU; ignoring compute=:gpu"
 
-    local inversion, silencing, coherence, field_amp, grad_I, grad_F
+    local inversion, silencing, coherence, field_amp, weak_seed_retention, grad_I, grad_F
     try
         function pb_inv!(λx, a, Sp, Sz)
             inversion_pullback!(λx, Sz, d.g_b, d.Nj)
@@ -395,12 +396,13 @@ function pulse_cost_grad_adjoint(
             reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
         )
         silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, Float64))
-        coherence = Float64(_weighted_coherence(Sp, d.Nj, Float64))
+        coherence = Float64(_weighted_coherence(Sp, d.g_b, d.Nj, d.delta_b, Float64))
         field_amp = Float64(_weighted_field_amplitude(Sp, d.g_b, d.Nj, Float64))
+        weak_seed_retention = Float64(_weak_seed_retention(Sp, d.g_b, d.Nj, d.delta_b, Float64))
     catch e
         e isa PulseSolveFailed || rethrow()
         GC.gc(false)
-        return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN
+        return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN, NaN
     end
 
     GC.gc(false)
@@ -420,5 +422,5 @@ function pulse_cost_grad_adjoint(
 
     grad = grad_physics .+ grad_direct
     cost = physics_cost + direct_val
-    return grad, cost, inversion, silencing, duration, coherence, field_amp
+    return grad, cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention
 end
