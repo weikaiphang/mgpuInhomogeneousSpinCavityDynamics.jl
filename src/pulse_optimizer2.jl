@@ -610,8 +610,19 @@ end
   * `:weak` -- ONE `:weak` solve; `inversion` is read from THAT solve's
     own `Sz` too. Halves the ODE cost. Justified because the `:weak`
     seed perturbs `Sz` only at O(ε) (ε = `_WEAK_SEED` = 1e-3), so
-    `inversion` on `:weak` ≈ `inversion` on `:ground` to ~1e-3. Use when
-    that bias is acceptable relative to the fidelity target.
+    `inversion` on `:weak` ≈ `inversion` on `:ground` to ~1e-3 (measured
+    4.2e-5 on the toy `hs1` config). Use when that DETERMINISTIC bias is
+    acceptable relative to the fidelity target.
+
+The single-track gradient (ForwardDiff, threaded-Jacobian, AND the
+1-forward/2-reverse adjoint via [`_adjoint_track_multi`](@ref)) is the
+EXACT gradient of `pulse_cost(u; track=:weak)` -- verified roundoff-
+identical across all three backends. The only approximation is that
+`pulse_cost(u; track=:weak)` itself ≈ `pulse_cost(u; track=:dual)` to
+O(ε); a `track=:weak` optimum is therefore an O(ε)-approximate stationary
+point of the `:dual` objective. Re-evaluate the winner with
+`pulse_metrics(best_u, pulse, d; track=:dual)` for the canonical `:ground`
+inversion if the fidelity budget is tighter than ~1e-3.
 """
 function _assert_track(track::Symbol)
     track === :dual || track === :weak || error(
