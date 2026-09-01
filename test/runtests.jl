@@ -403,6 +403,23 @@ end
     @test r[8].track === :weak
     @test isfinite(r[2])
     @test all(haskey(h, :weak_seed_retention) for h in r[6])
+
+    # automatic winner re-check: optimizer_settings carries the canonical
+    # :ground inversion of the winner and the O(ε) bias (one extra :ground
+    # solve for track=:weak; reused, gap==0, for track=:dual).
+    @test haskey(r[8], :final_inversion_ground) && haskey(r[8], :final_inv_gap)
+    inv_g = pulse_metrics(r[1], r[3], FAKE_D_ODE; track=:dual)[1]
+    inv_w = pulse_metrics(r[1], r[3], FAKE_D_ODE; track=:weak)[1]
+    @test r[8].final_inversion_ground ≈ inv_g atol=1e-10
+    @test r[8].final_inv_gap ≈ inv_w - inv_g atol=1e-10
+    @test abs(r[8].final_inv_gap) < 5e-3               # O(ε) bias
+    @test r[8].final_inv_gap ≈ r[7][2] - r[8].final_inversion_ground atol=1e-12
+
+    rd = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE; track=:dual,
+        num_epochs=2, n_hops=1, patience=2, hop_patience=1, tol=1e-3, seed=1,
+        label_prefix="[oc-dual] ")
+    @test rd[8].final_inv_gap == 0.0                   # :dual scored inversion on :ground already
+    @test rd[8].final_inversion_ground == rd[7][2]     # no extra solve, reused
 end
 
 @testset "threaded gradient matches serial" begin

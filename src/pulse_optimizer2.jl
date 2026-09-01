@@ -620,9 +620,13 @@ EXACT gradient of `pulse_cost(u; track=:weak)` -- verified roundoff-
 identical across all three backends. The only approximation is that
 `pulse_cost(u; track=:weak)` itself ≈ `pulse_cost(u; track=:dual)` to
 O(ε); a `track=:weak` optimum is therefore an O(ε)-approximate stationary
-point of the `:dual` objective. Re-evaluate the winner with
-`pulse_metrics(best_u, pulse, d; track=:dual)` for the canonical `:ground`
-inversion if the fidelity budget is tighter than ~1e-3.
+point of the `:dual` objective. [`optimise_composite_pulse`](@ref) /
+[`optimise_composite_pulse_rjmcmc`](@ref) do this re-check automatically:
+after the search they spend ONE `:ground` solve of the winner and record
+`final_inversion_ground` (the canonical value) and `final_inv_gap`
+(`inversion:weak - inversion:ground`) in `optimizer_settings`, so any
+saved run log carries the true `:ground` inversion. For an ad-hoc `u`,
+`pulse_metrics(u, pulse, d; track=:dual)[1]` gives the same number.
 """
 function _assert_track(track::Symbol)
     track === :dual || track === :weak || error(
@@ -3805,7 +3809,12 @@ any of `solve_kwargs` whose value isn't a `Function` (so e.g. a numeric
 non-serialisable closure like `signal_E_of_t` is deliberately excluded --
 that one is captured separately, as `use_signal`/`n_signal`, by
 [`optimise_control_pulse_from_jld2`](@ref), since those two scalars are
-enough to rebuild the exact same closure deterministically). All of
+enough to rebuild the exact same closure deterministically). It also
+carries `final_inversion_ground` and `final_inv_gap` from the automatic
+winner re-check (see [`_assert_track`](@ref)): for `track=:dual` these are
+just `final_metrics[2]` and `0.0`; for `track=:weak` `final_inversion_ground`
+is a fresh canonical `:ground` solve of `best_u` and `final_inv_gap =
+inversion:weak - inversion:ground` is the O(ε) single-track bias. All of
 these are exactly what [`optimise_control_pulse_from_jld2`](@ref) needs
 to write a full, replicable run log; ordinary callers that only want the
 optimised pulse can simply ignore the extra return values.
@@ -4011,6 +4020,35 @@ function optimise_composite_pulse(
     end
 
     final_metrics = pulse_cost(global_best_u, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
+
+    # Winner re-check: a `track=:weak` run scores `inversion` on the `:weak`
+    # solve, which biases it by O(ε) vs the canonical `:ground` value (see
+    # `_assert_track`). Spend ONE `:ground` solve of the winner so
+    # `optimizer_settings` (and therefore any saved run log) always carries the
+    # true `:ground` inversion and the measured bias. `:dual` runs already
+    # scored inversion on `:ground`, so there `final_inv_gap == 0` and no extra
+    # solve runs. Uses the SAME `_solver_kwargs`/`run_sim_1st_order_pure` path
+    # `pulse_cost`'s own `:dual` branch uses, so this is the identical solve.
+    if track === :weak
+        sk_final = _solver_kwargs(solve_kwargs)
+        _, _, Sz_gf, Nj_gf = run_sim_1st_order_pure(
+            global_best_u, pulse, d; compute=compute, sk_final..., initial_condition=:ground,
+        )
+        final_inversion_ground = Float64(_weighted_inversion(Sz_gf, d.g_b, Nj_gf, Float64))
+        final_inv_gap = Float64(final_metrics[2]) - final_inversion_ground
+        println(
+            "$(label_prefix)track=:weak winner re-check: inversion(:weak)=" *
+            "$(round(Float64(final_metrics[2]), sigdigits=6))  inversion(:ground)=" *
+            "$(round(final_inversion_ground, sigdigits=6))  inv_gap=$(round(final_inv_gap, sigdigits=3))"
+        )
+    else
+        final_inversion_ground = Float64(final_metrics[2])
+        final_inv_gap = 0.0
+    end
+    optimizer_settings = merge(
+        optimizer_settings,
+        (final_inversion_ground=final_inversion_ground, final_inv_gap=final_inv_gap),
+    )
 
     println("$(label_prefix)Optimisation complete. Global best cost: $(round(global_best_cost, digits=4)).")
     return global_best_u, global_best_cost, pulse, u0, initial_metrics, history, final_metrics, optimizer_settings

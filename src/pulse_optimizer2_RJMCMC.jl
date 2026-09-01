@@ -535,10 +535,13 @@ any of `solve_kwargs` whose value isn't a `Function` (so e.g. a numeric
 non-serialisable closure like `signal_E_of_t` is deliberately excluded --
 that one is captured separately, as `use_signal`/`n_signal`, by
 [`optimise_control_pulse_from_jld2`](@ref), since those two scalars are
-enough to rebuild the exact same closure deterministically). All of
-these are exactly what [`optimise_control_pulse_from_jld2`](@ref) needs
-to write a full, replicable run log; ordinary callers that only want the
-optimised pulse can simply ignore the extra return values.
+enough to rebuild the exact same closure deterministically). It also
+carries `final_inversion_ground`/`final_inv_gap` from the automatic winner
+re-check (canonical `:ground` inversion of `best_u` and the O(ε)
+single-track bias; `0.0` gap for `track=:dual`) -- see [`_assert_track`](@ref).
+All of these are exactly what [`optimise_control_pulse_from_jld2`](@ref)
+needs to write a full, replicable run log; ordinary callers that only want
+the optimised pulse can simply ignore the extra return values.
 
 `warm_start_u`: if given (e.g. a previous run's saved `final_u`, from a
 loaded `_optrunlog.jld2` -- see [`load_jld2_run`](@ref)), hop 0 starts
@@ -756,6 +759,30 @@ function optimise_composite_pulse_rjmcmc(
     end
 
     final_metrics = pulse_cost(global_best_u, global_best_pulse, d; cost_kwargs..., solve_kwargs...)
+
+    # Winner re-check under `track=:weak` -- see the identical block in
+    # `optimise_composite_pulse`. One `:ground` solve of the winner so the saved
+    # run log carries the canonical `:ground` inversion and the O(ε) bias.
+    if track === :weak
+        sk_final = _solver_kwargs(solve_kwargs)
+        _, _, Sz_gf, Nj_gf = run_sim_1st_order_pure(
+            global_best_u, global_best_pulse, d; sk_final..., initial_condition=:ground,
+        )
+        final_inversion_ground = Float64(_weighted_inversion(Sz_gf, d.g_b, Nj_gf, Float64))
+        final_inv_gap = Float64(final_metrics[2]) - final_inversion_ground
+        println(
+            "$(label_prefix)track=:weak winner re-check: inversion(:weak)=" *
+            "$(round(Float64(final_metrics[2]), sigdigits=6))  inversion(:ground)=" *
+            "$(round(final_inversion_ground, sigdigits=6))  inv_gap=$(round(final_inv_gap, sigdigits=3))"
+        )
+    else
+        final_inversion_ground = Float64(final_metrics[2])
+        final_inv_gap = 0.0
+    end
+    optimizer_settings = merge(
+        optimizer_settings,
+        (final_inversion_ground=final_inversion_ground, final_inv_gap=final_inv_gap),
+    )
 
     println("$(label_prefix)Optimisation complete. Global best cost: $(round(global_best_cost, digits=4)), global best k=$(global_best_pulse.k).")
     return global_best_u, global_best_cost, global_best_pulse, u0, initial_metrics, history, final_metrics, optimizer_settings
