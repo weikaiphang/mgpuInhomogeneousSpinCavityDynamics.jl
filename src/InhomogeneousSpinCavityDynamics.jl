@@ -139,6 +139,7 @@ export SignalControlRejected
 
 # Analytic composite ARP pulse exports
 export generate_2n1_arp_pi_pulse
+export generate_2n1_arp_from_jld2
 export generate_3arp_pi_pulse  # DEPRECATED alias -> generate_2n1_arp_pi_pulse(d; n_pairs=1, ...)
 
 # Noise exports
