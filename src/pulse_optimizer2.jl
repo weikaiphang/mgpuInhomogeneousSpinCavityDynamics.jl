@@ -3362,23 +3362,32 @@ is a separate final evaluation of `best_u` under the caller's own static
 `cost_kwargs` (full `w_time`), so basin-hopping's Metropolis test and
 `final_metrics` still compare hops on the SAME fixed objective.
 
-**`hop==0` ALWAYS runs at `dyn_w_time == 0.0` -- a HARD INVARIANT, not
-something `anneal_direct_weights=false` can override.** `factor` is pinned
-at `0.0`, AND `dyn_w_time` is computed as an explicit `hop==0 ? 0.0 :
-base_w_time*factor` short-circuit (not left to emerge from `factor==0`) and
-`@assert`ed, so a future change to `factor` cannot silently reintroduce a
-`w_time` term on hop 0. hop 0's `w_time` contribution to the gradient AND
-to `best_cost`/`improved` is fully suppressed (genuinely physics-only
-optimisation -- duration ignored -- for the entire first hop) REGARDLESS of
-`anneal_direct_weights`'s own value -- unlike every other hop, where
-`anneal_direct_weights=false` means the ORIGINAL "disable annealing,
-`factor=1.0`, recover the full fixed `w_time`" contract exactly as before
-this feature existed. These are two genuinely different `factor` defaults
-(`0.0` vs `1.0`) for two different reasons -- do not conflate them. No
-calibration `pulse_cost` evaluation is spent on hop 0 either way (nothing
-to calibrate `x_tune` for when `factor` is pinned regardless of
-`x_tune_alpha`). Annealing (in the ordinary, `anneal_direct_weights`-gated
-sense) only starts from **hop 1 onwards**. `hop` is this function's own
+**With `hop0_phyonly=true` (the default), `hop==0` ALWAYS runs at
+`dyn_w_time == 0.0` -- a HARD INVARIANT for that mode, not something
+`anneal_direct_weights=false` can override.** `factor` is pinned at `0.0`,
+AND `dyn_w_time` is computed as an explicit `(hop==0 && hop0_phyonly) ? 0.0
+: base_w_time*factor` short-circuit (not left to emerge from `factor==0`)
+and `@assert`ed, so a future change to `factor` cannot silently reintroduce
+a `w_time` term on a suppressed hop 0. hop 0's `w_time` contribution to the
+gradient AND to `best_cost`/`improved` is fully suppressed (genuinely
+physics-only optimisation -- duration ignored -- for the entire first hop)
+REGARDLESS of `anneal_direct_weights`'s own value -- unlike every other
+hop, where `anneal_direct_weights=false` means the ORIGINAL "disable
+annealing, `factor=1.0`, recover the full fixed `w_time`" contract exactly
+as before this feature existed. These are two genuinely different `factor`
+defaults (`0.0` vs `1.0`) for two different reasons -- do not conflate
+them. No calibration `pulse_cost` evaluation is spent on a suppressed hop 0
+either way (nothing to calibrate `x_tune` for when `factor` is pinned
+regardless of `x_tune_alpha`). Annealing (in the ordinary,
+`anneal_direct_weights`-gated sense) then only starts from **hop 1
+onwards**.
+
+**`hop0_phyonly=false`** removes this special case: hop 0 becomes a normal
+scheduled hop -- `dyn_w_time = base_w_time*factor` with `factor` from the
+curriculum anneal (`anneal_direct_weights=true`, one calibration
+`pulse_cost` eval at hop 0 to solve `x_tune`, like hop 1) or `1.0`
+(`anneal_direct_weights=false`). Use it when hop 0's search should already
+weigh pulse duration, not just fidelity. `hop` is this function's own
 existing parameter (defaulting to `0`), so a **standalone call with no
 explicit `hop`** (e.g. `run_local_adam(u0, pulse, d, cost_kwargs)`) always
 has `w_time` suppressed to `0.0` this way -- pass `hop=1` (or any nonzero
@@ -3451,7 +3460,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
                          hop::Integer=0, num_epochs::Integer=30, patience::Integer=5, tol::Real=1e-3,
                          learning_rate::Real=0.05, cf_lr_scale::Real=1.0, label::AbstractString="",
                          threaded_grad::Bool=false, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
-                         anneal_direct_weights::Bool=true,
+                         anneal_direct_weights::Bool=true, hop0_phyonly::Bool=true,
                          x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA,
                          _precalibrated_x_tune::Union{Nothing,Real}=nothing,
                          solve_kwargs...)
@@ -3471,9 +3480,12 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     target_F_val = haskey(cost_kwargs, :target_F) ? Float64(cost_kwargs.target_F) : 1.0
 
     # x_tune is never a caller-supplied keyword -- it is ALWAYS one of:
-    # (0) forced to the linear sentinel 0.0 on hop==0 -- annealing NEVER
-    # applies to hop 0 (see this function's own docstring), so no
-    # calibration pulse_cost evaluation is spent on it at all; (1) an
+    # (0) forced to the linear sentinel 0.0 on a `hop==0 && hop0_phyonly` hop
+    # -- the physics-only sandbox suppresses annealing entirely, so no
+    # calibration pulse_cost evaluation is spent on it at all. (`hop0_phyonly`
+    # defaults true; pass `hop0_phyonly=false` to make hop 0 a normal
+    # scheduled hop that calibrates x_tune from its own u_start like hop 1.)
+    # Otherwise: (1) an
     # already-calibrated value injected by a pipeline caller
     # (_precalibrated_x_tune, for optimise_composite_pulse/
     # optimise_composite_pulse_rjmcmc's own recalibrate_optima_x=false
@@ -3497,7 +3509,7 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
     # no eval spent, so no seed available; epoch 1 keeps w_time=0 there), and
     # for the uncalibrated linear fallback.
     seed_inv, seed_sil = NaN, NaN
-    x_tune_eff = if hop == 0
+    x_tune_eff = if hop == 0 && hop0_phyonly
         0.0
     elseif _precalibrated_x_tune !== nothing
         Float64(_precalibrated_x_tune)
@@ -3545,34 +3557,37 @@ function run_local_adam(u_start::AbstractVector, pulse::CompositePulse, d, cost_
         # via a factor computed from the LAST ACCEPTED point's own
         # (plain-Float64, AD-detached) metrics -- see
         # _curriculum_fidelity_weight's own docstring. TWO DIFFERENT
-        # defaults, not one: hop==0 ALWAYS pins factor at 0.0 (w_time fully
-        # suppressed for the entire first hop, regardless of
-        # anneal_direct_weights -- see this function's own docstring;
-        # annealing only starts from hop 1 onwards), whereas
-        # anneal_direct_weights=false at any hop!=0 is the ORIGINAL
-        # "disable annealing, recover the full fixed w_time" contract, i.e.
-        # factor=1.0 (NOT 0.0 -- these two "off" cases are NOT the same
-        # value and must not be conflated). Computed every epoch (including
+        # defaults, not one: a `hop==0 && hop0_phyonly` hop pins factor at 0.0
+        # (w_time fully suppressed for the entire first hop, regardless of
+        # anneal_direct_weights -- the physics-only sandbox; annealing only
+        # starts from hop 1), whereas anneal_direct_weights=false at any
+        # scheduled hop is the ORIGINAL "disable annealing, recover the full
+        # fixed w_time" contract, i.e. factor=1.0 (NOT 0.0 -- these two "off"
+        # cases are NOT the same value and must not be conflated). With
+        # `hop0_phyonly=false`, hop 0 is a normal scheduled hop and takes the
+        # anneal/1.0 branch like any other. Computed every epoch (including
         # just_reverted retries): the moving-target shift below needs the
         # current dyn_w_time even when the gradient itself is reused.
-        factor = if hop == 0
+        factor = if hop == 0 && hop0_phyonly
             0.0
         elseif anneal_direct_weights
             _curriculum_fidelity_weight(last_good_aux[2], last_good_aux[3], target_F_val, x_tune_eff)
         else
             1.0
         end
-        # HARD INVARIANT: hop 0 is the pure physics sandbox -- dyn_w_time is
-        # identically 0 for the WHOLE hop (gradient AND accept/reject), no
-        # schedule, no calibration, regardless of anneal_direct_weights. Written
-        # as an explicit hop==0 short-circuit (not left to emerge from factor==0)
-        # so a future change to `factor` cannot silently break it; the assert
-        # locks it. The epoch_cost_kwargs merge below is unconditional, so
-        # cost_kwargs.w_time can never leak into a hop-0 epoch either; and the
-        # moving-target block is inert at hop 0 (dyn_w_time is 0 every epoch and
-        # prev_dyn_w_time becomes 0 after epoch 1, so it never fires).
-        dyn_w_time = hop == 0 ? 0.0 : base_w_time * factor
-        @assert hop != 0 || dyn_w_time == 0.0 "hop 0 must run at w_time=0 (got dyn_w_time=$dyn_w_time)"
+        # INVARIANT (when hop0_phyonly): hop 0 is the pure physics sandbox --
+        # dyn_w_time is identically 0 for the WHOLE hop (gradient AND
+        # accept/reject), no schedule, no calibration, regardless of
+        # anneal_direct_weights. Written as an explicit short-circuit (not left
+        # to emerge from factor==0) so a future change to `factor` cannot
+        # silently break it; the assert locks it. The epoch_cost_kwargs merge
+        # below is unconditional, so cost_kwargs.w_time can never leak into a
+        # suppressed hop-0 epoch either; and the moving-target block is inert
+        # there (dyn_w_time is 0 every epoch and prev_dyn_w_time becomes 0
+        # after epoch 1, so it never fires). `hop0_phyonly=false` opts hop 0
+        # out of all of this -- it then behaves exactly like hop 1+.
+        dyn_w_time = (hop == 0 && hop0_phyonly) ? 0.0 : base_w_time * factor
+        @assert !(hop == 0 && hop0_phyonly) || dyn_w_time == 0.0 "hop0_phyonly hop must run at w_time=0 (got dyn_w_time=$dyn_w_time)"
 
         # I_min/kappa_I/S_min/kappa_S (the squared-hinge penalty on
         # inversion/silencing_success, see _fidelity_physics_cost) are NOT
@@ -3844,13 +3859,16 @@ returned `best_u` under the static, caller-configured `w_time` before
 returning it. Pass `anneal_direct_weights=false` to disable annealing
 entirely and recover the original fixed-`w_time` cost.
 
-**`hop==0` always has `w_time` suppressed to `0.0`** -- exactly mirroring
-[`run_local_adam`](@ref)'s own unconditional `hop==0` rule (physics-only
-optimisation for the entire first hop, REGARDLESS of
-`anneal_direct_weights`'s own value -- confirmed deliberate, not an
-oversight; see that function's own docstring for why this is a genuinely
-different `factor` default than the ordinary `anneal_direct_weights=false`
-one). No calibration `pulse_cost` evaluation spent on hop 0 either way.
+**`hop0_phyonly` (default `true`) suppresses hop 0's `w_time` to `0.0`** --
+exactly mirroring [`run_local_adam`](@ref)'s own `hop==0 && hop0_phyonly`
+rule (physics-only optimisation for the entire first hop, REGARDLESS of
+`anneal_direct_weights`'s own value -- a genuinely different `factor`
+default than the ordinary `anneal_direct_weights=false` one; see that
+function's docstring). No calibration `pulse_cost` evaluation spent on a
+suppressed hop 0. Pass **`hop0_phyonly=false`** to make hop 0 a normal
+scheduled hop instead -- it then anneals `w_time` (and calibrates
+`x_tune` from `u0`, one extra `pulse_cost` eval) exactly like hop 1, so
+duration is weighed from the very first hop.
 **Hop 1 is the first hop ORDINARY annealing (the `anneal_direct_weights`-
 gated kind) ever applies to**, and is therefore this function's own "seed"
 hop:
@@ -3894,7 +3912,7 @@ function optimise_composite_pulse(
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
     track::Symbol=:dual,
-    anneal_direct_weights::Bool=true,
+    anneal_direct_weights::Bool=true, hop0_phyonly::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
     S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
@@ -3921,7 +3939,7 @@ function optimise_composite_pulse(
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
          threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, track=track, n_gpus=pulse_gpu_count(),
-         anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
+         anneal_direct_weights=anneal_direct_weights, hop0_phyonly=hop0_phyonly, x_tune_alpha=x_tune_alpha,
          recalibrate_optima_x=recalibrate_optima_x,
          I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S),
         solve_settings,
@@ -3946,14 +3964,17 @@ function optimise_composite_pulse(
     initial_metrics = pulse_cost(u0, pulse, d; cost_kwargs..., compute=compute, solve_kwargs...)
     history = NamedTuple[]
 
-    # Hop 0 NEVER anneals (see run_local_adam's own hop==0 rule), so it has
-    # nothing to calibrate x_tune for -- no seed-calibration block needed
-    # here any more; x_tune_alpha/_precalibrated_x_tune are simply not
-    # forwarded to hop 0's own call.
+    # Hop 0: with the default hop0_phyonly=true it never anneals (see
+    # run_local_adam's own hop==0 rule), so nothing to calibrate x_tune for.
+    # With hop0_phyonly=false it IS a normal scheduled hop and calibrates
+    # x_tune from its own u_start -- so x_tune_alpha must be forwarded (it is
+    # inert under hop0_phyonly=true). `_precalibrated_x_tune` is still not
+    # forwarded: hop 0 is the first hop, there is nothing precalibrated yet.
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate, cf_lr_scale,
         label="$(label_prefix)[hop 0]", threaded_grad=threaded_grad, compute=compute,
         grad_mode=grad_mode, anneal_direct_weights=anneal_direct_weights,
+        hop0_phyonly=hop0_phyonly, x_tune_alpha=x_tune_alpha,
         solve_kwargs...
     )
     append!(history, hop0_history)

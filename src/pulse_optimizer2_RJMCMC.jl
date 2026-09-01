@@ -569,13 +569,19 @@ re-evaluates `best_u` under before returning. Pass
 `anneal_direct_weights=false` to disable annealing entirely and recover
 the original fixed-`w_time` cost.
 
-**`hop==0` always has `w_time` suppressed to `0.0`** -- exactly mirroring
-[`run_local_adam`](@ref)'s own unconditional `hop==0` rule (physics-only
-optimisation for the entire first hop, REGARDLESS of
-`anneal_direct_weights`'s own value -- confirmed deliberate, not an
-oversight; see that function's own docstring for why this is a genuinely
-different `factor` default than the ordinary `anneal_direct_weights=false`
-one). No calibration `pulse_cost` evaluation spent on hop 0 either way.
+**`hop==0` has `w_time` suppressed to `0.0` when `hop0_phyonly=true`
+(the default)** -- exactly mirroring [`run_local_adam`](@ref)'s own
+`hop==0 && hop0_phyonly` rule (physics-only optimisation for the entire
+first hop, REGARDLESS of `anneal_direct_weights`'s own value -- confirmed
+deliberate, not an oversight; see that function's own docstring for why
+this is a genuinely different `factor` default than the ordinary
+`anneal_direct_weights=false` one). No calibration `pulse_cost`
+evaluation spent on hop 0 either way. `hop0_phyonly=false` instead makes
+hop 0 a fully normal scheduled hop: it follows the standard `w_time`
+schedule (`dyn_w_time = base_w_time * factor`) and, under
+`anneal_direct_weights=true`, spends one calibration `pulse_cost` eval to
+solve `x_tune` from its own starting point, exactly like hop 1. Forwarded
+unchanged to hop 0's `run_local_adam` call.
 **Hop 1 is the first hop ORDINARY annealing (the `anneal_direct_weights`-
 gated kind) ever applies to** -- INCLUDING when hop 1 itself performs a
 `_grow_pulse`/`_shrink_pulse` k-change, since which hop number this is is
@@ -620,7 +626,7 @@ function optimise_composite_pulse_rjmcmc(
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     track::Symbol=:dual,
-    anneal_direct_weights::Bool=true,
+    anneal_direct_weights::Bool=true, hop0_phyonly::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
     S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
@@ -640,7 +646,7 @@ function optimise_composite_pulse_rjmcmc(
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
          track=track,
-         anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
+         anneal_direct_weights=anneal_direct_weights, hop0_phyonly=hop0_phyonly, x_tune_alpha=x_tune_alpha,
          recalibrate_optima_x=recalibrate_optima_x,
          I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S),
         solve_settings,
@@ -664,13 +670,16 @@ function optimise_composite_pulse_rjmcmc(
     initial_metrics = pulse_cost(u0, pulse, d; cost_kwargs..., solve_kwargs...)
     history = NamedTuple[]
 
-    # Hop 0 NEVER anneals (see run_local_adam's own hop==0 rule), so it has
-    # nothing to calibrate x_tune for -- no seed-calibration block needed
-    # here any more; x_tune_alpha/_precalibrated_x_tune are simply not
-    # forwarded to hop 0's own call.
+    # Hop 0: with the default hop0_phyonly=true it never anneals (see
+    # run_local_adam's own hop==0 rule). With hop0_phyonly=false it is a
+    # normal scheduled hop and calibrates x_tune from its own u_start, so
+    # x_tune_alpha must be forwarded (inert under hop0_phyonly=true).
+    # `_precalibrated_x_tune` is still not forwarded -- hop 0 has nothing
+    # precalibrated yet.
     current_u, current_cost, _, _, _, hop0_history = run_local_adam(
         u0, pulse, d, cost_kwargs; hop=0, num_epochs, patience, tol, learning_rate,
         label="$(label_prefix)[hop 0]", anneal_direct_weights=anneal_direct_weights,
+        hop0_phyonly=hop0_phyonly, x_tune_alpha=x_tune_alpha,
         solve_kwargs...
     )
     append!(history, hop0_history)

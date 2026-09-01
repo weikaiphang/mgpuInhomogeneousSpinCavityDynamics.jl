@@ -831,6 +831,69 @@ end
     # optimise_composite_pulse testset below.
 end
 
+@testset "run_local_adam hop0_phyonly=false makes hop 0 a normal scheduled hop" begin
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    u0 = seed_canonical(pulse, :hs1)
+    cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
+
+    # --- (a) hop0_phyonly=false + anneal_direct_weights=false -------------
+    # hop 0 stops being the w_time=0 sandbox: it takes the ordinary
+    # "annealing disabled -> factor=1.0" branch, so dyn_w_time == base_w_time
+    # (0.15) on EVERY epoch, exactly like any hop>=1 with annealing off.
+    phy_off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=0, hop0_phyonly=false, anneal_direct_weights=false,
+        num_epochs=3, patience=3, learning_rate=0.05, label="[h0-phyoff-adwoff]")
+    @test all(h.schedule_factor == 1.0 for h in phy_off[6])
+    @test all(h.x_tune == 0.0 for h in phy_off[6])
+    @test phy_off[6][1].cost ≈
+        pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.15)[1] atol=1e-12
+    # Bit-identical to running the SAME call at an explicit hop=1 (the only
+    # difference the flag removes is the hop==0 short-circuit; the recorded
+    # `.hop` index still differs).
+    ref_hop1_off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=1, anneal_direct_weights=false,
+        num_epochs=3, patience=3, learning_rate=0.05, label="[ref-hop1-adwoff]")
+    @test phy_off[1] == ref_hop1_off[1]           # best_u
+    @test phy_off[2] == ref_hop1_off[2]           # best_cost
+    @test [Base.structdiff(h, (hop=0,)) for h in phy_off[6]] ==
+          [Base.structdiff(h, (hop=0,)) for h in ref_hop1_off[6]]
+    @test all(h.hop == 0 for h in phy_off[6])
+
+    # --- (b) hop0_phyonly=false + anneal_direct_weights=true -------------
+    # hop 0 now performs the SAME mandatory calibration hop 1 does: one
+    # pulse_cost eval from its own u_start -> a nonzero calibrated x_tune,
+    # and schedule_factor follows _curriculum_fidelity_weight.
+    _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
+    F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
+    x_tune_expected = solve_optimal_x_start(F_0, _DEFAULT_X_TUNE_ALPHA)
+    factor1 = _curriculum_fidelity_weight(Float64(inv0), Float64(sil0), 1.0, x_tune_expected)
+
+    phy_on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=0, hop0_phyonly=false, anneal_direct_weights=true,
+        num_epochs=3, patience=3, learning_rate=0.05, label="[h0-phyoff-adwon]")
+    @test factor1 > 0.0
+    @test all(h.x_tune == x_tune_expected for h in phy_on[6])
+    @test all(h.x_tune != 0.0 for h in phy_on[6])
+    @test phy_on[6][1].schedule_factor == factor1
+    @test phy_on[6][1].cost ≈
+        pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.15*factor1)[1] atol=1e-12
+    # ...and again bit-identical (modulo `.hop`) to the same call at hop=1.
+    ref_hop1_on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=1, anneal_direct_weights=true,
+        num_epochs=3, patience=3, learning_rate=0.05, label="[ref-hop1-adwon]")
+    @test phy_on[1] == ref_hop1_on[1]
+    @test phy_on[2] == ref_hop1_on[2]
+    @test [Base.structdiff(h, (hop=0,)) for h in phy_on[6]] ==
+          [Base.structdiff(h, (hop=0,)) for h in ref_hop1_on[6]]
+
+    # --- default hop0_phyonly=true is unchanged (still the w_time=0 sandbox)
+    default_h0 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
+        hop=0, anneal_direct_weights=true,
+        num_epochs=3, patience=3, learning_rate=0.05, label="[h0-default]")
+    @test all(h.schedule_factor == 0.0 && h.x_tune == 0.0 for h in default_h0[6])
+    @test default_h0[6] != phy_on[6]
+end
+
 @testset "_fidelity_physics_cost / _fidelity_gradient_coefficients" begin
     # kappa_I=kappa_S=0 bit-identity over a grid including inv/sil edges
     # (0, near-0, 1) -- === not ≈, proving 0.5*0*x^2 == 0.0 exactly, not
@@ -1068,6 +1131,32 @@ end
     @test plain_cost_u0 != barriered_cost_u0  # sanity: penalty really changes u0's cost
 end
 
+@testset "optimise_composite_pulse: hop0_phyonly flag" begin
+    common = (n_hops=3, num_epochs=2, patience=2, tol=1e-3, learning_rate=0.05,
+              hop_step_size=0.5, seed=7, threaded_grad=false)
+
+    # Default is hop0_phyonly=true -- recorded in optimizer_settings, hop-0
+    # rows are the w_time=0 sandbox (schedule_factor/x_tune pinned at 0.0).
+    default_run = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., label_prefix="[ocp-h0phy-default] ")
+    @test default_run[8].hop0_phyonly === true
+    @test all(h.schedule_factor == 0.0 && h.x_tune == 0.0
+              for h in default_run[6] if h.hop == 0)
+
+    # hop0_phyonly=false -> hop 0 becomes a fully normal scheduled hop: it
+    # anneals under the default anneal_direct_weights=true (schedule_factor
+    # and x_tune move off 0.0 at hop 0), and the hop-0 history diverges from
+    # the sandboxed default.
+    phy_off = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
+        common..., hop0_phyonly=false, label_prefix="[ocp-h0phy-off] ")
+    @test phy_off[8].hop0_phyonly === false
+    @test any(h.x_tune != 0.0 for h in phy_off[6] if h.hop == 0)
+    @test any(h.schedule_factor != 0.0 for h in phy_off[6] if h.hop == 0)
+    default_hop0 = [h for h in default_run[6] if h.hop == 0]
+    phy_off_hop0 = [h for h in phy_off[6] if h.hop == 0]
+    @test default_hop0 != phy_off_hop0
+end
+
 @testset "optimise_composite_pulse_rjmcmc: hop 0 never anneals, hop 1 is the calibration seed" begin
     # n_hops=3 -- hop 0 (never anneals), hop 1 (mandatory fresh seed
     # calibration), hop 2 (recalibrate_optima_x branches) -- need all three
@@ -1132,6 +1221,7 @@ end
     # optimizer_settings carries every explicit keyword actually forwarded
     # -- no stray x_tune, and the ones that DO exist reflect what was passed.
     @test baseline[8].anneal_direct_weights == true
+    @test baseline[8].hop0_phyonly === true
     @test baseline[8].x_tune_alpha == _DEFAULT_X_TUNE_ALPHA
     @test baseline[8].recalibrate_optima_x == true
     @test baseline[8].I_min == _DEFAULT_PENALTY_MIN

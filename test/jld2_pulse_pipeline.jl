@@ -342,6 +342,13 @@ end
     @test pipe_on.use_interior === true
     @test pipe_on.use_signal === true
     @test_throws ErrorException _jld2_split_kwargs((; not_a_real_knob=1))
+
+    # hop0_phyonly is a canonical optimiser knob: present in the defaults,
+    # auto-allowlisted, and forwarded into the `opt` split.
+    @test haskey(jld2_optimizer_defaults(), :hop0_phyonly)
+    @test jld2_optimizer_defaults().hop0_phyonly === true
+    _, opt_h0, _ = _jld2_split_kwargs((; hop0_phyonly=false))
+    @test opt_h0.hop0_phyonly === false
 end
 
 @testset "try_parse ROSE vs 3ARP (not positional)" begin
