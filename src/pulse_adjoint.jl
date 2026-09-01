@@ -232,6 +232,55 @@ function _adjoint_one_track(
 end
 
 """
+    _adjoint_track_multi(u, pulse, d, initial_condition, pullbacks, reltol, abstol,
+                         tstops, signal_E_of_t, checkpoint_stride, use_checkpoints) -> (grads, a, Sp, Sz)
+
+Like [`_adjoint_one_track`](@ref) but records the forward trajectory ONCE
+and then runs one reverse sweep per `pullback!` in `pullbacks` (each with
+a fresh `λx`/`gθ`). `reverse_tsit5_on_states!` /
+`reverse_tsit5_on_checkpoints!` only READ `mesh`/`stack`, never mutate
+them, so replaying is sound. Used by [`pulse_cost_grad_adjoint`](@ref)'s
+`track=:weak` path so `∇inversion` and `∇silencing` both come from ONE
+`:weak` forward record (1 forward + `length(pullbacks)` reverse sweeps,
+vs the `:dual` path's 2 full forward+reverse tracks).
+"""
+function _adjoint_track_multi(
+    u::AbstractVector,
+    pulse::CompositePulse,
+    d,
+    initial_condition::Symbol,
+    pullbacks,
+    reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints::Bool,
+)
+    M = Int(d.M)
+    E_of_t = _control_plus_signal_E(pulse, u, signal_E_of_t)
+    p = _host_ode_p(d, E_of_t)
+    u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
+    mesh, stack, u_end = record_adaptive_tsit5_mesh(
+        u0, p, d.timespan;
+        reltol=reltol, abstol=abstol, tstops=tstops, checkpoint_stride=checkpoint_stride,
+        record_full_u=!use_checkpoints,
+    )
+    a, Sp, Sz = unpack_state_1st_order_u(u_end, M)
+    nR = real_state_length_1st_order(M)
+    uθ64 = collect(Float64, u)
+    grads = Vector{Vector{Float64}}(undef, length(pullbacks))
+    for (i, pb!) in enumerate(pullbacks)
+        λx = zeros(Float64, nR)
+        pb!(λx, a, Sp, Sz)
+        gθ = zeros(Float64, length(u))
+        ws = _tsit5_adj_workspace(M)
+        if use_checkpoints
+            reverse_tsit5_on_checkpoints!(gθ, λx, mesh, stack, p, pulse, uθ64, ws)
+        else
+            reverse_tsit5_on_states!(gθ, λx, mesh.u, mesh.t, mesh.dt, p, pulse, uθ64, ws)
+        end
+        grads[i] = gθ
+    end
+    return grads, a, collect(Sp), collect(Sz)
+end
+
+"""
     pulse_cost_on_frozen_mesh(u, pulse, d, mesh_ground, mesh_weak; ...) -> cost
 
 Test-facing primal: replay each track's frozen `dt` sequence with Φ
@@ -256,22 +305,29 @@ function pulse_cost_on_frozen_mesh(
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
     S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
     signal_E_of_t=_zero_drive,
+    track::Symbol=:dual,
 )
+    _assert_track(track)
     T = eltype(u)
     E_of_t = _control_plus_signal_E(pulse, u, signal_E_of_t)
     p = _host_ode_p(d, E_of_t)
     duration = pulse_duration(pulse, u)
 
-    mesh_ground === nothing && error("pulse_cost_on_frozen_mesh: ground mesh required.")
-    u0g = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :ground)
-    usg = replay_tsit5_window(u0g, p, mesh_ground.t[1], mesh_ground.dt)
-    _, _, Sz = unpack_state_1st_order_u(usg[end], Int(d.M))
-    inversion = _weighted_inversion(Sz, d.g_b, d.Nj, T)
-
     mesh_weak === nothing && error("pulse_cost_on_frozen_mesh: weak-excitation (:weak) mesh required.")
     u0e = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :weak)
     use = replay_tsit5_window(u0e, p, mesh_weak.t[1], mesh_weak.dt)
-    _, Sp, _ = unpack_state_1st_order_u(use[end], Int(d.M))
+    _, Sp, Sz_w = unpack_state_1st_order_u(use[end], Int(d.M))
+
+    if track === :dual
+        mesh_ground === nothing && error("pulse_cost_on_frozen_mesh: ground mesh required for track=:dual.")
+        u0g = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :ground)
+        usg = replay_tsit5_window(u0g, p, mesh_ground.t[1], mesh_ground.dt)
+        _, _, Sz = unpack_state_1st_order_u(usg[end], Int(d.M))
+        inversion = _weighted_inversion(Sz, d.g_b, d.Nj, T)
+    else
+        inversion = _weighted_inversion(Sz_w, d.g_b, d.Nj, T)
+    end
+
     silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, T)
     coherence = _weighted_coherence(Sp, d.g_b, d.Nj, d.delta_b, T)
     field_amp = _weighted_field_amplitude(Sp, d.g_b, d.Nj, T)
@@ -310,8 +366,10 @@ list for that one window anyway -- no memory saving over
 it cannot happen under the defaults, only if `checkpoint_stride` is
 explicitly reset to `typemax(Int)` while `use_checkpoints=true`.
 
-Both tracks are always run (see [`inversion_pullback!`](@ref)/
-[`silencing_pullback!`](@ref)'s docstrings): each adjoint sweep seeds
+`track=:dual` (default) runs both ICs; `track=:weak` records ONE `:weak`
+forward trajectory and reverse-sweeps it twice (`∇inversion` from that
+solve's own `Sz`, O(ε) bias -- see [`_assert_track`](@ref)) via
+[`_adjoint_track_multi`](@ref). Either way, each adjoint sweep seeds
 `λx` with the RAW `∂inversion/∂x`/`∂silencing/∂x` pullback (coefficient
 `+1`, no `target_F`/weight baked in), producing `grad_I = ∇inversion(u)`
 and `grad_F = ∇silencing(u)` -- the same two Jacobians
@@ -338,9 +396,11 @@ function pulse_cost_grad_adjoint(
     compute::Symbol=:cpu,
     checkpoint_stride::Integer=300,
     use_checkpoints::Bool=true,
+    track::Symbol=:dual,
     kwargs...,
 )
     _forbid_initial_condition(kwargs)
+    _assert_track(track)
     _assert_tsit5_alg(kwargs)
     sk = _solver_kwargs(kwargs)
     n = length(u)
@@ -376,25 +436,30 @@ function pulse_cost_grad_adjoint(
     compute_eff === :gpu && @warn "pulse_cost_grad_adjoint v1 reverses on CPU; ignoring compute=:gpu"
 
     local inversion, silencing, coherence, field_amp, weak_seed_retention, grad_I, grad_F
+    pb_inv!(λx, a, Sp, Sz) = (inversion_pullback!(λx, Sz, d.g_b, d.Nj); λx)
+    pb_sil!(λx, a, Sp, Sz) = (silencing_pullback!(λx, Sp, d.g_b, d.Nj, d.delta_b); λx)
     try
-        function pb_inv!(λx, a, Sp, Sz)
-            inversion_pullback!(λx, Sz, d.g_b, d.Nj)
-            return λx
+        if track === :weak
+            # SINGLE-TRACK: one :weak forward record, two reverse sweeps
+            # (∇inversion from its own Sz, ∇silencing from Sp). O(ε) bias on
+            # `inversion` -- see `_assert_track`.
+            gs, _, Sp, Sz = _adjoint_track_multi(
+                uθ, pulse, d, :weak, (pb_inv!, pb_sil!),
+                reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+            )
+            grad_I, grad_F = gs[1], gs[2]
+            inversion = Float64(_weighted_inversion(Sz, d.g_b, d.Nj, Float64))
+        else
+            grad_I, _, _, Sz, _, _ = _adjoint_one_track(
+                uθ, pulse, d, :ground, pb_inv!,
+                reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+            )
+            inversion = Float64(_weighted_inversion(Sz, d.g_b, d.Nj, Float64))
+            grad_F, _, Sp, _, _, _ = _adjoint_one_track(
+                uθ, pulse, d, :weak, pb_sil!,
+                reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+            )
         end
-        grad_I, _, _, Sz, _, _ = _adjoint_one_track(
-            uθ, pulse, d, :ground, pb_inv!,
-            reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
-        )
-        inversion = Float64(_weighted_inversion(Sz, d.g_b, d.Nj, Float64))
-
-        function pb_sil!(λx, a, Sp, Sz)
-            silencing_pullback!(λx, Sp, d.g_b, d.Nj, d.delta_b)
-            return λx
-        end
-        grad_F, _, Sp, _, _, _ = _adjoint_one_track(
-            uθ, pulse, d, :weak, pb_sil!,
-            reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
-        )
         silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, Float64))
         coherence = Float64(_weighted_coherence(Sp, d.g_b, d.Nj, d.delta_b, Float64))
         field_amp = Float64(_weighted_field_amplitude(Sp, d.g_b, d.Nj, Float64))

@@ -360,6 +360,51 @@ const FAKE_D_ODE = merge(FAKE_D, (
     @test_throws ErrorException pulse_metrics(u0, pulse, FAKE_D_ODE; initial_condition=:ground)
 end
 
+@testset "single-track (track=:weak): one :weak solve, inversion from it" begin
+    pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
+    u0 = seed_canonical(pulse, :hs1)
+
+    @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; track=:bogus)
+    @test_throws ErrorException pulse_metrics(u0, pulse, FAKE_D_ODE; track=:ground)
+
+    inv_d, sil_d, coh_d, famp_d, ret_d = pulse_metrics(u0, pulse, FAKE_D_ODE; track=:dual)
+    inv_w, sil_w, coh_w, famp_w, ret_w = pulse_metrics(u0, pulse, FAKE_D_ODE; track=:weak)
+    # silencing/coherence/field_amp/retention come from the SAME :weak solve either way
+    @test sil_w == sil_d
+    @test coh_w == coh_d && famp_w == famp_d && ret_w == ret_d
+    # inversion:weak differs from inversion:ground only at O(ε) (ε = _WEAK_SEED = 1e-3)
+    @test abs(inv_w - inv_d) < 5e-3
+    @test 0 <= inv_w <= 1
+
+    cost_w, i2, s2, dur2, c2, f2, r2 = pulse_cost(u0, pulse, FAKE_D_ODE; track=:weak)
+    @test isfinite(cost_w)
+    @test i2 == inv_w && s2 == sil_w && c2 == coh_w && f2 == famp_w && r2 == ret_w
+
+    # single-track threaded gradient == serial ForwardDiff of pulse_cost(track=:weak)
+    g_serial = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; track=:weak)[1], u0)
+    g_thr, cost_thr, inv_thr, sil_thr = _pulse_cost_grad_threaded(u0, pulse, FAKE_D_ODE; track=:weak)
+    @test cost_thr == cost_w
+    @test inv_thr == inv_w && sil_thr == sil_w
+    @test maximum(abs.(g_thr .- g_serial) ./ max.(abs.(g_thr), abs.(g_serial), 1e-6)) < 1e-9
+
+    # FD check on the single-track cost
+    eps = 1e-6
+    fd = similar(g_serial)
+    for i in eachindex(u0)
+        up = copy(u0); up[i] += eps
+        fd[i] = (pulse_cost(up, pulse, FAKE_D_ODE; track=:weak)[1] - cost_w) / eps
+    end
+    @test maximum(abs.(g_serial .- fd) ./ max.(abs.(g_serial), abs.(fd), 1e-6)) < 1e-3
+
+    # optimiser + k-hopping smoke, and track is recorded
+    r = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE; track=:weak,
+        num_epochs=2, n_hops=1, patience=2, hop_patience=1, tol=1e-3, seed=1,
+        label_prefix="[oc-weak] ")
+    @test r[8].track === :weak
+    @test isfinite(r[2])
+    @test all(haskey(h, :weak_seed_retention) for h in r[6])
+end
+
 @testset "threaded gradient matches serial" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     cost_kwargs = (w_tmax=1.0, w_power=0.05, target_F=1.0, w_time=0.15)

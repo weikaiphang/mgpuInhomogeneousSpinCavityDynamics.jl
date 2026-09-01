@@ -497,13 +497,13 @@ budgets, not a converged global optimum.
 
 `degree` / `taper_frac` are forwarded to [`CompositePulse`](@ref) (defaults
 3 and 0.1, same as constructing the pulse by hand). `w_tmax`, `w_power`,
-`target_F`, and `w_time` are forwarded to [`pulse_cost`](@ref); both
-dual-trajectory tracks are always solved (`pulse_cost`'s multiplicative
-`fidelity_phys` has no `w_inv`/`w_sil` weight any more), targeting
+`target_F`, and `w_time` are forwarded to [`pulse_cost`](@ref), targeting
 `target_F=1.0` (RASE-style revival; pass `target_F=0.0` for ROSE-style
-silencing instead). These are explicit keywords so they are NOT passed
-through to the ODE solver. Do not pass `initial_condition` — the cost
-fixes `:ground` and `:weak` itself.
+silencing instead). `track` (`:dual` default / `:weak`, see
+[`_assert_track`](@ref)) chooses one or two ODE solves per cost
+evaluation and rides through every `run_local_adam` hop (any k). These
+are explicit keywords so they are NOT passed through to the ODE solver.
+Do not pass `initial_condition` — the cost fixes its own ICs.
 
 Besides the optimised `(best_u, best_cost, pulse)` -- `pulse` here is the
 `CompositePulse` matching `best_u`'s OWN `k`, which (unlike the fixed-k
@@ -616,6 +616,7 @@ function optimise_composite_pulse_rjmcmc(
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
+    track::Symbol=:dual,
     anneal_direct_weights::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
@@ -623,9 +624,10 @@ function optimise_composite_pulse_rjmcmc(
     solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
+    _assert_track(track)
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
     cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time,
-                   I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S)
+                   I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S, track=track)
     rng = Random.Xoshiro(seed)
 
     solve_settings = NamedTuple(kv for kv in pairs(solve_kwargs) if !(kv[2] isa Function))
@@ -634,6 +636,7 @@ function optimise_composite_pulse_rjmcmc(
          num_epochs=num_epochs, learning_rate=learning_rate, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
+         track=track,
          anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
          recalibrate_optima_x=recalibrate_optima_x,
          I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S),

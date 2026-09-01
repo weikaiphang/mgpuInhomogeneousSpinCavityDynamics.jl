@@ -592,11 +592,33 @@ end
 
 function _forbid_initial_condition(kwargs)
     :initial_condition in keys(kwargs) && error(
-        "dual-trajectory cost fixes initial conditions to :ground (inversion) and " *
-        ":weak (silencing). Do not pass initial_condition into pulse_cost / " *
-        "pulse_metrics / optimise_composite_pulse."
+        "the cost fixes its own initial conditions (:ground and/or :weak, see `track`). " *
+        "Do not pass initial_condition into pulse_cost / pulse_metrics / optimise_composite_pulse."
     )
     return nothing
+end
+
+"""
+    _assert_track(track::Symbol) -> Symbol
+
+`track` selects how `inversion` and `silencing` are obtained:
+
+  * `:dual` (default) -- two ODE solves per cost evaluation: `:ground`
+    (`Sp=0`) gives `inversion`, the weak-excitation `:weak` seed
+    (`Sp=ε·Nj/2`) gives `silencing`/`coherence`/`field_amp`/
+    `weak_seed_retention`.
+  * `:weak` -- ONE `:weak` solve; `inversion` is read from THAT solve's
+    own `Sz` too. Halves the ODE cost. Justified because the `:weak`
+    seed perturbs `Sz` only at O(ε) (ε = `_WEAK_SEED` = 1e-3), so
+    `inversion` on `:weak` ≈ `inversion` on `:ground` to ~1e-3. Use when
+    that bias is acceptable relative to the fidelity target.
+"""
+function _assert_track(track::Symbol)
+    track === :dual || track === :weak || error(
+        "track must be :dual (separate :ground + :weak solves) or :weak " *
+        "(a single :weak solve, inversion read from it too), got $(repr(track))."
+    )
+    return track
 end
 
 function _solver_kwargs(kwargs)
@@ -898,16 +920,24 @@ coordinates of one Bloch vector:
   `|F|_⋆`/`coherence` normalisation stretched -- interpret with care.
   DIAGNOSTIC ONLY.
 
-Do not pass `initial_condition` — both ICs are fixed here. Solver kwargs
-(`signal_E_of_t`, `reltol`, ...) are forwarded to both solves.
+Do not pass `initial_condition` — the ICs are fixed here. `track`
+(`:dual` default / `:weak`, see [`_assert_track`](@ref)) chooses one or
+two solves. Solver kwargs (`signal_E_of_t`, `reltol`, ...) are forwarded.
 """
-function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d; compute::Symbol=:auto, kwargs...)
+function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d;
+                        compute::Symbol=:auto, track::Symbol=:dual, kwargs...)
     _forbid_initial_condition(kwargs)
+    _assert_track(track)
     T = eltype(u)
     sk = _solver_kwargs(kwargs)
-    _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
-    inversion = _weighted_inversion(Sz, d.g_b, Nj, T)
-    _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
+    if track === :dual
+        _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
+        inversion = _weighted_inversion(Sz, d.g_b, Nj, T)
+        _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
+    else
+        _, Sp, Sz_w, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
+        inversion = _weighted_inversion(Sz_w, d.g_b, Nj_eq, T)
+    end
     silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, T)
     coherence = _weighted_coherence(Sp, d.g_b, Nj_eq, d.delta_b, T)
     field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
@@ -1100,12 +1130,15 @@ end
     pulse_cost(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
         -> (cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention)
 
-Scalar cost to be minimised. Inversion and silencing are scored on
-**two independent ODE solves** of the same pulse `u` (see
-[`pulse_metrics`](@ref)): `:ground` → bright-mode (`Nj g²`) weighted
+Scalar cost to be minimised. With `track=:dual` (default) inversion and
+silencing come from **two independent ODE solves** of the same pulse `u`
+(see [`pulse_metrics`](@ref)): `:ground` → bright-mode (`Nj g²`) weighted
 inversion `I` (paper App. H), the `:weak` track (`Sp = ε·Nj/2`)
 → paper per-frequency-slice silencing factor `|F|_⋆ = ⟨|F(ω)|⟩` (Eq. 5 /
-A.132). `target_F` picks which cavity-QED protocol this pulse is being
+A.132). With `track=:weak` there is ONE `:weak` solve and `inversion` is
+read from its own `Sz` (halves the ODE cost; O(ε)≈1e-3 bias vs `:ground`
+inversion -- see [`_assert_track`](@ref)). `target_F` picks which
+cavity-QED protocol this pulse is being
 optimised for: `target_F=1.0` (default) rewards preserving collective
 coherence -- a pure `ω²/κ` chirp, `|F|→1` (RASE-style revival / ACE);
 `target_F=0.0` rewards `g`-space cancellation, `|F|→0` (ROSE-style echo
@@ -1167,8 +1200,9 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
                      target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                      I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
                      S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
-                     compute::Symbol=:auto, kwargs...)
+                     compute::Symbol=:auto, track::Symbol=:dual, kwargs...)
     _forbid_initial_condition(kwargs)
+    _assert_track(track)
     T = eltype(u)
     sk = _solver_kwargs(kwargs)
     duration = pulse_duration(pulse, u)
@@ -1189,11 +1223,16 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
     weak_seed_retention = zero(T)
 
     try
-        # Both tracks must be simulated to compute the multiplicative physical fidelity
-        _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
-        inversion = _weighted_inversion(Sz, d.g_b, Nj, T)
-
-        _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
+        if track === :dual
+            # Two solves: :ground -> inversion, :weak -> the rest.
+            _, _, Sz, Nj = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:ground)
+            inversion = _weighted_inversion(Sz, d.g_b, Nj, T)
+            _, Sp, _, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
+        else
+            # One :weak solve; inversion read from its own Sz (O(ε) bias, see _assert_track).
+            _, Sp, Sz_w, Nj_eq = run_sim_1st_order_pure(u, pulse, d; compute=compute, sk..., initial_condition=:weak)
+            inversion = _weighted_inversion(Sz_w, d.g_b, Nj_eq, T)
+        end
         silencing = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, T)
         coherence = _weighted_coherence(Sp, d.g_b, Nj_eq, d.delta_b, T)
         field_amp = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, T)
@@ -2932,18 +2971,23 @@ gradient. Host-only runs keep the original 2-way `Threads.@threads`
 schedule and are the path `test/runtests.jl` checks against serial
 ForwardDiff.
 
-Both tracks are always solved -- there is no `w_inv`/`w_sil` skip any
-more (the multiplicative cost has no well-defined single-track reduction:
-dropping either track collapses `fidelity_phys` to 0 regardless of the
-other). A `PulseSolveFailed` on EITHER track reproduces `pulse_cost`'s
-failure contract: `(fill(NaN, n), Inf, NaN, NaN, duration, NaN)`.
+`track=:dual` (default) solves both ICs as above. `track=:weak` solves
+ONLY `:weak` and takes `grad_I`/`grad_F` as the two rows of a single
+`ForwardDiff.jacobian` of `[inversion, silencing]` (`inversion` read from
+that solve's own `Sz`, O(ε) bias -- see [`_assert_track`](@ref)); the
+analytic chain rule below is unchanged, only the solve count drops to 1.
+Neither track can be dropped from the OBJECTIVE (the multiplicative
+`fidelity_phys` collapses to 0 without both), only the second SOLVE.
+A `PulseSolveFailed` reproduces `pulse_cost`'s failure contract:
+`(fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN, NaN)`.
 """
 function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                                     target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                                     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
                                     S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
-                                    compute::Symbol=:auto, kwargs...)
+                                    compute::Symbol=:auto, track::Symbol=:dual, kwargs...)
     _forbid_initial_condition(kwargs)
+    _assert_track(track)
     sk = _solver_kwargs(kwargs)
     n = length(u)
     length(u) == n_params(pulse) || error(
@@ -2980,7 +3024,42 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
     aux_ground = Ref{Float64}(0.0)
     aux_weak = Ref{NTuple{4,Float64}}((0.0, 0.0, 0.0, 0.0))  # (silencing, coherence, field_amp, weak_seed_retention)
 
-    if !use_gpu_pool
+    if track === :weak
+        # SINGLE-TRACK: one :weak solve. `inversion` is read from its own
+        # `Sz`; `grad_I` and `grad_F` are BOTH rows of one Jacobian of
+        # `[inversion, silencing]` w.r.t. `u`, so the analytic physics_cost
+        # chain rule below is byte-for-byte the same as the :dual path --
+        # only the number of ODE solves changes (1, not 2). No GPU-pool
+        # param-chunk splitting here (nothing to split across ICs); a
+        # compute=:gpu request still runs the single solve on-device.
+        function weak_pair(uu)
+            _, Sp, Sz_w, Nj_eq = run_sim_1st_order_pure(
+                uu, pulse, d; compute=compute, sk..., initial_condition=:weak,
+            )
+            Tu = eltype(uu)
+            inv_ = _weighted_inversion(Sz_w, d.g_b, Nj_eq, Tu)
+            sil_ = _weighted_silencing_factor(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
+            coh_ = _weighted_coherence(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
+            famp_ = _weighted_field_amplitude(Sp, d.g_b, Nj_eq, Tu)
+            ret_ = _weak_seed_retention(Sp, d.g_b, Nj_eq, d.delta_b, Tu)
+            aux_ground[] = Float64(ForwardDiff.value(inv_))
+            aux_weak[] = (Float64(ForwardDiff.value(sil_)), Float64(ForwardDiff.value(coh_)),
+                          Float64(ForwardDiff.value(famp_)), Float64(ForwardDiff.value(ret_)))
+            return [inv_, sil_]
+        end
+        local J
+        try
+            J = ForwardDiff.jacobian(weak_pair, u, ForwardDiff.JacobianConfig(weak_pair, u, chunk))
+        catch e
+            e isa PulseSolveFailed || rethrow()
+            return fill(NaN, n), Inf, NaN, NaN, duration, NaN, NaN, NaN
+        end
+        inversion = aux_ground[]
+        silencing, coherence, field_amp, weak_seed_retention = aux_weak[]
+        grad_I = J[1, :]
+        grad_F = J[2, :]
+
+    elseif !use_gpu_pool
         grads = Vector{Vector{Float64}}(undef, 2)
         failed = fill(false, 2)
         Threads.@threads for i in 1:2
@@ -3794,6 +3873,7 @@ function optimise_composite_pulse(
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
+    track::Symbol=:dual,
     anneal_direct_weights::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
@@ -3801,12 +3881,13 @@ function optimise_composite_pulse(
     solve_kwargs...,
 )
     _forbid_initial_condition(solve_kwargs)
+    _assert_track(track)
     (grad_mode === :forwarddiff || grad_mode === :adjoint) || error(
         "grad_mode must be :forwarddiff or :adjoint, got $(repr(grad_mode))."
     )
     pulse = CompositePulse(k, n_coeff_A, n_coeff_f, d; degree=degree, taper_frac=taper_frac)
     cost_kwargs = (w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time,
-                   I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S)
+                   I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S, track=track)
     rng = Random.Xoshiro(seed)
 
     # threaded_grad/compute are deliberately kept OUT of solve_kwargs
@@ -3819,7 +3900,7 @@ function optimise_composite_pulse(
          num_epochs=num_epochs, learning_rate=learning_rate, cf_lr_scale=cf_lr_scale, patience=patience, tol=tol,
          n_hops=n_hops, hop_patience=hop_patience, hop_step_size=hop_step_size, temperature=temperature,
          w_tmax=w_tmax, w_power=w_power, target_F=target_F, w_time=w_time, seed=seed,
-         threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, n_gpus=pulse_gpu_count(),
+         threaded_grad=threaded_grad, compute=compute, grad_mode=grad_mode, track=track, n_gpus=pulse_gpu_count(),
          anneal_direct_weights=anneal_direct_weights, x_tune_alpha=x_tune_alpha,
          recalibrate_optima_x=recalibrate_optima_x,
          I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S),

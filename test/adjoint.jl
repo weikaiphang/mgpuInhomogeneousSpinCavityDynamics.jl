@@ -343,7 +343,10 @@ end
                (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, I_min=0.99, kappa_I=5.0, kappa_S=0.0),
                (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, S_min=0.99, kappa_S=5.0, kappa_I=0.0),
                (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, I_min=0.9, kappa_I=3.0, S_min=0.9, kappa_S=8.0),
-               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, I_min=0.9, kappa_I=6.0, S_min=0.9, kappa_S=2.0))
+               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, I_min=0.9, kappa_I=6.0, S_min=0.9, kappa_S=2.0),
+               # single-track: adjoint (1 fwd + 2 rev on :weak) vs threaded (one Jacobian on :weak)
+               (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, track=:weak),
+               (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, track=:weak, I_min=0.9, kappa_I=6.0, S_min=0.9, kappa_S=2.0))
         g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a, famp_a, ret_a = pulse_cost_grad_adjoint(θ, pulse, FAKE_D_ODE; kw...)
         g_thr, cost_thr, inv_t, sil_t, dur_t, coh_t, famp_t, ret_t = _pulse_cost_grad_threaded(θ, pulse, FAKE_D_ODE; kw...)
         @test cost_adj == cost_thr
