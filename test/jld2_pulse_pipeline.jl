@@ -313,8 +313,8 @@ end
 
 @testset "pipeline invocation signatures" begin
     @test jld2_pipeline_defaults().n_signal === nothing
-    @test jld2_pipeline_defaults().use_signal === true
-    @test jld2_pipeline_defaults().use_interior === true
+    @test jld2_pipeline_defaults().use_signal === false
+    @test jld2_pipeline_defaults().use_interior === false
     @test hasmethod(try_parse_pulse_config, Tuple{NamedTuple})
     @test hasmethod(load_jld2_reference, Tuple{String})
     @test hasmethod(run_reference_forward, Tuple{Any})
@@ -334,11 +334,13 @@ end
     @test length(mlog) >= 1
     pipe, opt, verbose = _jld2_split_kwargs((;))
     @test pipe.n_signal === nothing
-    @test pipe.use_interior === true
+    @test pipe.use_interior === false
+    @test pipe.use_signal === false
     @test verbose === true
     @test haskey(opt, :num_epochs)
-    pipe_off, _, _ = _jld2_split_kwargs((; use_interior=false))
-    @test pipe_off.use_interior === false
+    pipe_on, _, _ = _jld2_split_kwargs((; use_interior=true, use_signal=true))
+    @test pipe_on.use_interior === true
+    @test pipe_on.use_signal === true
     @test_throws ErrorException _jld2_split_kwargs((; not_a_real_knob=1))
 end
 
@@ -477,11 +479,11 @@ end
         ref = load_jld2_reference(path; verbose=false, fit_N=1001)
         @test ref.parse_ok
         @test ref.pulse_source === :pulse_config
-        @test ref.use_interior === true
+        @test ref.use_interior === false
         @test ref.n_signal == 1
         @test ref.n_signal_check === nothing
         @test ref.identification !== nothing
-        @test ref.use_signal === true
+        @test ref.use_signal === false
         @test length(ref.signal_cfg) == 1
         @test length(ref.control_cfg) == 2
         @test ref.signal_cfg[1].kind === :gaussian
@@ -491,17 +493,18 @@ end
         i_w1 = argmin(abs.(ref.control_t .- 80e-6))
         @test hypot(ref.control_Ex[i_sig], ref.control_Ep[i_sig]) <
               1e-3 * hypot(ref.control_Ex[i_w1], ref.control_Ep[i_w1])
-        @test e2e_iq_at(ref.signal_E_of_t, 15e-6) > 0
-        @test e2e_iq_at(ref.signal_E_of_t, 80e-6) < 1e-3 * e2e_iq_at(ref.signal_E_of_t, 15e-6)
+        @test ref.signal_E_of_t(15e-6) == 0
+        @test e2e_iq_at(ref.signal_E_always, 15e-6) > 0
+        @test e2e_iq_at(ref.signal_E_always, 80e-6) < 1e-3 * e2e_iq_at(ref.signal_E_always, 15e-6)
         ident = segment_signal_control(E2E_ROSE_COMPACT_PC; d=ref.d)
         @test e2e_iq_at(ref.recorded_E_of_t, 15e-6) ≈ e2e_iq_at(signal_envelope_E_of_t(ident), 15e-6) rtol=1e-8
         @test e2e_iq_at(ref.recorded_E_of_t, 80e-6) ≈ e2e_iq_at(control_envelope_E_of_t(ident), 80e-6) rtol=1e-8
 
-        ref_off = load_jld2_reference(path; use_signal=false, verbose=false, fit_N=501)
-        @test ref_off.signal_E_of_t(15e-6) == 0
-        @test e2e_iq_at(ref_off.signal_E_always, 15e-6) > 0
-        ref_no_int = load_jld2_reference(path; use_interior=false, verbose=false, fit_N=501)
-        @test ref_no_int.use_interior === false
+        ref_on = load_jld2_reference(path; use_signal=true, verbose=false, fit_N=501)
+        @test e2e_iq_at(ref_on.signal_E_of_t, 15e-6) > 0
+        @test e2e_iq_at(ref_on.signal_E_always, 15e-6) > 0
+        ref_yes_int = load_jld2_reference(path; use_interior=true, verbose=false, fit_N=501)
+        @test ref_yes_int.use_interior === true
 
         forward = run_reference_forward(ref; compute=:cpu, verbose=false)
         @test 0 <= forward.metrics.inversion <= 1
@@ -538,8 +541,7 @@ end
         @test length(best_u) == n_params(pulse_opt)
         @test pulse_opt.k == 2
         @test isfinite(best_cost)
-        @test e2e_iq_at(signal_E, 15e-6) > 0
-        @test e2e_iq_at(signal_E, 80e-6) < 1e-3 * e2e_iq_at(signal_E, 15e-6)
+        @test signal_E(15e-6) == 0
         @test d_opt.M == 4
         @test data.PULSE_CONFIG[1].kind === :gaussian
         @test seed_rep !== nothing
@@ -550,7 +552,7 @@ end
         @test isfile(logp) && isfile(pmat) && isfile(ppara)
         log = JLD2.load(logp, "data")
         @test log.n_signal == 1
-        @test log.use_signal === true
+        @test log.use_signal === false
         @test log.optimizer_settings.use_interior === false
         @test length(log.final_u) == length(best_u)
         # Saved pulsemat is CONTROL only (no Gaussian lobe).
@@ -620,8 +622,8 @@ end
               1e-3 * hypot(ref.control_Ex[i_w1], ref.control_Ep[i_w1])
         @test hypot(ref.control_Ex[i_w1], ref.control_Ep[i_w1]) > 0
         @test e2e_iq_at(ref.recorded_E_of_t, 15e-6) > 0  # mixed recorded drive still has signal
-        @test e2e_iq_at(ref.signal_E_of_t, 15e-6) > 0  # CSV-identified signal is a fixed background
-        @test e2e_iq_at(ref.signal_E_of_t, 80e-6) < 1e-3 * e2e_iq_at(ref.signal_E_of_t, 15e-6)
+        @test ref.signal_E_of_t(15e-6) == 0  # default use_signal=false zeros the opt background
+        @test e2e_iq_at(ref.signal_E_always, 15e-6) > 0
         pulse, u_fit, _, segs = fit_linear_seed(ref; param_budget=40, verbose=false)
         @test pulse.k >= 1
         @test length(u_fit) == n_params(pulse)

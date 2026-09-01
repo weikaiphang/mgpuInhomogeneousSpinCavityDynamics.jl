@@ -16,7 +16,7 @@
 #      PULSE_CONFIG is present but identification rejects the sequence, error
 #      (do not fit a mixed drive into u).
 #   5. Forward-simulate the recorded drive (:ground and the weak-excitation
-#      :equator seed, Sp = eps*Nj/2). Those metrics are the reference
+#      :weak seed, Sp = eps*Nj/2). Those metrics are the reference
 #      metrics: bright-mode (Nj g^2) weighted inversion I (paper App. H)
 #      and the per-frequency-slice silencing factor |F|_* = <|F(omega)|>
 #      (paper Eq. 5 / A.132).
@@ -894,8 +894,8 @@ this NamedTuple; it does not hardcode a second copy).
 function jld2_pipeline_defaults()
     return (
         n_signal=nothing,
-        use_signal=true,
-        use_interior=true,
+        use_signal=false,
+        use_interior=false,
         rtol_check=1e-3,
         atol_check=nothing,
         check_reltol=nothing,
@@ -1191,7 +1191,7 @@ function _print_reference_audit(ref)
 end
 
 """
-    load_jld2_reference(path; n_signal=nothing, use_signal=true, use_interior=true,
+    load_jld2_reference(path; n_signal=nothing, use_signal=false, use_interior=false,
                         fit_N=nothing, verbose=true)
         -> NamedTuple
 
@@ -1357,8 +1357,9 @@ end
         -> NamedTuple
 
 Step 5: final-state forward simulation of `ref.recorded_E_of_t` on
-`:ground` and `:equator`. Returns `ground` outputs (`a`, `Σp`, `Σz`),
-`equator` `Sp`, and `metrics = (inversion, silencing, coherence, duration)`.
+`:ground` and the weak-excitation `:weak` seed. Returns `ground` outputs
+(`a`, `Σp`, `Σz`), the `weak` track's `Sp`, and
+`metrics = (inversion, silencing, coherence, duration)`.
 Those metrics are the reference metrics for later optimisation comparison.
 `reltol`/`abstol` default to `ref.SIM_SETTING`.
 """
@@ -1380,7 +1381,7 @@ function run_reference_forward(
     )
     _, Sp_eq, _ = run_sim_1st_order_final(
         ref.recorded_E_of_t, d;
-        initial_condition=:equator, reltol=reltol_s, abstol=abstol_s, compute=compute,
+        initial_condition=:weak, reltol=reltol_s, abstol=abstol_s, compute=compute,
     )
 
     Sigma_p = sum(Sp)
@@ -1396,7 +1397,7 @@ function run_reference_forward(
     )
     forward = (
         ground=(a=a, Sigma_p=Sigma_p, Sigma_z=Sigma_z, Sp=Sp, Sz=Sz),
-        equator=(Sp=Sp_eq,),
+        weak=(Sp=Sp_eq,),
         metrics=metrics,
         reltol=reltol_s,
         abstol=abstol_s,
@@ -1406,7 +1407,7 @@ function run_reference_forward(
         println("Reference forward simulation ($(ref.jld2_path), final state):")
         println("  :ground   inversion=$(round(inversion, sigdigits=6))  a=$(a)  Σz=$(Sigma_z)")
         println(
-            "  :equator  silencing=$(round(silencing, sigdigits=6))  " *
+            "  :weak     silencing=$(round(silencing, sigdigits=6))  " *
             "coherence=$(round(coherence, sigdigits=6))  duration=$(round(duration, sigdigits=6))s"
         )
     end
@@ -1893,11 +1894,11 @@ convention [`load_jld2_run`](@ref) already reads):
     [`_weighted_silencing_factor`](@ref)) plus the time/power penalties;
     `coherence` rides along in the same tuple but, like `duration`, is
     NOT part of `cost` -- it is the OLDER per-bin `Nj`-weighted mean of
-    `|Sp|/(Nj/2)` (see [`_weighted_coherence`](@ref)), DIAGNOSTIC ONLY,
+    `|Sp|/(ε·Nj/2)` (see [`_weighted_coherence`](@ref)), DIAGNOSTIC ONLY,
     recorded purely for comparison against the collective `|F|` actually
     being optimised)
   - `initial_coherence` -- same `coherence` value as `initial_metrics`
-    above, evaluated once at `u0` from an `:equator` solve, kept as its
+    above, evaluated once at `u0` from a `:weak` solve, kept as its
     own top-level key purely for convenience so a saved run can be
     compared against that simpler metric without digging into the
     `initial_metrics` tuple
@@ -1907,7 +1908,7 @@ convention [`load_jld2_run`](@ref) already reads):
     [`run_local_adam`](@ref)): `hop, epoch, k, cost, inversion, silencing,
     duration, coherence, improved`. `coherence` here is the SAME
     diagnostic-only per-bin metric as `initial_coherence`/`final_coherence`
-    below, recorded for every epoch (reusing the `:equator` solve already
+    below, recorded for every epoch (reusing the `:weak` solve already
     run for `silencing`, so it costs nothing extra) -- never fed into
     `cost`, which the optimiser actually descends on. History rows do NOT
     carry the raw pulse parameter vector `u` for that epoch -- only the
@@ -1938,10 +1939,10 @@ function save_optimisation_run_log(
     # the silencing factor |F|, not this per-bin coherence average).
     # Logged purely so a saved run can be compared against the old
     # coherence-based metric without re-running anything: two extra
-    # :equator solves at u0/best_u, done once here, not every epoch.
-    _, Sp0_eq, _, Nj0_eq = run_sim_1st_order_pure(u0, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:equator)
+    # :weak solves at u0/best_u, done once here, not every epoch.
+    _, Sp0_eq, _, Nj0_eq = run_sim_1st_order_pure(u0, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:weak)
     initial_coherence = _weighted_coherence(Sp0_eq, Nj0_eq, Float64)
-    _, Sp1_eq, _, Nj1_eq = run_sim_1st_order_pure(best_u, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:equator)
+    _, Sp1_eq, _, Nj1_eq = run_sim_1st_order_pure(best_u, pulse, d; signal_E_of_t=signal_E_of_t, initial_condition=:weak)
     final_coherence = _weighted_coherence(Sp1_eq, Nj1_eq, Float64)
 
     full_settings = merge((n_signal=n_signal, USE_SIGNAL=use_signal), optimizer_settings)
@@ -1987,7 +1988,7 @@ Linear pipeline:
   1–4. [`load_jld2_reference`](@ref) — open the `.jld2`, extract/parse
        `SIM_SETTING`/`SYSTEM_CONFIG`/`PULSE_CONFIG`, fall back to
        `*_pulsemat.csv` only if `PULSE_CONFIG` cannot be parsed.
-  5.   [`run_reference_forward`](@ref) — `:ground` and `:equator` final-state
+  5.   [`run_reference_forward`](@ref) — `:ground` and `:weak` final-state
        solves. Those metrics are the reference metrics.
   6.   [`reconcile_reference`](@ref) — if the file stores results, compare
        this run's final-state outputs and metrics against them; if it stores
@@ -1997,9 +1998,9 @@ Linear pipeline:
        pulse** (`PULSE_CONFIG` control segments, or the CSV). Signal is
        not fit. Skipped if `fit_seed_from_file=false` or `warm_start_u`
        is passed.
-  7b.  [`generate_interior_seed`](@ref) — when `use_interior=true` (the
-       default), rewrite that `u_fit` toward inversion≈silencing≈0.5
-       using step 5's `inversion`/`silencing`. `use_interior=false`
+  7b.  [`generate_interior_seed`](@ref) — when `use_interior=true`,
+       rewrite that `u_fit` toward inversion≈silencing≈0.5 using
+       step 5's `inversion`/`silencing`. Default `use_interior=false`
        leaves the linear seed unchanged.
   8.   [`optimise_composite_pulse`](@ref) (`pulse_optimizer2.jl`) optimises
        that same **control pulse** on the reference ensemble `d`,
@@ -2040,7 +2041,7 @@ function optimise_control_pulse_from_jld2(
     d = ref.d
     signal_E_of_t = ref.signal_E_of_t
 
-    verbose && println("=== 5  run_reference_forward (:ground + :equator) ===")
+    verbose && println("=== 5  run_reference_forward (:ground + :weak) ===")
     forward = run_reference_forward(
         ref; reltol=pipe.check_reltol, abstol=pipe.check_abstol,
         compute=opt_kwargs.compute, verbose=verbose,

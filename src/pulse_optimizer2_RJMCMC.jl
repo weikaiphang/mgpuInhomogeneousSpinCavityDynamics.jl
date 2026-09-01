@@ -503,7 +503,7 @@ dual-trajectory tracks are always solved (`pulse_cost`'s multiplicative
 `target_F=1.0` (RASE-style revival; pass `target_F=0.0` for ROSE-style
 silencing instead). These are explicit keywords so they are NOT passed
 through to the ODE solver. Do not pass `initial_condition` — the cost
-fixes `:ground` and `:equator` itself.
+fixes `:ground` and `:weak` itself.
 
 Besides the optimised `(best_u, best_cost, pulse)` -- `pulse` here is the
 `CompositePulse` matching `best_u`'s OWN `k`, which (unlike the fixed-k

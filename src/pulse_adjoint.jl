@@ -49,7 +49,7 @@ function inversion_pullback!(λx::AbstractVector, Sz::AbstractVector, g_b::Abstr
 end
 
 """
-    silencing_pullback!(λx, Sp, g_b, Nj, delta_b; eps_seed=_EQUATOR_WEAK_SEED)
+    silencing_pullback!(λx, Sp, g_b, Nj, delta_b; eps_seed=_WEAK_SEED)
 
 Seeds `λx` with the RAW `∂silencing/∂Re(Sp_j)`/`∂silencing/∂Im(Sp_j)`
 gradient (the pullback of [`_weighted_silencing_factor`](@ref) alone,
@@ -74,7 +74,7 @@ bounded away from 0 by the `1e-30` floors.
 """
 function silencing_pullback!(λx::AbstractVector, Sp::AbstractVector, g_b::AbstractVector,
                              Nj::AbstractVector, delta_b::AbstractVector;
-                             eps_seed::Real=_EQUATOR_WEAK_SEED)
+                             eps_seed::Real=_WEAK_SEED)
     M = length(Nj)
     length(Sp) == length(g_b) == length(delta_b) == M || error(
         "silencing_pullback!: Sp/g_b/delta_b lengths $(length(Sp))/$(length(g_b))/$(length(delta_b)) != Nj length $M."
@@ -232,14 +232,14 @@ function _adjoint_one_track(
 end
 
 """
-    pulse_cost_on_frozen_mesh(u, pulse, d, mesh_ground, mesh_equator; ...) -> cost
+    pulse_cost_on_frozen_mesh(u, pulse, d, mesh_ground, mesh_weak; ...) -> cost
 
 Test-facing primal: replay each track's frozen `dt` sequence with Φ
 (`tsit5_forced_step`) and score the same scalar as [`pulse_cost`](@ref),
 via the SAME [`_fidelity_physics_cost`](@ref) helper (so `I_min`/`kappa_I`/
 `S_min`/`kappa_S`, defaults `_DEFAULT_PENALTY_MIN`/`_DEFAULT_PENALTY_KAPPA`,
 track `pulse_cost`'s own formula exactly -- see that function's docstring).
-Both `mesh_ground` and `mesh_equator` are always required now: the
+Both `mesh_ground` and `mesh_weak` are always required now: the
 multiplicative `fidelity_phys = inversion*silencing_success` has no
 well-defined value with either track missing.
 """
@@ -248,7 +248,7 @@ function pulse_cost_on_frozen_mesh(
     pulse::CompositePulse,
     d,
     mesh_ground,
-    mesh_equator;
+    mesh_weak;
     target_F=1.0,
     w_time=0.15,
     w_power=0.05,
@@ -268,9 +268,9 @@ function pulse_cost_on_frozen_mesh(
     _, _, Sz = unpack_state_1st_order_u(usg[end], Int(d.M))
     inversion = _weighted_inversion(Sz, d.g_b, d.Nj, T)
 
-    mesh_equator === nothing && error("pulse_cost_on_frozen_mesh: equator mesh required.")
-    u0e = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :equator)
-    use = replay_tsit5_window(u0e, p, mesh_equator.t[1], mesh_equator.dt)
+    mesh_weak === nothing && error("pulse_cost_on_frozen_mesh: weak-excitation (:weak) mesh required.")
+    u0e = build_u0_1st_order_cpu(Int(d.M), d.Nj, T, :weak)
+    use = replay_tsit5_window(u0e, p, mesh_weak.t[1], mesh_weak.dt)
     _, Sp, _ = unpack_state_1st_order_u(use[end], Int(d.M))
     silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, T)
     coherence = _weighted_coherence(Sp, d.Nj, T)
@@ -391,7 +391,7 @@ function pulse_cost_grad_adjoint(
             return λx
         end
         grad_F, _, Sp, _, _, _ = _adjoint_one_track(
-            uθ, pulse, d, :equator, pb_sil!,
+            uθ, pulse, d, :weak, pb_sil!,
             reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
         )
         silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, Float64))

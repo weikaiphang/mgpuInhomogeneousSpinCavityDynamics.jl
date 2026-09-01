@@ -37,7 +37,7 @@ Builds a (+k, +k/2, +k) composite ARP pi-pulse for the cavity/ensemble
 every other pulse-building/simulation function in this package takes),
 runs it forward (no differentiation, no CUDA --
 [`run_sim_1st_order_trajectory`](@ref)) from both `:ground` and
-`:equator`, and reports how well it actually performed.
+`:weak`, and reports how well it actually performed.
 
 Segment structure (universal, system-independent RATIOS):
 - All three segments sweep the SAME bandwidth `bw = bandwidth_fwhm_mult *
@@ -164,7 +164,7 @@ function generate_3arp_pi_pulse(
     _, _, Sp_g, Sz_g = run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:ground, reltol=reltol, abstol=abstol)
     inversion = _weighted_inversion(Sz_g[end, :], d.g_b, d.Nj, T)
 
-    _, _, Sp_e, Sz_e = run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:equator, reltol=reltol, abstol=abstol)
+    _, _, Sp_e, Sz_e = run_sim_1st_order_trajectory(E_of_t, d; initial_condition=:weak, reltol=reltol, abstol=abstol)
     coherence = _weighted_coherence(Sp_e[end, :], d.Nj, T)
     silencing = _weighted_silencing_factor(Sp_e[end, :], d.g_b, d.Nj, d.delta_b, T)
 

@@ -95,7 +95,7 @@ end
 # table). `T` varies between `Float64` (forward-only calls) and
 # `ForwardDiff.Dual{Tag,V,N}` (differentiated calls) -- ForwardDiff
 # assigns a distinct `Tag` per differentiated closure, so e.g. this
-# file's own `:ground`- and `:equator`-track gradients (different
+# file's own `:ground`- and `:weak`-track gradients (different
 # closures) get different `Dual` types and hence different, non-aliasing
 # cache entries even when running concurrently on different threads with
 # the same `n0`.

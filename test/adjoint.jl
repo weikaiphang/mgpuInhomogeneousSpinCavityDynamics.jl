@@ -6,7 +6,7 @@
 # global-drive-phase parameter, to which both the paper bright-mode
 # inversion and the per-frequency-slice silencing factor |F|_⋆ are exactly
 # invariant. Once |F|_⋆ clamps (a coherence-preserving pulse drives the
-# weak-excitation equator track well above its seed), the silencing track
+# :weak track's coherence well above its ε seed), the silencing track
 # contributes an exact 0 to that component, so the two backends differ only
 # by reverse- vs forward-mode roundoff on a genuine 0 (~1e-16). Every
 # component with a non-negligible gradient (|g| ≫ 1e-6) is still compared at
@@ -238,7 +238,7 @@ end
         tstops=tstops,
     )
     mesh_e, _, _ = record_adaptive_tsit5_mesh(
-        build_u0_1st_order_cpu(Int(d.M), d.Nj, Float64, :equator), p, d.timespan;
+        build_u0_1st_order_cpu(Int(d.M), d.Nj, Float64, :weak), p, d.timespan;
         tstops=tstops,
     )
 

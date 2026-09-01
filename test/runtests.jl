@@ -196,20 +196,35 @@ end
     u_g = build_u0_1st_order_cpu(M, Nj, Float64, :ground)
     u_i = build_u0_1st_order_cpu(M, Nj, Float64, :inverted)
     u_e = build_u0_1st_order_cpu(M, Nj, Float64, :equator)
+    u_w = build_u0_1st_order_cpu(M, Nj, Float64, :weak)
+    u_wi = build_u0_1st_order_cpu(M, Nj, Float64, :weak_inverted)
     _, Sp_g, Sz_g = unpack_state_1st_order_u(u_g, M)
     _, Sp_i, Sz_i = unpack_state_1st_order_u(u_i, M)
     _, Sp_e, Sz_e = unpack_state_1st_order_u(u_e, M)
+    _, Sp_w, Sz_w = unpack_state_1st_order_u(u_w, M)
+    _, Sp_wi, Sz_wi = unpack_state_1st_order_u(u_wi, M)
     @test all(iszero, Sp_g)
     @test Sz_g ≈ .-Nj ./ 2
     @test all(iszero, Sp_i)
     @test Sz_i ≈ Nj ./ 2
-    # :equator is now the weak-excitation seed: near-|g⟩ (Sz = -Nj/2) with a
-    # tiny transverse coherence Sp = ε·Nj/2, ε = _EQUATOR_WEAK_SEED ≪ 1
-    # (paper App. B). NOT the old macroscopic Dicke state Sz = 0, Sp = Nj/2.
-    @test real.(Sp_e) ≈ _EQUATOR_WEAK_SEED .* Nj ./ 2
+    # :equator is the true macroscopic equator (Sz = 0, Sp = Nj/2) -- kept,
+    # but NOT used by the dual-trajectory cost (radiates / outside HP).
+    @test real.(Sp_e) ≈ Nj ./ 2
     @test all(iszero, imag.(Sp_e))
-    @test Sz_e ≈ .-Nj ./ 2
+    @test all(iszero, Sz_e)
+    # :weak = paper App. B weak-excitation seed: near-|g⟩ (Sz = -Nj/2) with a
+    # tiny +x coherence Sp = ε·Nj/2, ε = _WEAK_SEED ≪ 1. Sp(0) is held at
+    # EXACTLY ε·Nj/2 (matches _weighted_silencing_factor's initial-overlap
+    # denominator); the O(ε²) off-sphere excess is negligible.
+    @test real.(Sp_w) ≈ _WEAK_SEED .* Nj ./ 2
+    @test all(iszero, imag.(Sp_w))
+    @test Sz_w ≈ .-Nj ./ 2
+    # :weak_inverted = the :inverted analogue (Sz = +Nj/2, same ε seed).
+    @test real.(Sp_wi) ≈ _WEAK_SEED .* Nj ./ 2
+    @test all(iszero, imag.(Sp_wi))
+    @test Sz_wi ≈ Nj ./ 2
     @test abs2.(Sp_g) .+ abs2.(Sz_g) ≈ (Nj ./ 2) .^ 2
+    @test abs2.(Sp_e) .+ abs2.(Sz_e) ≈ (Nj ./ 2) .^ 2
     @test_throws ErrorException build_u0_1st_order_cpu(M, Nj, Float64, :nope)
     @test_throws ErrorException _forbid_initial_condition((initial_condition=:ground,))
 end
@@ -307,7 +322,7 @@ const FAKE_D_ODE = merge(FAKE_D, (
     # n(omega) = sum(Nj g^2) in every slice, so |F|_* collapses to its own
     # epsilon floor (~0), NOT to 1.0: g=0 means no coupling channel into
     # the cavity at all, a genuinely different statement than "the spins
-    # stay locally coherent" (they do -- :equator's own Sp never decays
+    # stay locally coherent" (they do -- :weak's own Sp never decays
     # here -- this metric just doesn't measure that).
     d_nog = merge(FAKE_D_ODE, (g_b = zeros(FAKE_D_ODE.M),))
     inv_nog, sil_nog = pulse_metrics(u0, pulse, d_nog)
@@ -832,7 +847,7 @@ end
     # I_min=0.99 (kappa_I keeps pulse_cost's own default 50.0) so the
     # inversion squared-hinge penalty is genuinely ACTIVE at the :hs1 seed
     # (inversion ≈ 0.986 < 0.99): under the paper-aligned metrics the :hs1
-    # pulse retains full equatorial coherence, so its silencing |F|_⋆
+    # pulse retains full equatorial coherence on the :weak track, so its silencing |F|_⋆
     # clamps to 1.0 and BOTH default floors (I_min=0.85, S_min=0.85) would
     # otherwise be slack here -- this test is about the penalty MECHANISM
     # biting, not about which floor a canonical seed happens to trip.
