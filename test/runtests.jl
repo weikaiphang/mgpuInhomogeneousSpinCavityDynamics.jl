@@ -1253,3 +1253,6 @@ end
 
 include(joinpath(@__DIR__, "jld2_pulse_pipeline.jl"))
 
+
+# Standalone analytical Volkov-Zon solver (src/volkov_zon.jl).
+include(joinpath(@__DIR__, "volkov_zon.jl"))
