@@ -906,6 +906,8 @@ function jld2_pipeline_defaults()
         save_log=true,
         log_out_dir=nothing,
         pulsemat_N=nothing,
+        write_report=true,
+        report_out_dir=nothing,
     )
 end
 
@@ -1938,6 +1940,7 @@ function save_optimisation_run_log(
     u0::AbstractVector, initial_metrics,
     best_u::AbstractVector, final_metrics, history, optimizer_settings;
     out_dir=nothing, pulsemat_N=nothing, benchmark_metrics=nothing,
+    elapsed_seconds=nothing,
 )
     optrunlog_path, pulsemat_path, pulsepara_path = optrunlog_paths(path; out_dir=out_dir)
 
@@ -1974,6 +1977,7 @@ function save_optimisation_run_log(
         final_u=collect(best_u), final_metrics=final_metrics, final_output=final_output,
         final_coherence=final_coherence,
         final_weak_seed_retention=final_weak_seed_retention,
+        elapsed_seconds=elapsed_seconds,
     )
     JLD2.save(optrunlog_path, "data", run_log)
     println("Saved optimisation run log to $optrunlog_path")
@@ -2034,6 +2038,8 @@ function optimise_control_pulse_from_jld2(
     n_coeff_f::Union{Nothing,Integer}=nothing;
     kwargs...,
 )
+    _t0 = time()
+
     n_given = count(!isnothing, (k, n_coeff_A, n_coeff_f))
     n_given == 0 || n_given == 3 || error(
         "k/n_coeff_A/n_coeff_f must be given ALL THREE (EXACT seed shape) or NONE " *
@@ -2129,6 +2135,12 @@ function optimise_control_pulse_from_jld2(
     best_u, best_cost, pulse, u0, initial_metrics, history, final_metrics, optimizer_settings =
         _call_optimise_composite_pulse(k, n_coeff_A, n_coeff_f, d, signal_E_of_t, opt_kwargs)
 
+    # Wall time for the run PROPER (steps 1-8). Captured once, here, so the
+    # run log's `elapsed_seconds` and the HTML report's runtime agree -- the
+    # diagnostic re-solves inside save_optimisation_run_log and the report
+    # render itself are bookkeeping, not part of "how long the run took".
+    _elapsed = time() - _t0
+
     if pipe.save_log
         full_settings = merge(
             (pulse_source=ref.pulse_source, rtol_check=pipe.rtol_check, atol_check=pipe.atol_check,
@@ -2143,7 +2155,25 @@ function optimise_control_pulse_from_jld2(
             u0, initial_metrics, best_u, final_metrics, history, full_settings;
             out_dir=pipe.log_out_dir, pulsemat_N=pipe.pulsemat_N,
             benchmark_metrics=reference_metrics,
+            elapsed_seconds=_elapsed,
         )
+
+        # Auto-generate the seed-vs-optimised HTML report from the just-saved
+        # files. Never let a report failure disturb the (already saved) run.
+        if pipe.write_report
+            try
+                rp = write_pulse_report(
+                    ref.jld2_path; out_dir=pipe.report_out_dir,
+                    log_dir=pipe.log_out_dir,
+                    runtime_s=_elapsed, verbose=verbose,
+                )
+                verbose && println("Wrote pulse report to $rp")
+            catch e
+                e isa InterruptException && rethrow()
+                @warn "pulse report generation failed (optimisation results are " *
+                      "saved and unaffected)" exception = (e, catch_backtrace())
+            end
+        end
     end
 
     return best_u, best_cost, pulse, signal_E_of_t, d, data, seed_fit_report, reference_metrics
