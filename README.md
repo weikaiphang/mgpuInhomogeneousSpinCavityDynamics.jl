@@ -11,6 +11,7 @@ Julia simulation code for **"Inhomogeneous Light-Matter Coupling as a Resource f
 * Configurable pulse sequences and ensemble distributions
 * Noise and correlation calculations using the Quantum Regression Theorem
 * PINN first-order datagen catalog (`src/datagen/`; see [src/datagen/README.md](src/datagen/README.md))
+* Standalone analytical Volkov–Zon solver (`src/volkov_zon.jl`) — closed-form linear-response dynamics with no ensemble discretisation and no ODE solve; CPU only, no CUDA required
 
 ## Installation
 
@@ -530,6 +531,116 @@ Run a script from the repository directory using, for example:
 julia --project=. scripts/compute_noise.jl
 ```
 
+## Analytical Volkov–Zon solver
+
+`src/volkov_zon.jl` is a **fully independent, standalone** solver for the same
+physical system, using the analytical Volkov–Zon method instead of numerical
+integration. It depends only on the Julia standard library — no CUDA, no
+`DifferentialEquations`, no `Distributions` — so it runs on any machine:
+
+```julia
+include("src/volkov_zon.jl")
+using .VolkovZon
+
+sys = VZSystem(
+    kappa_e   = 2π * 1e6,
+    C_ens     = 0.6,
+    detuning  = DetuningLorentzian(2π * 1e6),
+    coupling  = CouplingPowerLaw(5/3, 2π * 1.0, 2π * 1000.0),
+    drive     = gaussian_drive(t0 = 20e-6, sigma = (10/6) * 1e-6, amp = 1.0),
+)
+
+sol = vz_solve(sys; Ttotal = 100e-6, Nt_save = 5001)
+sol.a, sol.a_out, sol.Sigma_p, sol.Sigma_z, sol.poles
+```
+
+### How it works
+
+The method linearises the spin inversion (`⟨S^z⟩ → s₀/2`), which makes the spin
+equation solvable in closed form. Substituting back, the whole inhomogeneous
+ensemble collapses onto two closed-form scalars: the coupling second moment
+`⟨g²⟩` and the detuning memory kernel
+
+```math
+K(t) = \int \rho(\Delta)\, e^{-i\Delta t}\, d\Delta ,
+\qquad
+\tilde K(s) = \int \frac{\rho(\Delta)}{s + i\Delta}\, d\Delta ,
+```
+
+obtained by contour integration. The cavity transform is then algebraic,
+
+```math
+\hat a(s) = \frac{a(0) + \sqrt{\kappa_e}\,\hat E(s) - i N \hat J(s)}{s + \kappa_t/2 + i\delta_0 - s_0 N\langle g^2\rangle \tilde K(s)} .
+```
+
+Two inversion routes are provided and selected automatically:
+
+* `:residue` — **exact**. For a Lorentzian (and for the power-law family below)
+  `K̃` is rational, so the poles of the transform are the roots of a
+  polynomial and `⟨a⟩(t)` is an exact finite sum of exponentials — the
+  cavity/spin polariton branches, returned in `sol.poles`.
+* `:fft` — Bromwich inversion of the exact transform, used for the Gaussian
+  line shape, whose `K̃` is the Faddeeva function.
+
+**There is no ensemble discretisation to converge and no ODE is integrated**, so
+the cost depends only on `Nt_save`. This matters most for heavy-tailed line
+shapes: reproducing a Lorentzian ensemble by binning needs very many bins, since
+even ±400 half-widths captures only ~96% of the probability.
+
+### Distributions
+
+Detuning `ρ(Δ)` — Lorentzian, Gaussian, or power law:
+
+| Constructor | Density |
+| --- | --- |
+| `DetuningLorentzian(FWHM; center)` | `∝ 1/((Δ-c)² + w²)` |
+| `DetuningGaussian(FWHM; center)` | `∝ exp(-(Δ-c)²/2σ²)` |
+| `DetuningPowerLaw(FWHM, n; center)` | `∝ [1 + ((Δ-c)/w)²]^(-n)`, algebraic tails of exponent `2n` |
+
+`DetuningPowerLaw` is the Pearson-VII / generalised-Lorentzian family: `n = 1`
+reproduces the Lorentzian exactly and larger `n` interpolates towards the
+Gaussian while keeping algebraic tails. Integer `n` keeps the kernel rational,
+so the exact residue solution is available for the power-law case too.
+
+Coupling `p(g)` — Lorentzian, Gaussian, or power law (plus a constant):
+
+| Constructor | Density |
+| --- | --- |
+| `CouplingConstant(g)` | single value |
+| `CouplingGaussian(mean, std; span_sigma)` | truncated normal |
+| `CouplingLorentzian(center, FWHM; span_gamma)` | truncated Cauchy |
+| `CouplingPowerLaw(alpha, g_min, g_max)` | `∝ g^(-alpha)`, as `:powerlaw_g` |
+
+At linear order the coupling distribution enters the cavity dynamics *only*
+through `⟨g²⟩`, so its shape is degenerate there; `⟨g⟩` additionally sets the
+collective coherence. Coupling distributions are truncated and renormalised —
+an untruncated Cauchy has no second moment.
+
+### Output
+
+`vz_solve` returns a `NamedTuple` with `t`, `a` (`⟨a⟩`), `a_out`
+(`E(t) - √κ_e ⟨a⟩`, the package's convention), `E`, `Sigma_p` / `Sigma_m`
+(`Σⱼ⟨S_j^±⟩`), `Sigma_z`, `Ngsigma_m`, `poles`, `residues`, `N_total`, `C_ens`
+and `linear_validity`. Passing `bin_deltas` (and optionally `bin_gs`) also
+returns the resolved single-spin coherences `sigma_minus` / `sigma_plus`;
+`vz_ensemble_grid` supplies matching quadrature nodes and weights.
+
+### Validity
+
+The method is exact for the *linearised* ensemble. Every solution reports
+`linear_validity`, the largest fractional change of the total inversion. It is
+an ensemble average — resonant bins deplete considerably more — so keep it well
+below `1e-3` for quantitative work. Measured against a direct nonlinear
+integration, a `linear_validity` of `2.5e-7` gave `~2e-5` relative error in
+`⟨a⟩`, and `2.5e-5` gave `~1.6e-3`.
+
+### Running it
+
+```bash
+julia --project=. examples/volkov_zon_demo.jl
+julia --project=. test/volkov_zon.jl
+```
+
 ## PINN datagen
 
 `src/datagen/` is a separate script package that builds a first-order
@@ -562,6 +673,7 @@ julia --project=. src/datagen/datagen_selftest.jl
 ```text
 InhomogeneousSpinCavityDynamics.jl/
 ├── src/              Main simulation source code
+│   ├── volkov_zon.jl Standalone analytical Volkov-Zon solver (stdlib only)
 │   └── datagen/      PINN first-order datagen catalog (see src/datagen/README.md)
 ├── examples/         Example scripts for running simulations
 ├── scripts/          Plotting, noise, and correlation analysis scripts
@@ -571,7 +683,7 @@ InhomogeneousSpinCavityDynamics.jl/
 └── README.md         Repository documentation
 ```
 
-- `src/`: Contains the first-order and second-order solvers, ensemble discretization, pulse definitions, validation functions, data-saving functions, and data-analysis functions. `src/datagen/` is the PINN first-order datagen catalog (see [src/datagen/README.md](src/datagen/README.md)).
+- `src/`: Contains the first-order and second-order solvers, ensemble discretization, pulse definitions, validation functions, data-saving functions, and data-analysis functions. `src/datagen/` is the PINN first-order datagen catalog (see [src/datagen/README.md](src/datagen/README.md)). `src/volkov_zon.jl` is the standalone analytical Volkov–Zon solver (see [Analytical Volkov–Zon solver](#analytical-volkovzon-solver)).
 
 - `examples/`: Contains example scripts showing how to define `SIM_SETTING`, `SYSTEM_CONFIG`, and `PULSE_CONFIG` and run a simulation.
 
