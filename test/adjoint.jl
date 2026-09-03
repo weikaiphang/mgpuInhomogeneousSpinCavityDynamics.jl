@@ -38,6 +38,65 @@ end
     @test dx ≈ dx_ref atol=1e-14
 end
 
+# Pins rhs_1st_order! to its pre-optimisation formulation, elementwise.
+# `_rhs_1st_order_preopt!` is the RHS exactly as it stood before the
+# GPU-hot-path work (scalar `a = u[1]` / `du[1] = ...`, and a fresh
+# `sum(g_b .* conj.(Sp))` temporary each call). The current
+# rhs_1st_order! uses a 1-element view for `a`/`da` and a reused reduction
+# buffer; both are meant to be BIT-IDENTICAL on the Vector / Dual
+# backends. If a future change alters the vector field on these paths,
+# this fails even when the looser real-split `atol` test above would not.
+function _rhs_1st_order_preopt!(du, u, p, t)
+    delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t = p
+    a = u[1]
+    Sp = @view u[2:1+M]
+    Sz = @view u[2+M:1+2M]
+    dSp = @view du[2:1+M]
+    dSz = @view du[2+M:1+2M]
+    κe = kappa_e
+    κt = kappa_e + kappa_i
+    E_t = E_of_t(t)
+    du[1] = sqrt(κe) * E_t - 1im * delta0 * a -
+            1im * sum(g_b .* conj.(Sp)) - 0.5 * κt * a
+    dSp .= 1im .* delta_b .* Sp .- 2im .* g_b .* conj(a) .* Sz
+    dSz .= -1im .* g_b .* a .* Sp .+ 1im .* g_b .* conj(a) .* conj.(Sp)
+    return nothing
+end
+
+@testset "rhs_1st_order! bit-identical to pre-optimisation formulation" begin
+    d = FAKE_D_ODE
+    M = Int(d.M)
+    p = _toy_p(d; E = t -> 1.3 + 0.7im)
+
+    # ComplexF64 path: exact bits, cold AND warm reduction buffer.
+    for seed in (1, 2, 3), t in (0.0, 1.3e-6, 4.1e-5)
+        rng = Random.Xoshiro(seed)
+        u = randn(rng, ComplexF64, state_length_1st_order(M))
+        a_new = similar(u); a_ref = similar(u)
+        rhs_1st_order!(a_new, u, p, t)
+        rhs_1st_order!(a_new, u, p, t)          # warm buffer
+        _rhs_1st_order_preopt!(a_ref, u, p, t)
+        @test reinterpret(UInt8, a_new) == reinterpret(UInt8, a_ref)
+    end
+
+    # ForwardDiff.Dual path: derivative of a scalar functional of `du`
+    # w.r.t. a knob threaded through E(t) must match to the last bit.
+    rng = Random.Xoshiro(7)
+    u = randn(rng, ComplexF64, state_length_1st_order(M))
+    w = randn(rng, ComplexF64, state_length_1st_order(M))
+    tprobe = 2.7e-5
+    func(rhs!, θ) = begin
+        E = tt -> (1.3 + 0.7im) * (1 + θ * sin(2π * 1e4 * tt))
+        pp = (p[1], p[2], p[3], p[4], p[5], M, E)
+        du = Vector{Complex{eltype(θ)}}(undef, length(u))
+        rhs!(du, convert(Vector{Complex{eltype(θ)}}, u), pp, tprobe)
+        real(sum(w .* du))
+    end
+    g_new = ForwardDiff.derivative(θ -> func(rhs_1st_order!, θ), 0.37)
+    g_ref = ForwardDiff.derivative(θ -> func(_rhs_1st_order_preopt!, θ), 0.37)
+    @test g_new === g_ref
+end
+
 @testset "VJP adjoint identity and vs ForwardDiff λ·F" begin
     d = FAKE_D_ODE
     M = Int(d.M)
