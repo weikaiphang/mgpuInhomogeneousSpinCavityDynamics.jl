@@ -305,7 +305,7 @@ function pulse_cost_on_frozen_mesh(
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
     S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
     signal_E_of_t=_zero_drive,
-    track::Symbol=:dual,
+    track::Symbol=:weak,
 )
     _assert_track(track)
     T = eltype(u)
@@ -366,10 +366,11 @@ list for that one window anyway -- no memory saving over
 it cannot happen under the defaults, only if `checkpoint_stride` is
 explicitly reset to `typemax(Int)` while `use_checkpoints=true`.
 
-`track=:dual` (default) runs both ICs; `track=:weak` records ONE `:weak`
-forward trajectory and reverse-sweeps it twice (`∇inversion` from that
-solve's own `Sz`, O(ε) bias -- see [`_assert_track`](@ref)) via
-[`_adjoint_track_multi`](@ref). Either way, each adjoint sweep seeds
+`track=:weak` (default) records ONE `:weak` forward trajectory and
+reverse-sweeps it twice (`∇inversion` from that solve's own `Sz`, O(ε)
+bias -- see [`_assert_track`](@ref)) via [`_adjoint_track_multi`](@ref).
+Pass `track=:dual` explicitly to run both ICs; `:dual` is never selected
+automatically. Either way, each adjoint sweep seeds
 `λx` with the RAW `∂inversion/∂x`/`∂silencing/∂x` pullback (coefficient
 `+1`, no `target_F`/weight baked in), producing `grad_I = ∇inversion(u)`
 and `grad_F = ∇silencing(u)` -- the same two Jacobians
@@ -396,7 +397,7 @@ function pulse_cost_grad_adjoint(
     compute::Symbol=:cpu,
     checkpoint_stride::Integer=300,
     use_checkpoints::Bool=true,
-    track::Symbol=:dual,
+    track::Symbol=:weak,
     kwargs...,
 )
     _forbid_initial_condition(kwargs)

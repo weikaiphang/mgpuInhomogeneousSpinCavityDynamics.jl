@@ -21,7 +21,7 @@ const RULE_SAFETY_MIN = 3.0
 
 # Allowed simulate-time ICs. These are pulse_optimizer2.jl's named
 # initial conditions (`build_u0_1st_order_cpu`), not the cost-mode
-# `track=:dual|:weak`. Default is cannon = ground+equator.
+# `track` (`:weak` default / `:dual` opt-in). Default is cannon = ground+equator.
 const DATAGEN_TRACKS = (:ground, :inverted, :equator, :weak, :weak_inverted)
 const DATAGEN_ICS = (:ground, :equator)
 const DATAGEN_TRACK_POLES = (:ground, :inverted)

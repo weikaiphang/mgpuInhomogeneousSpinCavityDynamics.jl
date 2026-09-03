@@ -166,6 +166,7 @@ end
     @test k_of_seed_kind(:hs1) == 1
     @test k_of_seed_kind(:corpse) == 5
     @test k_of_seed_kind(:bb1) == 7
+    @test k_of_seed_kind(:bir4) == 4
     @test_throws ErrorException k_of_seed_kind(:random)
 
     p1 = CompositePulse(1, 4, 4, FAKE_D)
@@ -188,6 +189,29 @@ end
     @test length(u_b) == n_params(p7)
     @test_throws ErrorException seed_hs1(p5, p5.amp_scale, 1.0, 1.0)
     @test_throws ErrorException seed_canonical(p1, :corpse)
+
+    p4 = CompositePulse(4, 6, 6, FAKE_D)
+    u_bir4 = seed_canonical(p4, :bir4)
+    @test length(u_bir4) == n_params(p4)
+    ts4, te4, phi4, cA4, cf4 = decode(p4, u_bir4)
+    @test all(cA4 .> 0)
+    @test all(te4 .> ts4)
+    @test issorted(ts4)
+    # amplitude nodes at the quarter points: segments start full / end near
+    # zero (seg 1, 3) and vice versa (seg 2, 4)
+    @test cA4[1, 1] > cA4[end, 1]
+    @test cA4[end, 2] > cA4[1, 2]
+    # discrete phase jumps Δφ and −Δφ around the inner segments (θ = π)
+    @test phi4[1] == 0
+    @test phi4[2] ≈ pi + pi / 2
+    @test phi4[3] == 0
+    @test phi4[4] ≈ -(pi + pi / 2)
+    # frequency sweep is antisymmetric between the paired segments
+    @test cf4[1, 1] ≈ 0 atol = 1e-12
+    @test cf4[1, 2] < 0
+    @test_throws ErrorException seed_bir4(p1, p1.amp_scale)
+    @test_throws ErrorException seed_bir4(p4, p4.amp_scale; kappa=pi / 2)
+    @test_throws ErrorException seed_canonical(p1, :bir4)
 end
 
 @testset "dual-trajectory initial conditions" begin
@@ -1252,7 +1276,3 @@ if !isdefined(@__MODULE__, :build_full_config)
 end
 
 include(joinpath(@__DIR__, "jld2_pulse_pipeline.jl"))
-
-
-# Standalone analytical Volkov-Zon solver (src/volkov_zon.jl).
-include(joinpath(@__DIR__, "volkov_zon.jl"))

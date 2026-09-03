@@ -499,9 +499,10 @@ budgets, not a converged global optimum.
 3 and 0.1, same as constructing the pulse by hand). `w_tmax`, `w_power`,
 `target_F`, and `w_time` are forwarded to [`pulse_cost`](@ref), targeting
 `target_F=1.0` (RASE-style revival; pass `target_F=0.0` for ROSE-style
-silencing instead). `track` (`:dual` default / `:weak`, see
+silencing instead). `track` (`:weak` default / `:dual` opt-in only, see
 [`_assert_track`](@ref)) chooses one or two ODE solves per cost
-evaluation and rides through every `run_local_adam` hop (any k). These
+evaluation and rides through every `run_local_adam` hop (any k); `:dual`
+is never selected automatically. These
 are explicit keywords so they are NOT passed through to the ODE solver.
 Do not pass `initial_condition` — the cost fixes its own ICs.
 
@@ -538,7 +539,8 @@ that one is captured separately, as `use_signal`/`n_signal`, by
 enough to rebuild the exact same closure deterministically). It also
 carries `final_inversion_ground`/`final_inv_gap` from the automatic winner
 re-check (canonical `:ground` inversion of `best_u` and the O(ε)
-single-track bias; `0.0` gap for `track=:dual`) -- see [`_assert_track`](@ref).
+single-track bias under the default `track=:weak`; `0.0` gap for an
+explicit `track=:dual`) -- see [`_assert_track`](@ref).
 All of these are exactly what [`optimise_control_pulse_from_jld2`](@ref)
 needs to write a full, replicable run log; ordinary callers that only want
 the optimised pulse can simply ignore the extra return values.
@@ -625,7 +627,7 @@ function optimise_composite_pulse_rjmcmc(
     degree::Integer=3, taper_frac::Real=0.1, w_tmax::Real=1.0, w_power::Real=0.05,
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
-    track::Symbol=:dual,
+    track::Symbol=:weak,
     anneal_direct_weights::Bool=true, hop0_phyonly::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,

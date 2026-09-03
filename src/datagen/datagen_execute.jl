@@ -346,7 +346,7 @@ Parse `--tracks` / `--default-conditions`. Comma-separated tokens,
 order-preserving, duplicates dropped. Tokens: `ground`, `inverted`,
 `equator` (`equatorial`), `weak`, `weak_inverted`. Groups: `poles`,
 `precess`, `cannon`, `approx`, `all`. These are ICs, not the optimizer
-cost-mode `track=:dual|:weak`.
+cost-mode `track` (`:weak` default / `:dual` opt-in).
 """
 function parse_tracks(s::AbstractString)
     raw = strip(String(s))

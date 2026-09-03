@@ -943,7 +943,7 @@ function jld2_optimizer_defaults()
         threaded_grad=true,
         compute=:auto,
         grad_mode=:forwarddiff,
-        track=:dual,
+        track=:weak,
         anneal_direct_weights=true,
         hop0_phyonly=true,
         x_tune_alpha=_DEFAULT_X_TUNE_ALPHA,

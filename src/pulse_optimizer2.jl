@@ -605,24 +605,28 @@ end
 
 `track` selects how `inversion` and `silencing` are obtained:
 
-  * `:dual` (default) -- two ODE solves per cost evaluation: `:ground`
-    (`Sp=0`) gives `inversion`, the weak-excitation `:weak` seed
-    (`Sp=ε·Nj/2`) gives `silencing`/`coherence`/`field_amp`/
-    `weak_seed_retention`.
-  * `:weak` -- ONE `:weak` solve; `inversion` is read from THAT solve's
-    own `Sz` too. Halves the ODE cost. Justified because the `:weak`
-    seed perturbs `Sz` only at O(ε) (ε = `_WEAK_SEED` = 1e-3), so
+  * `:weak` (default) -- ONE `:weak` solve; `inversion` is read from THAT
+    solve's own `Sz` too. Halves the ODE cost. Justified because the
+    `:weak` seed perturbs `Sz` only at O(ε) (ε = `_WEAK_SEED` = 1e-3), so
     `inversion` on `:weak` ≈ `inversion` on `:ground` to ~1e-3 (measured
-    4.2e-5 on the toy `hs1` config). Use when that DETERMINISTIC bias is
-    acceptable relative to the fidelity target.
+    4.2e-5 on the toy `hs1` config). This is the default because the O(ε)
+    bias is negligible for realistic fidelity targets and the winner
+    re-check below restores the canonical `:ground` inversion anyway.
+  * `:dual` -- OPT-IN ONLY (pass `track=:dual` explicitly): two ODE solves
+    per cost evaluation: `:ground` (`Sp=0`) gives `inversion`, the
+    weak-excitation `:weak` seed (`Sp=ε·Nj/2`) gives `silencing`/
+    `coherence`/`field_amp`/`weak_seed_retention`. Nothing in this package
+    selects `:dual` on its own -- it is never the fallback for a missing
+    or unrecognised keyword.
 
 The single-track gradient (ForwardDiff, threaded-Jacobian, AND the
 1-forward/2-reverse adjoint via [`_adjoint_track_multi`](@ref)) is the
 EXACT gradient of `pulse_cost(u; track=:weak)` -- verified roundoff-
 identical across all three backends. The only approximation is that
 `pulse_cost(u; track=:weak)` itself ≈ `pulse_cost(u; track=:dual)` to
-O(ε); a `track=:weak` optimum is therefore an O(ε)-approximate stationary
-point of the `:dual` objective. [`optimise_composite_pulse`](@ref) /
+O(ε); a `track=:weak` optimum (the default) is therefore an
+O(ε)-approximate stationary point of the `:dual` objective.
+[`optimise_composite_pulse`](@ref) /
 [`optimise_composite_pulse_rjmcmc`](@ref) do this re-check automatically:
 after the search they spend ONE `:ground` solve of the winner and record
 `final_inversion_ground` (the canonical value) and `final_inv_gap`
@@ -631,9 +635,10 @@ saved run log carries the true `:ground` inversion. For an ad-hoc `u`,
 `pulse_metrics(u, pulse, d; track=:dual)[1]` gives the same number.
 """
 function _assert_track(track::Symbol)
-    track === :dual || track === :weak || error(
-        "track must be :dual (separate :ground + :weak solves) or :weak " *
-        "(a single :weak solve, inversion read from it too), got $(repr(track))."
+    track === :weak || track === :dual || error(
+        "track must be :weak (the default -- a single :weak solve, inversion " *
+        "read from it too) or :dual (opt-in -- separate :ground + :weak " *
+        "solves), got $(repr(track))."
     )
     return track
 end
@@ -938,11 +943,12 @@ coordinates of one Bloch vector:
   DIAGNOSTIC ONLY.
 
 Do not pass `initial_condition` — the ICs are fixed here. `track`
-(`:dual` default / `:weak`, see [`_assert_track`](@ref)) chooses one or
-two solves. Solver kwargs (`signal_E_of_t`, `reltol`, ...) are forwarded.
+(`:weak` default / `:dual` opt-in only, see [`_assert_track`](@ref))
+chooses one or two solves. Solver kwargs (`signal_E_of_t`, `reltol`, ...)
+are forwarded.
 """
 function pulse_metrics(u::AbstractVector, pulse::CompositePulse, d;
-                        compute::Symbol=:auto, track::Symbol=:dual, kwargs...)
+                        compute::Symbol=:auto, track::Symbol=:weak, kwargs...)
     _forbid_initial_condition(kwargs)
     _assert_track(track)
     T = eltype(u)
@@ -1147,14 +1153,16 @@ end
     pulse_cost(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, kwargs...)
         -> (cost, inversion, silencing, duration, coherence, field_amp, weak_seed_retention)
 
-Scalar cost to be minimised. With `track=:dual` (default) inversion and
-silencing come from **two independent ODE solves** of the same pulse `u`
-(see [`pulse_metrics`](@ref)): `:ground` → bright-mode (`Nj g²`) weighted
-inversion `I` (paper App. H), the `:weak` track (`Sp = ε·Nj/2`)
-→ paper per-frequency-slice silencing factor `|F|_⋆ = ⟨|F(ω)|⟩` (Eq. 5 /
-A.132). With `track=:weak` there is ONE `:weak` solve and `inversion` is
-read from its own `Sz` (halves the ODE cost; O(ε)≈1e-3 bias vs `:ground`
-inversion -- see [`_assert_track`](@ref)). `target_F` picks which
+Scalar cost to be minimised. With `track=:weak` (default) there is ONE
+`:weak` solve (`Sp = ε·Nj/2`): the paper per-frequency-slice silencing
+factor `|F|_⋆ = ⟨|F(ω)|⟩` (Eq. 5 / A.132) comes from it, and `inversion`
+is read from its own `Sz` (halves the ODE cost; O(ε)≈1e-3 bias vs the
+`:ground` inversion -- see [`_assert_track`](@ref)). Pass `track=:dual`
+explicitly to instead take inversion and silencing from **two
+independent ODE solves** of the same pulse `u` (see [`pulse_metrics`](@ref)):
+`:ground` → bright-mode (`Nj g²`) weighted inversion `I` (paper App. H),
+the `:weak` track → the silencing factor. `:dual` is never selected
+automatically. `target_F` picks which
 cavity-QED protocol this pulse is being
 optimised for: `target_F=1.0` (default) rewards preserving collective
 coherence -- a pure `ω²/κ` chirp, `|F|→1` (RASE-style revival / ACE);
@@ -1176,7 +1184,10 @@ well-revived `:weak` track are required for `physics_cost`'s base term
 to reach its minimum of 0 -- either track alone, however good, cannot
 drive the cost down on its own, since `fidelity_phys` is their PRODUCT,
 not their weighted sum. There is accordingly no `w_inv`/`w_sil` knob any
-more: both tracks are always solved, unconditionally.
+more: both `inversion` and `silencing` always enter the objective,
+unconditionally. What `track` changes is only how many ODE solves supply
+them -- one `:weak` solve (default) or a separate `:ground` + `:weak`
+pair (`track=:dual`, opt-in) -- never whether a metric is in the cost.
 
 `I_min`/`kappa_I`/`S_min`/`kappa_S` (defaults [`_DEFAULT_PENALTY_MIN`](@ref)/
 [`_DEFAULT_PENALTY_KAPPA`](@ref) each) are a squared-hinge exterior
@@ -1217,7 +1228,7 @@ function pulse_cost(u::AbstractVector, pulse::CompositePulse, d;
                      target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                      I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
                      S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
-                     compute::Symbol=:auto, track::Symbol=:dual, kwargs...)
+                     compute::Symbol=:auto, track::Symbol=:weak, kwargs...)
     _forbid_initial_condition(kwargs)
     _assert_track(track)
     T = eltype(u)
@@ -3088,11 +3099,13 @@ gradient. Host-only runs keep the original 2-way `Threads.@threads`
 schedule and are the path `test/runtests.jl` checks against serial
 ForwardDiff.
 
-`track=:dual` (default) solves both ICs as above. `track=:weak` solves
-ONLY `:weak` and takes `grad_I`/`grad_F` as the two rows of a single
-`ForwardDiff.jacobian` of `[inversion, silencing]` (`inversion` read from
-that solve's own `Sz`, O(ε) bias -- see [`_assert_track`](@ref)); the
-analytic chain rule below is unchanged, only the solve count drops to 1.
+`track=:weak` (default) solves ONLY `:weak` and takes `grad_I`/`grad_F`
+as the two rows of a single `ForwardDiff.jacobian` of
+`[inversion, silencing]` (`inversion` read from that solve's own `Sz`,
+O(ε) bias -- see [`_assert_track`](@ref)). Pass `track=:dual` explicitly
+to solve both ICs as above; the analytic chain rule below is identical
+either way, only the solve count changes. `:dual` is never the implicit
+choice.
 Neither track can be dropped from the OBJECTIVE (the multiplicative
 `fidelity_phys` collapses to 0 without both), only the second SOLVE.
 A `PulseSolveFailed` reproduces `pulse_cost`'s failure contract:
@@ -3102,7 +3115,7 @@ function _pulse_cost_grad_threaded(u::AbstractVector, pulse::CompositePulse, d;
                                     target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                                     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
                                     S_min::Real=_DEFAULT_PENALTY_MIN, kappa_S::Real=_DEFAULT_PENALTY_KAPPA,
-                                    compute::Symbol=:auto, track::Symbol=:dual, kwargs...)
+                                    compute::Symbol=:auto, track::Symbol=:weak, kwargs...)
     _forbid_initial_condition(kwargs)
     _assert_track(track)
     sk = _solver_kwargs(kwargs)
@@ -3852,7 +3865,7 @@ end
         degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
         target_F=1.0, w_time=0.15, seed=42,
         warm_start_u=nothing, label_prefix="", threaded_grad=true, compute=:auto,
-        grad_mode=:forwarddiff, anneal_direct_weights=true,
+        grad_mode=:forwarddiff, track=:weak, anneal_direct_weights=true,
         x_tune_alpha=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x=true,
         I_min=_DEFAULT_PENALTY_MIN, kappa_I=_DEFAULT_PENALTY_KAPPA,
         S_min=_DEFAULT_PENALTY_MIN, kappa_S=_DEFAULT_PENALTY_KAPPA, solve_kwargs...)
@@ -3896,13 +3909,19 @@ budgets, not a converged global optimum.
 
 `degree` / `taper_frac` are forwarded to [`CompositePulse`](@ref) (defaults
 3 and 0.1, same as constructing the pulse by hand). `w_tmax`, `w_power`,
-`target_F`, and `w_time` are forwarded to [`pulse_cost`](@ref); both
-dual-trajectory tracks are always solved (there is no `w_inv`/`w_sil`
-weight any more -- `pulse_cost`'s multiplicative `fidelity_phys` has no
-single-track reduction), targeting `target_F=1.0` (RASE-style revival;
-pass `target_F=0.0` for ROSE-style silencing instead). These are explicit
-keywords so they are NOT passed through to the ODE solver. Do not pass
-`initial_condition` — the cost fixes `:ground` and `:weak` itself.
+`target_F`, and `w_time` are forwarded to [`pulse_cost`](@ref). Both
+inversion and silencing always enter the objective (there is no
+`w_inv`/`w_sil` weight any more -- `pulse_cost`'s multiplicative
+`fidelity_phys` has no single-track reduction), targeting `target_F=1.0`
+(RASE-style revival; pass `target_F=0.0` for ROSE-style silencing
+instead). `track` (default `:weak`, forwarded to [`pulse_cost`](@ref) /
+[`_pulse_cost_grad_threaded`](@ref) / [`run_local_adam`](@ref)) selects
+ONE `:weak` solve per cost evaluation, with `inversion` read from that
+solve's own `Sz` (O(ε) bias, corrected by the automatic winner re-check
+below); pass `track=:dual` explicitly for the two-solve `:ground` +
+`:weak` objective. `:dual` is never chosen automatically. These are
+explicit keywords so they are NOT passed through to the ODE solver. Do
+not pass `initial_condition` — the cost fixes `:ground`/`:weak` itself.
 
 Besides the optimised `(best_u, best_cost, pulse)`, also returns: `u0`
 (the initial/candidate parameterisation hop 0 actually started from --
@@ -3928,10 +3947,11 @@ that one is captured separately, as `use_signal`/`n_signal`, by
 [`optimise_control_pulse_from_jld2`](@ref), since those two scalars are
 enough to rebuild the exact same closure deterministically). It also
 carries `final_inversion_ground` and `final_inv_gap` from the automatic
-winner re-check (see [`_assert_track`](@ref)): for `track=:dual` these are
-just `final_metrics[2]` and `0.0`; for `track=:weak` `final_inversion_ground`
-is a fresh canonical `:ground` solve of `best_u` and `final_inv_gap =
-inversion:weak - inversion:ground` is the O(ε) single-track bias. All of
+winner re-check (see [`_assert_track`](@ref)): for `track=:weak` (the
+default) `final_inversion_ground` is a fresh canonical `:ground` solve of
+`best_u` and `final_inv_gap = inversion:weak - inversion:ground` is the
+O(ε) single-track bias; for an explicit `track=:dual` these are just
+`final_metrics[2]` and `0.0`. All of
 these are exactly what [`optimise_control_pulse_from_jld2`](@ref) needs
 to write a full, replicable run log; ordinary callers that only want the
 optimised pulse can simply ignore the extra return values.
@@ -4013,7 +4033,7 @@ function optimise_composite_pulse(
     target_F::Real=1.0, w_time::Real=0.15,
     seed::Integer=42, warm_start_u=nothing, label_prefix::AbstractString="",
     threaded_grad::Bool=true, compute::Symbol=:auto, grad_mode::Symbol=:forwarddiff,
-    track::Symbol=:dual,
+    track::Symbol=:weak,
     anneal_direct_weights::Bool=true, hop0_phyonly::Bool=true,
     x_tune_alpha::Union{Nothing,Real}=_DEFAULT_X_TUNE_ALPHA, recalibrate_optima_x::Bool=true,
     I_min::Real=_DEFAULT_PENALTY_MIN, kappa_I::Real=_DEFAULT_PENALTY_KAPPA,
