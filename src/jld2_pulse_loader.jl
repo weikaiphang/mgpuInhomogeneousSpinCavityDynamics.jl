@@ -946,6 +946,7 @@ function jld2_optimizer_defaults()
         threaded_grad=true,
         compute=:auto,
         grad_mode=:forwarddiff,
+        frame=:lab,          # :lab | :ip  (interaction-picture co-rotating spin frame)
         track=:weak,
         anneal_direct_weights=true,
         hop0_phyonly=true,
@@ -1393,6 +1394,7 @@ function run_reference_forward(
     reltol=nothing,
     abstol=nothing,
     compute::Symbol=jld2_optimizer_defaults().compute,
+    frame::Symbol=:lab,
     verbose::Bool=true,
 )
     data = ref.data
@@ -1402,11 +1404,11 @@ function run_reference_forward(
 
     a, Sp, Sz = run_sim_1st_order_final(
         ref.recorded_E_of_t, d;
-        initial_condition=:ground, reltol=reltol_s, abstol=abstol_s, compute=compute,
+        initial_condition=:ground, reltol=reltol_s, abstol=abstol_s, compute=compute, frame=frame,
     )
     _, Sp_eq, _ = run_sim_1st_order_final(
         ref.recorded_E_of_t, d;
-        initial_condition=:weak, reltol=reltol_s, abstol=abstol_s, compute=compute,
+        initial_condition=:weak, reltol=reltol_s, abstol=abstol_s, compute=compute, frame=frame,
     )
 
     Sigma_p = sum(Sp)
@@ -1738,16 +1740,17 @@ function run_sim_1st_order_trajectory(
     E_of_t, d;
     initial_condition::Symbol=:ground, alg=Tsit5(),
     reltol=1e-8, abstol=1e-8, tstops=Float64[],
-    compute::Symbol=:auto,
+    compute::Symbol=:auto, frame::Symbol=:lab,
 )
     M = _assert_ensemble_shapes(d)
     hasproperty(d, :t_save) || error("run_sim_1st_order_trajectory: derived ensemble `d` is missing t_save.")
     compute_eff = _resolve_compute(compute, M)
+    frame === :ip && (compute_eff = :cpu)
     u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
     t, a, Sp, Sz = _run_sim_1st_order_from_u0(
         u0, E_of_t, d;
         alg=alg, reltol=reltol, abstol=abstol, tstops=tstops,
-        save_mode=:trajectory, t_save=d.t_save, compute=compute_eff,
+        save_mode=:trajectory, t_save=d.t_save, compute=compute_eff, frame=frame,
     )
     size(Sp) == (length(t), M) && size(Sz) == (length(t), M) || error(
         "run_sim_1st_order_trajectory: Sp/Sz shapes $(size(Sp))/$(size(Sz)) != ($((length(t), M)))."
@@ -1793,15 +1796,16 @@ function run_sim_1st_order_final(
     E_of_t, d;
     initial_condition::Symbol=:ground, alg=Tsit5(),
     reltol=1e-8, abstol=1e-8, tstops=Float64[],
-    compute::Symbol=:auto,
+    compute::Symbol=:auto, frame::Symbol=:lab,
 )
     M = _assert_ensemble_shapes(d)
     compute_eff = _resolve_compute(compute, M)
+    frame === :ip && (compute_eff = :cpu)
     u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
     a, Sp, Sz = _run_sim_1st_order_from_u0(
         u0, E_of_t, d;
         alg=alg, reltol=reltol, abstol=abstol, tstops=tstops,
-        save_mode=:final, compute=compute_eff,
+        save_mode=:final, compute=compute_eff, frame=frame,
     )
     return a, Sp, Sz
 end
@@ -2105,7 +2109,8 @@ function optimise_control_pulse_from_jld2(
     verbose && println("=== 5  run_reference_forward (:ground + :weak) ===")
     forward = run_reference_forward(
         ref; reltol=pipe.check_reltol, abstol=pipe.check_abstol,
-        compute=opt_kwargs.compute, verbose=verbose,
+        compute=opt_kwargs.compute,
+        frame=(hasproperty(opt_kwargs, :frame) ? opt_kwargs.frame : :lab), verbose=verbose,
     )
     reference_metrics = forward.metrics
 

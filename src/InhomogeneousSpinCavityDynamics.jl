@@ -25,6 +25,7 @@ include("state_layout_1st_order.jl")
 include("initial_conditions_1st_order.jl")
 include("rhs_1st_order.jl")
 include("rhs_1st_order_real.jl")
+include("rhs_1st_order_ip.jl")   # interaction-picture (co-rotating) RHS + rotate helpers
 include("peak_detection_helpers.jl")
 include("solver_1st_order.jl")
 

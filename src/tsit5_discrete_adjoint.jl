@@ -416,7 +416,7 @@ no error to flag the mismatch. The assertion converts that into a loud,
 immediate failure instead, and is exact-no-op on every currently-tested
 input (all real).
 """
-function _host_ode_p(d, E_of_t)
+function _host_ode_p(d, E_of_t, frame::Symbol=:lab)
     M = Int(d.M)
     all(iszero, imag.(d.delta_b)) || error(
         "_host_ode_p: d.delta_b has nonzero imaginary part(s) -- the adjoint " *
@@ -430,7 +430,8 @@ function _host_ode_p(d, E_of_t)
     )
     delta_b = collect(Float64, real.(d.delta_b))
     g_b = collect(Float64, real.(d.g_b))
-    return (Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i), delta_b, g_b, M, E_of_t)
+    base = (Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i), delta_b, g_b, M, E_of_t)
+    return frame === :ip ? (base..., :ip) : base
 end
 
 """

@@ -191,10 +191,13 @@ function _adjoint_one_track(
     initial_condition::Symbol,
     pullback!,
     reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints::Bool,
+    frame::Symbol=:lab,
 )
     M = Int(d.M)
     E_of_t = _control_plus_signal_E(pulse, u, signal_E_of_t)
-    p = _host_ode_p(d, E_of_t)
+    p = _host_ode_p(d, E_of_t, frame)
+    tfinal = Float64(d.timespan[2])
+    delta_b_r = collect(Float64, real.(d.delta_b))
     u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
     # record_full_u=!use_checkpoints: when the caller wants the checkpointed
     # reverse sweep, record_adaptive_tsit5_mesh's own memory-bounded mode
@@ -210,9 +213,17 @@ function _adjoint_one_track(
         record_full_u=!use_checkpoints,
     )
     a, Sp, Sz = unpack_state_1st_order_u(u_end, M)
+    Sp = collect(Sp)
+    Sz = collect(Sz)
+    # `mesh`/`stack` store IP-frame states when frame=:ip. Convert the final
+    # coherence to the lab frame for the metric pullback, then rotate the
+    # resulting terminal adjoint seed BACK into the IP frame (Q(t1) = P⁻¹)
+    # so the reverse sweep (frame-aware rhs_1st_order_vjp!) is consistent.
+    frame === :ip && ip_spins_to_lab!(Sp, delta_b_r, tfinal)
     nR = real_state_length_1st_order(M)
     λx = zeros(Float64, nR)
     pullback!(λx, a, Sp, Sz)
+    frame === :ip && _rotate_real_sp_block!(λx, delta_b_r, tfinal, M; sgn=-1)
     gθ = zeros(Float64, length(u))
     ws = _tsit5_adj_workspace(M)
     if use_checkpoints
@@ -228,7 +239,7 @@ function _adjoint_one_track(
     else
         reverse_tsit5_on_states!(gθ, λx, mesh.u, mesh.t, mesh.dt, p, pulse, collect(Float64, u), ws)
     end
-    return gθ, a, collect(Sp), collect(Sz), mesh, stack
+    return gθ, a, Sp, Sz, mesh, stack
 end
 
 """
@@ -251,10 +262,13 @@ function _adjoint_track_multi(
     initial_condition::Symbol,
     pullbacks,
     reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints::Bool,
+    frame::Symbol=:lab,
 )
     M = Int(d.M)
     E_of_t = _control_plus_signal_E(pulse, u, signal_E_of_t)
-    p = _host_ode_p(d, E_of_t)
+    p = _host_ode_p(d, E_of_t, frame)
+    tfinal = Float64(d.timespan[2])
+    delta_b_r = collect(Float64, real.(d.delta_b))
     u0 = build_u0_1st_order_cpu(M, d.Nj, Float64, initial_condition)
     mesh, stack, u_end = record_adaptive_tsit5_mesh(
         u0, p, d.timespan;
@@ -262,12 +276,16 @@ function _adjoint_track_multi(
         record_full_u=!use_checkpoints,
     )
     a, Sp, Sz = unpack_state_1st_order_u(u_end, M)
+    Sp = collect(Sp)
+    Sz = collect(Sz)
+    frame === :ip && ip_spins_to_lab!(Sp, delta_b_r, tfinal)   # IP mesh -> lab S⁺ for the pullbacks
     nR = real_state_length_1st_order(M)
     uθ64 = collect(Float64, u)
     grads = Vector{Vector{Float64}}(undef, length(pullbacks))
     for (i, pb!) in enumerate(pullbacks)
         λx = zeros(Float64, nR)
         pb!(λx, a, Sp, Sz)
+        frame === :ip && _rotate_real_sp_block!(λx, delta_b_r, tfinal, M; sgn=-1)  # lab seed -> IP frame
         gθ = zeros(Float64, length(u))
         ws = _tsit5_adj_workspace(M)
         if use_checkpoints
@@ -277,7 +295,7 @@ function _adjoint_track_multi(
         end
         grads[i] = gθ
     end
-    return grads, a, collect(Sp), collect(Sz)
+    return grads, a, Sp, Sz
 end
 
 """
@@ -421,6 +439,8 @@ function pulse_cost_grad_adjoint(
     signal_E_of_t = haskey(sk, :signal_E_of_t) ? sk.signal_E_of_t : _zero_drive
     reltol = haskey(sk, :reltol) ? sk.reltol : 1e-8
     abstol = haskey(sk, :abstol) ? sk.abstol : 1e-8
+    frame = haskey(sk, :frame) ? sk.frame : :lab
+    (frame === :lab || frame === :ip) || error("pulse_cost_grad_adjoint: frame must be :lab or :ip, got $(repr(frame)).")
     t_start, t_end, _, _, _ = decode(pulse, uθ)
     tstops = collect(Float64, vcat(t_start, t_end))
     if haskey(sk, :tstops)
@@ -447,6 +467,7 @@ function pulse_cost_grad_adjoint(
             gs, _, Sp, Sz = _adjoint_track_multi(
                 uθ, pulse, d, :weak, (pb_inv!, pb_sil!),
                 reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+                frame,
             )
             grad_I, grad_F = gs[1], gs[2]
             inversion = Float64(_weighted_inversion(Sz, d.g_b, d.Nj, Float64))
@@ -454,11 +475,13 @@ function pulse_cost_grad_adjoint(
             grad_I, _, _, Sz, _, _ = _adjoint_one_track(
                 uθ, pulse, d, :ground, pb_inv!,
                 reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+                frame,
             )
             inversion = Float64(_weighted_inversion(Sz, d.g_b, d.Nj, Float64))
             grad_F, _, Sp, _, _, _ = _adjoint_one_track(
                 uθ, pulse, d, :weak, pb_sil!,
                 reltol, abstol, tstops, signal_E_of_t, checkpoint_stride, use_checkpoints,
+                frame,
             )
         end
         silencing = Float64(_weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, Float64))

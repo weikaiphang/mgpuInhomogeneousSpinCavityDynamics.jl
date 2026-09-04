@@ -63,6 +63,13 @@ end
 end
 
 function rhs_1st_order!(du, u, p, t)
+    # Interaction-picture opt-in: an 8-tuple `p` whose 8th element is `:ip`
+    # routes to the co-rotating-frame RHS (rhs_1st_order_ip.jl), which stores
+    # `S̃⁺ = S⁺ e^{-iδt}` and drops the stiff `iδ·S⁺` free-precession term.
+    # For the 7-tuple `p` every other caller builds, `length(p) >= 8` folds
+    # to `false` at compile time and this line is dead-code-eliminated -- the
+    # lab-frame body below is byte-for-byte unchanged.
+    length(p) >= 8 && p[8] === :ip && return _rhs_1st_order_ip!(du, u, p, t)
     delta0, kappa_e, kappa_i, delta_b_gpu, g_b_gpu, M, E_of_t = p
 
     # `Sp`/`Sz` views (same slices as `unpack_state_1st_order_u`); the

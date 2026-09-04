@@ -369,15 +369,25 @@ function _run_sim_1st_order_from_u0(
     u0_host::AbstractVector, E_of_t, d;
     alg=Tsit5(), reltol=1e-8, abstol=1e-8, tstops=Float64[],
     save_mode::Symbol=:final, t_save=nothing, compute::Symbol=:cpu,
+    frame::Symbol=:lab,
 )
     M = _assert_ensemble_shapes(d)
     length(u0_host) == state_length_1st_order(M) || error(
         "u0 has length $(length(u0_host)), expected state_length_1st_order($M) = $(state_length_1st_order(M))."
     )
+    (frame === :lab || frame === :ip) || error("frame must be :lab or :ip, got $(repr(frame)).")
+    if frame === :ip && compute === :gpu
+        error("frame=:ip is CPU-only; pass compute=:cpu (or :auto).")
+    end
+    # u0 is applied at t=0, where S̃⁺(0) = S⁺(0): no IC change for :ip.
     u0 = _maybe_cuarray(u0_host, compute)
-    delta_b = _maybe_cuarray(collect(d.delta_b), compute)
+    delta_b_r = collect(d.delta_b)
+    delta_b = _maybe_cuarray(delta_b_r, compute)
     g_b = _maybe_cuarray(collect(d.g_b), compute)
-    p = (d.delta0, d.kappa_e, d.kappa_i, delta_b, g_b, M, E_of_t)
+    p = frame === :ip ?
+        (d.delta0, d.kappa_e, d.kappa_i, delta_b, g_b, M, E_of_t, :ip) :
+        (d.delta0, d.kappa_e, d.kappa_i, delta_b, g_b, M, E_of_t)
+    tfinal = Float64(d.timespan[2])
     sol = nothing
     try
         sol = _solve_1st_order_ode(
@@ -388,8 +398,12 @@ function _run_sim_1st_order_from_u0(
         if save_mode === :final
             u_end = Array(sol.u[end])
             a, Sp, Sz = unpack_state_1st_order_u(u_end, M)
+            Sp = collect(Sp)
+            # S̃⁺(t) -> lab S⁺(t) for every downstream observable/metric.
+            frame === :ip && ip_spins_to_lab!(Sp, delta_b_r, tfinal)
+            Sz = collect(Sz)
             _assert_state_shapes(Sp, Sz, d.Nj, M, "_run_sim_1st_order_from_u0")
-            return a, collect(Sp), collect(Sz)
+            return a, Sp, Sz
         end
         Nt = length(sol.t)
         a = Vector{eltype(sol.u[1])}(undef, Nt)
@@ -398,6 +412,8 @@ function _run_sim_1st_order_from_u0(
         @inbounds for i in 1:Nt
             ui = Array(sol.u[i])
             ai, Spi, Szi = unpack_state_1st_order_u(ui, M)
+            Spi = collect(Spi)
+            frame === :ip && ip_spins_to_lab!(Spi, delta_b_r, Float64(sol.t[i]))
             a[i] = ai
             Sp[i, :] .= Spi
             Sz[i, :] .= Szi
@@ -507,14 +523,18 @@ function run_sim_1st_order_pure(
     reltol=1e-8,
     abstol=1e-8,
     compute::Symbol=:auto,
+    frame::Symbol=:lab,
 )
     M = _assert_ensemble_shapes(d)
     length(u) == n_params(pulse) || error(
         "run_sim_1st_order_pure: u has length $(length(u)), but this CompositePulse " *
         "(k=$(pulse.k), n_coeff_A=$(pulse.n_coeff_A), n_coeff_f=$(pulse.n_coeff_f)) needs $(n_params(pulse))."
     )
+    (frame === :lab || frame === :ip) || error("frame must be :lab or :ip, got $(repr(frame)).")
     T = eltype(u)
     compute_eff = _resolve_compute(compute, M)
+    # The interaction-picture RHS is CPU-only.
+    frame === :ip && (compute_eff = :cpu)
     if compute_eff === :gpu && T <: ForwardDiff.Dual && _GPU_DUAL_OK[] === false
         compute_eff = :cpu
     end
@@ -569,7 +589,7 @@ function run_sim_1st_order_pure(
         a, Sp, Sz = _run_sim_1st_order_from_u0(
             u0, E_of_t, d;
             alg=alg, reltol=reltol, abstol=abstol, tstops=tstops,
-            save_mode=:final, compute=compute_eff,
+            save_mode=:final, compute=compute_eff, frame=frame,
         )
         if compute_eff === :gpu && T <: ForwardDiff.Dual
             _GPU_DUAL_OK[] = true
@@ -584,7 +604,7 @@ function run_sim_1st_order_pure(
             a, Sp, Sz = _run_sim_1st_order_from_u0(
                 u0, E_of_t, d;
                 alg=alg, reltol=reltol, abstol=abstol, tstops=tstops,
-                save_mode=:final, compute=:cpu,
+                save_mode=:final, compute=:cpu, frame=frame,
             )
             return a, Sp, Sz, d.Nj
         end

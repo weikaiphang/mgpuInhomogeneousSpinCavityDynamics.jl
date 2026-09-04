@@ -19,6 +19,7 @@ if !isdefined(@__MODULE__, :CompositePulse)
     include(joinpath(_SRC, "composite_pulse.jl"))
     include(joinpath(_SRC, "state_layout_1st_order.jl"))
     include(joinpath(_SRC, "rhs_1st_order.jl"))
+    include(joinpath(_SRC, "rhs_1st_order_ip.jl"))
     include(joinpath(_SRC, "pulse_optimizer2.jl"))
 end
 if !isdefined(@__MODULE__, :prepare_derived)

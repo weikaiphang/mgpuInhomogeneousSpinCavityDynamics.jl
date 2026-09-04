@@ -123,7 +123,8 @@ ignored (θ-dependence of the drive is accumulated separately from the
 cavity components of `λ`). `x`, `λ`, `x̄` are length-`2N` real vectors.
 """
 function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::AbstractVector, p, t)
-    delta0, kappa_e, kappa_i, delta_b, g_b, M, _ = p
+    delta0, kappa_e, kappa_i, delta_b, g_b, M = p[1], p[2], p[3], p[4], p[5], p[6]
+    frame = length(p) >= 8 ? p[8] : :lab
     n = real_state_length_1st_order(M)
     length(x) == length(λ) == length(x̄) == n || error(
         "rhs_1st_order_vjp!: x/λ/x̄ lengths $(length(x))/$(length(λ))/$(length(x̄)), expected $n."
@@ -134,6 +135,7 @@ function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::Abstract
     κt = kappa_e + kappa_i
     halfκ = 0.5 * κt
     δ0 = real(delta0)
+    ip = frame === :ip
 
     ar = x[1]
     ai = x[2]
@@ -155,12 +157,31 @@ function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::Abstract
         λzr = λ[_real_idx_zr(j, M)]
         # dzi/dt ≡ 0 for real g: λzi does not enter J^T.
 
+        # Interaction picture: J_ip^T = Q · J_G^T · P, where P rotates the
+        # S̃⁺ (pr,pi) block by +θ_j (=> lab S⁺, and the covector), J_G^T is
+        # the lab VJP with the iδ·S⁺ free-precession self-term dropped, and
+        # Q rotates the S̃⁺ rows of the result back by -θ_j. One sincos/bin.
+        local c::Float64, s::Float64
+        if ip
+            s, c = sincos(δj * t)
+            pr, pi_ = pr * c - pi_ * s, pr * s + pi_ * c          # P: S̃⁺ -> S⁺
+            λpr, λpi = λpr * c - λpi * s, λpr * s + λpi * c        # P: covector
+        end
+
         two_g = 2 * gj
         x̄ar += two_g * (λpr * zi - λpi * zr + λzr * pi_)
         x̄ai += two_g * (-λpr * zr - λpi * zi + λzr * pr)
 
-        x̄[_real_idx_pr(j, M)] = -gj * λai + δj * λpi + two_g * ai * λzr
-        x̄[_real_idx_pi(j, M)] = -gj * λar - δj * λpr + two_g * ar * λzr
+        if ip
+            gpr = -gj * λai + two_g * ai * λzr
+            gpi = -gj * λar + two_g * ar * λzr
+            x̄[_real_idx_pr(j, M)] = gpr * c + gpi * s             # Q: rotate S̃⁺ rows by -θ_j
+            x̄[_real_idx_pi(j, M)] = -gpr * s + gpi * c
+        else
+            # lab: unchanged term order (bit-identical to the pre-IP version)
+            x̄[_real_idx_pr(j, M)] = -gj * λai + δj * λpi + two_g * ai * λzr
+            x̄[_real_idx_pi(j, M)] = -gj * λar - δj * λpr + two_g * ar * λzr
+        end
         x̄[_real_idx_zr(j, M)] = -two_g * ai * λpr - two_g * ar * λpi
         x̄[_real_idx_zi(j, M)] = two_g * ar * λpr - two_g * ai * λpi
     end
