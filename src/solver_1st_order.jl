@@ -2,6 +2,13 @@
 # MAIN RUN FUNCTION FOR FIRST-ORDER SIMULATION
 # ============================================================
 
+# Backend trait for `rhs_1st_order!`'s cavity-source reduction. The host
+# fallback (`_is_gpu(::AbstractArray) = false`) lives in `rhs_1st_order.jl`
+# so the CUDA-free test harness compiles; this `true` method is only in
+# scope as part of the full module. Covers `CuArray` and its `SubArray` /
+# `reshape` wrappers (`Sp` is a `SubArray` of the state `CuArray`).
+_is_gpu(::CUDA.AnyCuArray) = true
+
 function run_sim_1st_order(
     SIM_SETTING,
     SYSTEM_CONFIG,
@@ -333,18 +340,26 @@ function run_sim_1st_order(
 
     t0 = time_ns()
 
-    sol_gpu = CUDA.allowscalar() do
-        solve(
-            prob_gpu,
-            Tsit5();
-            reltol = CONFIG.reltol,
-            abstol = CONFIG.abstol,
-            callback = cb,
-            save_on = false,
-            save_everystep = false,
-            dense = false,
-        )
-    end
+    # No `CUDA.allowscalar()` wrapper: `rhs_1st_order!` no longer scalar-
+    # indexes the state (`u[1]` / `du[1]` are 1-element views/broadcasts)
+    # and keeps the collective-source reduction on-device; the callback
+    # only does whole-array reductions, strided gathers and `Array(view)`
+    # copies -- none of which is a scalar index. Any scalar index that
+    # slips back in MUST fail loudly rather than silently resyncing every
+    # RK stage. Set explicitly here (not just relying on noise.jl's
+    # load-time call). Guarded by scripts/rose_reference_harness.jl.
+    CUDA.allowscalar(false)
+
+    sol_gpu = solve(
+        prob_gpu,
+        Tsit5();
+        reltol = CONFIG.reltol,
+        abstol = CONFIG.abstol,
+        callback = cb,
+        save_on = false,
+        save_everystep = false,
+        dense = false,
+    )
 
     CUDA.synchronize()
 
