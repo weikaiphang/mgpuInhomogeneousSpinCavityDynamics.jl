@@ -25,6 +25,7 @@ if !isdefined(@__MODULE__, :prepare_derived)
     include(joinpath(_SRC, "frequency_inhomogeneity.jl"))
     include(joinpath(_SRC, "coupling_inhomogeneity.jl"))
     include(joinpath(_SRC, "ensemble.jl"))
+    include(joinpath(_SRC, "ensemble_quadrature.jl"))
 end
 if !isdefined(@__MODULE__, :load_jld2_reference)
     include(joinpath(_SRC, "jld2_pulse_loader.jl"))
@@ -299,6 +300,7 @@ function e2e_opt_kwargs()
         n_hops=1,
         patience=1,
         compute=:cpu,
+        ensemble_method=:histogram,   # plumbing test: pin the original bins
         threaded_grad=false,
         anneal_direct_weights=false,
         reltol=1e-6,

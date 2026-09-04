@@ -91,6 +91,10 @@ function frozen_case(; outdir)
         simulation_order  = :order1,
         M_delta           = M_delta,
         M_g               = M_g,
+        # Frozen bit-identity gate: pin the equal-width histogram ensemble so
+        # the auto quadrature selector (ensemble_quadrature.jl) never changes
+        # this reference trajectory. Drop this line to exercise :auto.
+        ensemble_method   = :histogram,
         initial_condition = :ground,
         Ttotal            = Ttotal_us * 1e-6,
         Nt_save           = Nt_save,

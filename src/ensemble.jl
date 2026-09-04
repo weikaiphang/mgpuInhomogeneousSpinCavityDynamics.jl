@@ -63,7 +63,103 @@ function build_2d_bins(N, delta_b_1d, p_delta, g_b_1d, p_g)
 end
 
 
-function prepare_derived(CONFIG)
+# ============================================================
+# ENSEMBLE-METHOD SELECTOR  (auto quadrature vs equal-width histogram)
+#
+# These three helpers live here (not in ensemble_quadrature.jl) so the
+# histogram path of prepare_derived has NO cross-file dependency -- a
+# partial-include harness that loads only ensemble.jl still gets the
+# unchanged histogram behaviour. Only the :quadrature branch reaches into
+# ensemble_quadrature.jl.
+# ============================================================
+
+"""
+    ensemble_method_for(freq_cfg, g_cfg) -> NamedTuple
+
+Parse the two distribution configs and name the measure-matched quadrature
+rule per ensemble axis. `method` is `:quadrature` when BOTH axes have a
+spectral rule, else `:histogram` (`reason` set). `freq_rule` / `g_rule`
+are `nothing` on the axis that has no rule.
+
+  freq :lorentzian -> :tan_gauss_legendre    g :constant   -> :single_node
+       :gaussian   -> :gauss_legendre_pdf      :gaussian   -> :gauss_legendre_pdf
+                                               :powerlaw_g -> :log_gauss_legendre
+"""
+function ensemble_method_for(freq_cfg, g_cfg)
+    fk = hasproperty(freq_cfg, :kind) ? freq_cfg.kind : :unknown
+    gk = hasproperty(g_cfg, :kind)    ? g_cfg.kind    : :unknown
+    freq_rule = fk === :lorentzian ? :tan_gauss_legendre :
+                fk === :gaussian   ? :gauss_legendre_pdf  : nothing
+    g_rule = gk === :constant   ? :single_node        :
+             gk === :gaussian   ? :gauss_legendre_pdf  :
+             gk === :powerlaw_g ? :log_gauss_legendre  : nothing
+    ok = (freq_rule !== nothing) && (g_rule !== nothing)
+    reason = ok ? "" :
+        freq_rule === nothing ? "freq_inhomogeneity.kind=$fk has no quadrature rule" :
+                                "g_inhomogeneity.kind=$gk has no quadrature rule"
+    return (; method = ok ? :quadrature : :histogram,
+              freq_kind = fk, freq_rule = freq_rule,
+              g_kind = gk, g_rule = g_rule, reason = reason)
+end
+
+"""
+    resolve_ensemble_method(CONFIG, want::Symbol = :config) -> NamedTuple
+
+`want`: `:config` (read `CONFIG.ensemble_method`, default `:histogram`),
+`:histogram`, `:quadrature`, or `:auto`. Same NamedTuple shape as
+[`ensemble_method_for`](@ref) with a concrete `method`. `:quadrature`
+errors if the configs are not quadrature-representable; `:auto` silently
+falls back to `:histogram`.
+"""
+function resolve_ensemble_method(CONFIG, want::Symbol = :config)
+    if want === :config
+        want = hasproperty(CONFIG, :ensemble_method) ? Symbol(CONFIG.ensemble_method) : :histogram
+    end
+    want in (:histogram, :quadrature, :auto) ||
+        error("ensemble_method must be :histogram, :quadrature, or :auto; got :$want")
+
+    want === :histogram && return (; method = :histogram,
+        freq_kind = CONFIG.freq_inhomogeneity.kind, freq_rule = nothing,
+        g_kind = CONFIG.g_inhomogeneity.kind, g_rule = nothing, reason = "forced")
+
+    plan = ensemble_method_for(CONFIG.freq_inhomogeneity, CONFIG.g_inhomogeneity)
+    if want === :quadrature && plan.method !== :quadrature
+        error("ensemble_method=:quadrature requested but $(plan.reason); " *
+              "use :histogram or :auto (which falls back).")
+    end
+    return plan
+end
+
+function _log_ensemble_choice(plan, M_delta_req, M_g_req, M_delta, M_g, M)
+    if plan.method === :quadrature
+        println("[ensemble] method = QUADRATURE  " *
+                "(freq $(plan.freq_kind) -> $(plan.freq_rule),  g $(plan.g_kind) -> $(plan.g_rule))")
+        println("[ensemble] discretisation: M_delta x M_g = $M_delta x $M_g  (M = $M)" *
+                ((M_delta_req == M_delta && M_g_req == M_g) ? "" :
+                 "   [requested $M_delta_req x $M_g_req]"))
+    else
+        println("[ensemble] method = HISTOGRAM" *
+                (isempty(plan.reason) ? "" : "  ($(plan.reason))"))
+        println("[ensemble] discretisation: M_delta x M_g = $M_delta x $M_g  (M = $M)")
+    end
+    return nothing
+end
+
+# `ensemble_method`:
+#   :config     -- read CONFIG.ensemble_method (default :histogram for a bare call)
+#   :histogram  -- original equal-width bins (this body, unchanged)
+#   :quadrature -- Gauss quadrature nodes (prepare_derived_quadrature, ensemble_quadrature.jl)
+#   :auto       -- pick :quadrature when the line shapes have a spectral rule, else :histogram
+# The :histogram path below is byte-for-byte identical to before this hook.
+function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
+    _ens_plan = resolve_ensemble_method(CONFIG, ensemble_method)
+    if _ens_plan.method === :quadrature
+        @isdefined(prepare_derived_quadrature) || error(
+            "prepare_derived: ensemble_method resolved to :quadrature but " *
+            "ensemble_quadrature.jl is not loaded -- include it next to ensemble.jl.")
+        return prepare_derived_quadrature(CONFIG; plan = _ens_plan)
+    end
+
     C_ens   = CONFIG.C_ens
     M_delta = CONFIG.M_delta
     M_g     = CONFIG.M_g
@@ -158,6 +254,8 @@ function prepare_derived(CONFIG)
 
     Nt = length(t_save)
 
+    _log_ensemble_choice(_ens_plan, M_delta, M_g, M_delta, M_g, M)
+
     return (
         C_ens = C_ens,
 
@@ -202,5 +300,7 @@ function prepare_derived(CONFIG)
         timespan = timespan,
         t_save = t_save,
         Nt = Nt,
+
+        ensemble_method = :histogram,
     )
 end

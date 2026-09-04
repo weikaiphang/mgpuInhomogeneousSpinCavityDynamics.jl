@@ -18,6 +18,7 @@ include("frequency_inhomogeneity.jl")
 include("coupling_inhomogeneity.jl")
 include("pulses.jl")
 include("ensemble.jl")
+include("ensemble_quadrature.jl")  # Gauss-quadrature ensemble + auto selector (segregated)
 
 # 1st-order simulation
 include("state_layout_1st_order.jl")
@@ -102,6 +103,7 @@ export plot_E_of_t
 
 # Differentiable composite pi-pulse optimisation exports
 export build_full_config, prepare_derived  # needed to build the `d` argument below
+export prepare_derived_quadrature, ensemble_method_for, resolve_ensemble_method
 export make_clamped_knots, bspline_basis, bspline_eval, bspline_area, bspline_antiderivative
 export CompositePulse, n_params, decode, initial_guess, total_area, pulse_duration
 export points_per_segment_for_budget

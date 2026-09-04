@@ -902,6 +902,9 @@ function jld2_pipeline_defaults()
         check_abstol=nothing,
         fit_seed_from_file=true,
         fit_N=nothing,
+        ensemble_method=:auto,     # :auto | :quadrature | :histogram  (auto quadrature selector)
+        ensemble_M_delta=nothing,  # quadrature δ node count (default: recorded M_delta)
+        ensemble_M_g=nothing,      # quadrature g node count (default: recorded M_g)
         param_budget=60,
         save_log=true,
         log_out_dir=nothing,
@@ -1221,6 +1224,11 @@ function load_jld2_reference(
     use_signal::Bool=jld2_pipeline_defaults().use_signal,
     use_interior::Bool=jld2_pipeline_defaults().use_interior,
     fit_N::Union{Nothing,Integer}=jld2_pipeline_defaults().fit_N,
+    # Bare calls default to the original bins; the full pipeline
+    # (optimise_control_pulse_from_jld2) passes :auto via jld2_pipeline_defaults().
+    ensemble_method::Symbol=:histogram,
+    ensemble_M_delta::Union{Nothing,Integer}=nothing,
+    ensemble_M_g::Union{Nothing,Integer}=nothing,
     verbose::Bool=true,
 )
     jld2_path, pulsemat_path = _resolve_run_paths(path)
@@ -1232,7 +1240,19 @@ function load_jld2_reference(
     hasproperty(data.SIM_SETTING, :reltol) || error("$jld2_path SIM_SETTING has no reltol.")
     hasproperty(data.SIM_SETTING, :abstol) || error("$jld2_path SIM_SETTING has no abstol.")
     CONFIG = build_full_config(data.SIM_SETTING, data.SYSTEM_CONFIG)
+    # The auto quadrature selector runs here (early): the recorded SIM_SETTING
+    # rarely pins an `ensemble_method`, so the whole optimisation pipeline
+    # (reference forward + every optimiser forward/gradient run on this `d`)
+    # inherits the choice. Pass ensemble_method=:histogram to force old bins.
+    hasproperty(CONFIG, :ensemble_method) ||
+        (CONFIG = merge(CONFIG, (ensemble_method = ensemble_method,)))
+    ensemble_M_delta === nothing || hasproperty(CONFIG, :ensemble_M_delta) ||
+        (CONFIG = merge(CONFIG, (ensemble_M_delta = Int(ensemble_M_delta),)))
+    ensemble_M_g === nothing || hasproperty(CONFIG, :ensemble_M_g) ||
+        (CONFIG = merge(CONFIG, (ensemble_M_g = Int(ensemble_M_g),)))
     d = prepare_derived(CONFIG)
+    verbose && println("[jld2] ensemble for the optimisation pipeline: " *
+                       "method=$(d.ensemble_method)  M=$(d.M) (M_delta=$(length(d.delta_b_1d)) x M_g=$(length(d.g_b_1d)))")
 
     pc_present = hasproperty(data, :PULSE_CONFIG) && data.PULSE_CONFIG !== nothing
     parse_result = try_parse_pulse_config(data; n_signal=n_signal, d=d)
@@ -1962,7 +1982,23 @@ function save_optimisation_run_log(
     final_coherence = _weighted_coherence(Sp1_eq, d.g_b, Nj1_eq, d.delta_b, Float64)
     final_weak_seed_retention = _weak_seed_retention(Sp1_eq, d.g_b, Nj1_eq, d.delta_b, Float64)
 
-    full_settings = merge((n_signal=n_signal, USE_SIGNAL=use_signal), optimizer_settings)
+    # Record which ensemble discretisation every forward/gradient run in this
+    # optimisation used (auto quadrature selector, see ensemble_quadrature.jl).
+    _ens_plan = try
+        ensemble_method_for(d.freq_inhomogeneity, d.g_inhomogeneity)
+    catch
+        (; freq_rule=nothing, g_rule=nothing)
+    end
+    ensemble_settings = (
+        ensemble_method = hasproperty(d, :ensemble_method) ? d.ensemble_method : :histogram,
+        ensemble_M_delta = length(d.delta_b_1d),
+        ensemble_M_g = length(d.g_b_1d),
+        ensemble_M = Int(d.M),
+        ensemble_freq_rule = _ens_plan.freq_rule,
+        ensemble_g_rule = _ens_plan.g_rule,
+    )
+    full_settings = merge((n_signal=n_signal, USE_SIGNAL=use_signal),
+                          ensemble_settings, optimizer_settings)
 
     run_log = (
         source_path=path, n_signal=n_signal, use_signal=use_signal,
@@ -2057,7 +2093,10 @@ function optimise_control_pulse_from_jld2(
     verbose && println("=== 1–4  load_jld2_reference ===")
     ref = load_jld2_reference(
         path; n_signal=pipe.n_signal, use_signal=pipe.use_signal,
-        use_interior=pipe.use_interior, fit_N=pipe.fit_N, verbose=verbose,
+        use_interior=pipe.use_interior, fit_N=pipe.fit_N,
+        ensemble_method=pipe.ensemble_method,
+        ensemble_M_delta=pipe.ensemble_M_delta, ensemble_M_g=pipe.ensemble_M_g,
+        verbose=verbose,
     )
     data = ref.data
     d = ref.d
