@@ -1,31 +1,40 @@
+# Public API: src/chimera/ (SIM_SETTING / run_simulation / mgpu).
+# Pulse optimizer and datagen leftovers call that API. No nude-quad shims.
 module InhomogeneousSpinCavityDynamics
 
 using CUDA
 using DiffEqCallbacks
 using DifferentialEquations
 using Distributions
+using FastGaussQuadrature
 using ForwardDiff
 using JLD2
 using LinearAlgebra
+using OrdinaryDiffEq
 using Plots
 using Printf
 using QuadGK
 using Random
 
-include("config.jl")
-include("frequency_inhomogeneity.jl")
-include("coupling_inhomogeneity.jl")
-include("pulses.jl")
-include("ensemble.jl")
-include("ensemble_quadrature.jl")
+using QuantumCumulants
+using SecondQuantizedAlgebra
 
-include("state_layout_1st_order.jl")
-include("initial_conditions_1st_order.jl")
-include("rhs_1st_order.jl")
-include("rhs_1st_order_real.jl")
-include("rhs_1st_order_ip.jl")
-include("peak_detection_helpers.jl")
-include("solver_1st_order.jl")
+const HAVE_NCCL = try
+    @eval using NCCL
+    true
+catch
+    false
+end
+
+include("chimera/packages.jl")
+
+# QRT postprocessor: Jacobian of the QuantumCumulants / factorized 1st-order
+# Tavis–Cummings EOMs, not a linearization of the 2nd-order cumulant RHS.
+const QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian
+
+include("config.jl")
+include("pulses.jl")
+include("chimera/include_all.jl")
 
 include("bspline.jl")
 include("composite_pulse.jl")
@@ -39,40 +48,23 @@ include("jld2_pulse_loader.jl")
 include("composite_arp_pulses.jl")
 include("pulse_report.jl")
 
-include("state_layout_2nd_order.jl")
-include("initial_conditions_2nd_order.jl")
-include("rhs_2nd_order.jl")
-include("solver_2nd_order.jl")
-
-include("MGPUlayout.jl")
-include("MGPUdevices.jl")
-include("MGPUkernels.jl")
-include("MGPUtableaus.jl")
-include("MGPUproblem.jl")
-include("MGPUintegrator.jl")
-include("MGPUinitial_conditions.jl")
-include("MGPUobservables.jl")
-include("MGPUstate_io.jl")
-include("MGPUrhs_cpu.jl")
-
-include("noise.jl")
 include("correlations.jl")
-
-include("simulation_api.jl")
-include("MGPUsolver.jl")
 
 export run_simulation
 export run_sim_1st_order
 export run_sim_2nd_order
+export product_SmSp_same, product_SzSz_same, product_SpSp_same, product_SzSp_same
+export product_state_samebin, build_u0_2nd_order
 
 export mgpu_run_simulation
 export mgpu_run_sim_2nd_order
 export assemble_problem
+export choose_rowsum_exchange, assemble_rowsums!
+export assemble_rowsums_nccl!, assemble_rowsums_p2p!, assemble_rowsums_host!
 export free_shards!
 export set_initial_condition!
 export scatter_state!, gather_state
-export rhs!, rhs_cpu!
-export solve_mgpu!
+export rhs_cpu!, rhs_2nd_order_sharded!, rhs_2nd_order_mgpu!
 export memory_report, max_bins, EnsemblePartition
 export SolverOptions, ObservableStore
 
@@ -84,6 +76,14 @@ export plot_E_of_t
 
 export build_full_config, prepare_derived
 export prepare_derived_quadrature, ensemble_method_for, resolve_ensemble_method
+export truncation_cooperativity, maybe_print_truncation_cooperativity
+export QRT_CLOSURE_LEVEL
+export CHIMERA_HAMILTONIAN, chimera_hamiltonian_symbols
+export fgq_gausslegendre
+export derive_tc_meanfield, qc_algebra_selftest
+export compare_qc_to_closure_1st, solve_qc_sciml_1st_M1
+export factorized_first_order_jacobian_action!
+export chimera_solve, chimera_ode_problem, CHIMERA_INTEGRATOR
 export make_clamped_knots, bspline_basis, bspline_eval, bspline_area, bspline_antiderivative
 export CompositePulse, n_params, decode, initial_guess, total_area, pulse_duration
 export points_per_segment_for_budget
