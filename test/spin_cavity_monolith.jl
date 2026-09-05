@@ -354,11 +354,8 @@ end
     @test M._canon_mode(:order2_bspline) === :order2_bspline
     @test M._canon_mode(Symbol("order2-bspline")) === :order2_bspline
     settings = M.load_settings(joinpath(@__DIR__, "..", "examples", "monolith_order2.jl"))
-    buf = IOBuffer()
-    prep = redirect_stdout(buf) do
-        M.prepare(settings; ensemble_method=:auto)
-    end
-    printed = String(take!(buf))
+    prep = M.prepare(settings; ensemble_method=:auto)
+    printed = sprint(io -> M.summarize_cooperativity(prep.d, io))
     @test occursin("C_ens", printed)
     @test occursin("C_eff", printed)
     @test occursin("Σp_g", printed)

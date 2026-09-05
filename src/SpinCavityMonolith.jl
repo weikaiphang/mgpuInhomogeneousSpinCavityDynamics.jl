@@ -3342,15 +3342,15 @@ end
 # prepare / mode output: always print both C_ens and C_eff.
 # C_eff = C_ens × Σp_δ × Σp_g. g-mass (Σp_g) matters when coupling is truncated.
 # renormalize=false does not silently restore full C_ens.
-function summarize_cooperativity(d)
-    println("C_ens            : ", d.C_ens, "  (requested; sets analytic N)")
-    println("C_eff            : ", d.C_eff, "  (= C_ens × Σp_δ × Σp_g; simulated OD)")
+function summarize_cooperativity(d, io::IO=stdout)
+    println(io, "C_ens            : ", d.C_ens, "  (requested; sets analytic N)")
+    println(io, "C_eff            : ", d.C_eff, "  (= C_ens × Σp_δ × Σp_g; simulated OD)")
     gnote = d.p_g_mass < 1 - 1e-12 ? "  (g-mass truncated; included in C_eff)" : ""
-    println("Σp_δ (freq mass) : ", d.p_delta_mass)
-    println("Σp_g (g mass)    : ", d.p_g_mass, gnote)
-    println("Σp               : ", d.p_mass)
-    println("N analytic/N_tot : ", d.N, " / ", d.N_total)
-    println("√g2_avg          : ", d.g_rms, "  (amp_scale ∝ 1/√g2_avg; ⟨g⟩=", d.g_mean, ")")
+    println(io, "Σp_δ (freq mass) : ", d.p_delta_mass)
+    println(io, "Σp_g (g mass)    : ", d.p_g_mass, gnote)
+    println(io, "Σp               : ", d.p_mass)
+    println(io, "N analytic/N_tot : ", d.N, " / ", d.N_total)
+    println(io, "√g2_avg          : ", d.g_rms, "  (amp_scale ∝ 1/√g2_avg; ⟨g⟩=", d.g_mean, ")")
     return nothing
 end
 
