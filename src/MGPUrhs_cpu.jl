@@ -6,8 +6,9 @@ using Base.Threads: @threads, nthreads
 #   ∂t S⁺ = iΔ S⁺ − 2i g ⟨a† Sᶻ⟩
 #   ∂t Sᶻ = −i g ⟨a S⁺⟩ + i g ⟨a† S⁻⟩
 # No spin T₁/T₂ on this RHS.
-# threaded=nothing → auto (nthreads()>1 && M≥16). Same math as serial.
-const _RHS_CPU_THREAD_MIN_M = 16
+# threaded=nothing → auto (nthreads()>1 && M≥256). Same math as serial.
+# Below that, thread-pool overhead dominates the O(M²) kernel on this host.
+const _RHS_CPU_THREAD_MIN_M = 256
 
 @inline function _rhs_cpu_use_threads(threaded, M)
     want = threaded === nothing ? M >= _RHS_CPU_THREAD_MIN_M : threaded

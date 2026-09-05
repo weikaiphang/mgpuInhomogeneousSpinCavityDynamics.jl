@@ -357,7 +357,8 @@ end
 end
 
 @testset "rhs_cpu! serial ↔ threaded; full-du vs mulpath; no-alloc" begin
-    M = 20
+    M = 20  # below auto-thread cutoff; force both modes
+    @test _RHS_CPU_THREAD_MIN_M == 256
     u = _dirty_random_u(M; seed=4, dirty_diag=true)
     delta_b = Float64[0.1 * (j - 10) for j in 1:M]
     g_b = Float64[0.8 + 0.02 * j for j in 1:M]
