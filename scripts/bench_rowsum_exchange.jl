@@ -2,7 +2,7 @@
 # Structural argument (always valid): the production RHS no longer copies the
 # 3M complex row-sum through a pinned host buffer when NCCL or P2P is used.
 # See exchange_rowsums_nccl! / exchange_rowsums_p2p! / exchange_rowsums_host!
-# in src/MGPUproblem.jl.
+# in src/chimera/mgpu/problem.jl.
 
 using CUDA
 using Printf

@@ -41,11 +41,23 @@ end
     @test isfile(joinpath(root, "chimera", "eoms", "closure_2nd.jl"))
     @test isfile(joinpath(root, "chimera", "integrate", "sciml.jl"))
     @test isfile(joinpath(root, "chimera", "mgpu", "solver.jl"))
-    @test isfile(joinpath(root, "legacy", "sim_2nd_multi_gpu_opt.jl"))
-    shim = read(joinpath(root, "rhs_2nd_order.jl"), String)
-    @test occursin("Shim only", shim)
-    @test occursin("chimera/eoms/closure_2nd.jl", shim)
-    @test !occursin("function rhs_2nd_order!", shim)
+    @test isfile(joinpath(root, "chimera", "api.jl"))
+    @test !isdir(joinpath(root, "legacy"))
+    for gone in (
+        "rhs_1st_order.jl", "rhs_1st_order_real.jl", "rhs_1st_order_ip.jl",
+        "rhs_2nd_order.jl", "solver_1st_order.jl", "solver_2nd_order.jl",
+        "state_layout_1st_order.jl", "state_layout_2nd_order.jl",
+        "initial_conditions_1st_order.jl", "initial_conditions_2nd_order.jl",
+        "frequency_inhomogeneity.jl", "coupling_inhomogeneity.jl",
+        "ensemble.jl", "ensemble_quadrature.jl", "simulation_api.jl",
+        "noise.jl", "MGPUlayout.jl", "MGPUrhs_cpu.jl", "MGPUproblem.jl",
+        "MGPUkernels.jl", "MGPUintegrator.jl", "MGPUtableaus.jl",
+        "MGPUdevices.jl", "MGPUobservables.jl", "MGPUinitial_conditions.jl",
+        "MGPUstate_io.jl", "MGPUsolver.jl",
+        "accel_solver_1st_order.jl", "sim_2nd_multi_gpu_opt.jl",
+    )
+        @test !isfile(joinpath(root, gone))
+    end
     @test CHIMERA_HAMILTONIAN.name === :driven_lossy_tavis_cummings
     @test CHIMERA_INTEGRATOR === :sciml_ordinarydiffeq
 end

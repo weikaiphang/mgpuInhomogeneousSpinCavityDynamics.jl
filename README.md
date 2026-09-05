@@ -5,8 +5,10 @@ inhomogeneous spin-½ ensemble (Tavis–Cummings / Dicke-type), closed at
 first- and second-order cumulants.
 
 **This `chimera` tree is a package-first rebuild**, not a polished
-nude-quad monolith. Production code lives in `src/chimera/`. Established
-packages own each layer:
+nude-quad monolith. Production dynamics live in `src/chimera/`. The
+package entry includes chimera only (plus pulse/datagen leftovers).
+There is no `src/legacy/` and no parallel nude-quad implementation.
+Established packages own each layer:
 
 | Layer | Owner |
 | --- | --- |
@@ -39,7 +41,8 @@ There is **no Volkov–Zon** solver.
 * Lorentzian \(N = C_\mathrm{ens}\,\kappa\,\mathrm{FWHM}/(4\langle g^2\rangle)\); Gaussian peak-matched with \(\sqrt{\pi\ln 2}\)
 * `renormalize` defaults to `false` on frequency bins
 * `QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian` (same EOMs as QuantumCumulants order-1, not the 2nd-order Jacobian)
-* Production multi-GPU is `src/chimera/mgpu`. `src/legacy/sim_2nd_multi_gpu_opt.jl` is quarantined
+* Production multi-GPU is `src/chimera/mgpu` (NCCL Allreduce). The old
+  nude-quad multi-GPU scripts are deleted, not quarantined.
 
 ## Installation
 

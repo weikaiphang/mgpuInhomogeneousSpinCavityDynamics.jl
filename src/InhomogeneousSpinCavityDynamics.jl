@@ -1,3 +1,5 @@
+# Public API: src/chimera/ (SIM_SETTING / run_simulation / mgpu).
+# Pulse optimizer and datagen leftovers call that API. No nude-quad shims.
 module InhomogeneousSpinCavityDynamics
 
 using CUDA

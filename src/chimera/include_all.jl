@@ -1,4 +1,4 @@
-# Chimera production include graph. Nude-quad filenames are shims only.
+# Chimera production include graph. Public dynamics API lives here.
 
 include("frequency.jl")
 include("coupling.jl")
