@@ -1,6 +1,3 @@
-# ============================================================
-# OPTIONAL PEAK-DETECTION HELPERS
-# ============================================================
 
 optional_property(x, name::Symbol, default=nothing) =
     hasproperty(x, name) ? getproperty(x, name) : default

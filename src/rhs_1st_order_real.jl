@@ -1,21 +1,3 @@
-# ============================================================
-# Real isomorphic split of the 1st-order mean-field state, and the
-# Jacobian-transpose (VJP) of rhs_1st_order! as an R^{2N} → R^{2N} map.
-#
-# Layout (N = 1+2M complex = a, Sp[1:M], Sz[1:M]):
-#   x = [Re(a), Im(a), Re(Sp)..., Im(Sp)..., Re(Sz)..., Im(Sz)...]
-# length 2N = 2+4M. This matches the stored Complex state, including
-# Im(Sz), which the Complex layout carries even though dSz is real for
-# real g. Do NOT drop Im(Sz) here — that would be a different map than
-# the production RHS.
-#
-# rhs_1st_order_real! is a pack/call/unpack wrapper around the unmodified
-# rhs_1st_order!, so F_x is algebraically the production vector field.
-# rhs_1st_order_vjp! is the analytic J_x^T (real g, real detunings — the
-# ensemble's g_b/delta_b). It is verified against ForwardDiff of F_x on
-# the toy ensemble; it is NOT used to replace rhs_1st_order! on the
-# forward solve.
-# ============================================================
 
 real_state_length_1st_order(M::Integer) = 2 * state_length_1st_order(M)
 
@@ -91,14 +73,7 @@ function complex_to_real!(x::AbstractVector, u::AbstractVector, M::Integer)
     return pack_state_real!(x, u, M)
 end
 
-"""
-    rhs_1st_order_real!(dx, x, p, t)
 
-Real-split image of `rhs_1st_order!`: unpack `x` → complex `u`, call the
-production RHS, pack `du` → `dx`. `p` is the same 7-tuple the complex
-RHS uses. Allocates a pair of complex work vectors (used in tests and
-the algebraic identity, not on the adjoint hot path).
-"""
 function rhs_1st_order_real!(dx, x, p, t)
     M = p[6]
     N = state_length_1st_order(M)
@@ -114,14 +89,7 @@ function rhs_1st_order_real!(dx, x, p, t)
     return nothing
 end
 
-"""
-    rhs_1st_order_vjp!(x̄, λ, x, p, t)
 
-`x̄ = J_x(x,t)^T λ` for the real-split production RHS, with real `g_b`
-and real `delta_b` (the ensemble). `p` is the same 7-tuple; `E_of_t` is
-ignored (θ-dependence of the drive is accumulated separately from the
-cavity components of `λ`). `x`, `λ`, `x̄` are length-`2N` real vectors.
-"""
 function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::AbstractVector, p, t)
     delta0, kappa_e, kappa_i, delta_b, g_b, M = p[1], p[2], p[3], p[4], p[5], p[6]
     frame = length(p) >= 8 ? p[8] : :lab
@@ -155,17 +123,17 @@ function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::Abstract
         λpr = λ[_real_idx_pr(j, M)]
         λpi = λ[_real_idx_pi(j, M)]
         λzr = λ[_real_idx_zr(j, M)]
-        # dzi/dt ≡ 0 for real g: λzi does not enter J^T.
 
-        # Interaction picture: J_ip^T = Q · J_G^T · P, where P rotates the
-        # S̃⁺ (pr,pi) block by +θ_j (=> lab S⁺, and the covector), J_G^T is
-        # the lab VJP with the iδ·S⁺ free-precession self-term dropped, and
-        # Q rotates the S̃⁺ rows of the result back by -θ_j. One sincos/bin.
+
+
+
+
+
         local c::Float64, s::Float64
         if ip
             s, c = sincos(δj * t)
-            pr, pi_ = pr * c - pi_ * s, pr * s + pi_ * c          # P: S̃⁺ -> S⁺
-            λpr, λpi = λpr * c - λpi * s, λpr * s + λpi * c        # P: covector
+            pr, pi_ = pr * c - pi_ * s, pr * s + pi_ * c
+            λpr, λpi = λpr * c - λpi * s, λpr * s + λpi * c
         end
 
         two_g = 2 * gj
@@ -175,10 +143,10 @@ function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::Abstract
         if ip
             gpr = -gj * λai + two_g * ai * λzr
             gpi = -gj * λar + two_g * ar * λzr
-            x̄[_real_idx_pr(j, M)] = gpr * c + gpi * s             # Q: rotate S̃⁺ rows by -θ_j
+            x̄[_real_idx_pr(j, M)] = gpr * c + gpi * s
             x̄[_real_idx_pi(j, M)] = -gpr * s + gpi * c
         else
-            # lab: unchanged term order (bit-identical to the pre-IP version)
+
             x̄[_real_idx_pr(j, M)] = -gj * λai + δj * λpi + two_g * ai * λzr
             x̄[_real_idx_pi(j, M)] = -gj * λar - δj * λpr + two_g * ar * λzr
         end

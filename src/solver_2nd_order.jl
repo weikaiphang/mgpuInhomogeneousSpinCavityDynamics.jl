@@ -1,6 +1,3 @@
-# ============================================================
-# MAIN RUN FUNCTION FOR SECOND-ORDER SIMULATION
-# ============================================================
 
 function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=true)
     CONFIG = build_full_config(SIM_SETTING, SYSTEM_CONFIG)
@@ -41,9 +38,9 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     cb = nothing
 
     try
-    # --------------------------------------------------------
-    # Save arrays
-    # --------------------------------------------------------
+
+
+
 
     a_save    = Vector{ComplexF64}(undef, Nt)
     adad_save = Vector{ComplexF64}(undef, Nt)
@@ -106,9 +103,9 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
     println("Time taken: $elapsed_seconds seconds")
 
-    # --------------------------------------------------------
-    # Post-process
-    # --------------------------------------------------------
+
+
+
 
     t_saved = d.t_save
 

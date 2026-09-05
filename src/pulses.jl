@@ -1,6 +1,3 @@
-# ============================================================
-# PULSE CONSTRUCTORS
-# ============================================================
 
 function gaussian_drive(; t0, sigma, amp, omega=0.0, phase=0.0)
     t0_f    = Float64(t0)
@@ -111,16 +108,7 @@ function build_E_of_t(PULSE_CONFIG)
     end
 end
 
-"""
-Samples E_of_t at `N` evenly spaced points over `[0, t_end]` and returns
-`(Re[E(t)], Im[E(t)])` as two vectors, unchanged from before.
 
-If `savepath` is given, the same samples are additionally written to
-`savepath` as an (N, 2) matrix `[Re[E(t)] Im[E(t)]]` -- one row per sample,
-in sampling order -- via a plain, dependency-free CSV (see `save_E_samples`),
-directly readable from Python. The total pulse length `t_end` is recorded
-in the file too (see `save_E_samples` for the exact format/read pattern).
-"""
 function sample_E_of_t(E_of_t, t_end, N=10000; savepath=nothing)
     t_points = range(0.0, t_end; length=N)
     Et = ComplexF64[E_of_t(t) for t in t_points]
@@ -134,35 +122,7 @@ function sample_E_of_t(E_of_t, t_end, N=10000; savepath=nothing)
     return Ex, Ep
 end
 
-"""
-Writes an (N, 2) matrix `[Re[E(t)] Im[E(t)]]` (as produced by
-`sample_E_of_t`) to `path` as a plain CSV -- no Julia-specific type tags
-(unlike JLD2, whose compound HDF5 types aren't readable via plain h5py/
-numpy), so it opens directly from Python.
 
-`t_end` (seconds -- the same value passed to `sample_E_of_t`) is recorded
-as the total pulse length in microseconds, on its own `#` comment line
-before the column header:
-
-    # t_end_us,1100.0
-    Re,Im
-    1.234e-05,0.0
-    ...
-
-Read the sample matrix back with e.g.
-`numpy.loadtxt(path, delimiter=",", skiprows=2)` (skiprows=2 to skip both
-the metadata line and the "Re,Im" column header); read `t_end_us` back
-with e.g. `float(open(path).readline().split(",")[1])`.
-
-`extra_meta`, if non-empty, is appended VERBATIM (comma-prefixed) to that
-same metadata line -- e.g. `extra_meta="rel_l2_complex,0.0004"` writes
-`# t_end_us,1100.0,rel_l2_complex,0.0004`. Existing readers are
-unaffected: [`load_E_samples`](@ref) only ever looks at the SECOND
-comma-separated field, and the documented Python one-liner above
-(`split(",")[1]`) does too, so trailing fields are silently ignored by
-both. Default `""` (no-op) keeps every other caller's output identical to
-before this parameter existed.
-"""
 function save_E_samples(
     E_matrix::AbstractMatrix{<:Real}, t_end::Real, path::AbstractString;
     extra_meta::AbstractString="",
@@ -186,21 +146,7 @@ function save_E_samples(
     return path
 end
 
-"""
-    load_E_samples(path) -> (t_end, Ex, Ep)
 
-Reads a `_pulsemat.csv` file back in -- the exact read-side counterpart of
-[`save_E_samples`](@ref)/[`sample_E_of_t`](@ref): the `# t_end_us,<value>`
-metadata line, then the `Re,Im` header, then one `Re,Im` row per sample, in
-the same order they were written. `t_end` is returned in SECONDS (the file
-itself stores microseconds, matching `save_E_samples`'s own `t_end*1e6`
-convention) -- the corresponding sample TIMES are `range(0.0, t_end;
-length=length(Ex))`, since that is exactly the grid `sample_E_of_t` wrote
-them on; this function does not reconstruct that vector itself; a caller
-needing it just calls `collect(range(0.0, t_end; length=length(Ex)))`.
-Dependency-free (no CSV.jl/DelimitedFiles), matching the writer's own
-hand-rolled, Python-readable format.
-"""
 function load_E_samples(path::AbstractString)
     lines = readlines(path)
     length(lines) >= 2 || error("$path has fewer than the expected 2 header lines.")
@@ -226,22 +172,7 @@ function load_E_samples(path::AbstractString)
     return t_end_us * 1e-6, Ex, Ep
 end
 
-"""
-Saves `data` to `filename` via JLD2 -- exactly `@save filename data`, the
-convention every `run_sim_*` function already uses -- and, alongside it,
-regenerates that run's pulse-sample matrix: rebuilds `E_of_t` from
-`data.PULSE_CONFIG` and calls `sample_E_of_t` over
-`data.SIM_SETTING.Ttotal` at `data.SIM_SETTING.Nt_save` points, saving the
-result next to `filename` as `<basename>_pulsemat.csv` (same naming
-convention as `scripts/sample_pulse_from_run.jl`, which does this in batch
-for already-saved runs -- a run saved through this function no longer needs
-to be picked up by that script's gap-filling scan, since its
-`*_pulsemat.csv` is written right here, at save time).
 
-Requires `data.PULSE_CONFIG` and `data.SIM_SETTING` (with `Ttotal`/
-`Nt_save`) -- i.e. any `data` NamedTuple built the way `run_sim_1st_order`/
-`run_sim_2nd_order`/`mgpu_run_sim_2nd_order` already build theirs.
-"""
 function save_run_data(filename::AbstractString, data)
     dir = dirname(filename)
     isempty(dir) || mkpath(dir)
@@ -261,17 +192,8 @@ function save_run_data(filename::AbstractString, data)
     return filename
 end
 
-# ============================================================
-# PULSE PLOTTING
-# ============================================================
 
-"""
-Plot the amplitude of a generated pulse E_of_t versus time.
 
-`t_end` and `freq` are used to sample E_of_t (see `sample_E_of_t`).
-Set `plot_components=true` to overlay Re[E(t)] and Im[E(t)] alongside |E(t)|.
-Set `savepath` to a file path to also save the figure.
-"""
 function plot_E_of_t(
     E_of_t,
     t_end,

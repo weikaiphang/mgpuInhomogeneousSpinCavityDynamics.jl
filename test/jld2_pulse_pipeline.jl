@@ -1,5 +1,3 @@
-# Signal/control identification and jld2 optimisation pipeline.
-# Signal is a fixed background; only the control envelope is in `u`.
 
 using Test
 using Random
@@ -163,7 +161,7 @@ end
     end
     A = hypot.(I, Q)
     segs_once = _detect_subpulse_segments(t, A)
-    # A single global-max pass misses the Gaussian (peak ≪ 1e-3 × WURST).
+
     @test length(segs_once) == 1
     r = segment_signal_control_from_trace(t, I, Q; d=D)
     @test r.ok
@@ -242,7 +240,6 @@ e2e_wurst(; name="WURST", t_center=300e-6, duration=400e-6, amp=0.5 * E2E_SQRT_K
     phase0=0.0, edge_frac=1e-4,
 )
 
-# Production ROSE (examples/rose_1st_order.jl) and 3ARP (paper/fig_4_d).
 const E2E_ROSE_PC = (
     e2e_gaussian(),
     e2e_wurst(name="First WURST", t_center=300e-6, duration=400e-6),
@@ -253,7 +250,6 @@ const E2E_3ARP_PC = (
     e2e_wurst(name="WURST pulse 2", t_center=75e-6, duration=20e-6, amp=0.5 * E2E_SQRT_KE * 2.0e4 / sqrt(2)),
     e2e_wurst(name="WURST pulse 3", t_center=95e-6, duration=10e-6),
 )
-# Compact ROSE: same kinds/order, short enough for a cheap Dual ODE.
 const E2E_ROSE_COMPACT_PC = (
     e2e_gaussian(t0=15e-6, sigma=2e-6),
     e2e_wurst(name="First WURST", t_center=80e-6, duration=50e-6),
@@ -301,7 +297,7 @@ function e2e_opt_kwargs()
         n_hops=1,
         patience=1,
         compute=:cpu,
-        ensemble_method=:histogram,   # plumbing test: pin the original bins
+        ensemble_method=:histogram,
         threaded_grad=false,
         anneal_direct_weights=false,
         reltol=1e-6,
@@ -332,7 +328,7 @@ end
     @test hasmethod(run_sim_1st_order_pure, Tuple{AbstractVector,CompositePulse,Any})
     @test hasmethod(pulse_cost, Tuple{AbstractVector,CompositePulse,Any})
     @test hasmethod(optimise_composite_pulse, Tuple{Integer,Integer,Integer,Any})
-    # n_signal=nothing must dispatch (was Integer-only and threw MethodError).
+
     mlog = methods(save_optimisation_run_log)
     @test length(mlog) >= 1
     pipe, opt, verbose = _jld2_split_kwargs((;))
@@ -346,8 +342,8 @@ end
     @test pipe_on.use_signal === true
     @test_throws ErrorException _jld2_split_kwargs((; not_a_real_knob=1))
 
-    # hop0_phyonly is a canonical optimiser knob: present in the defaults,
-    # auto-allowlisted, and forwarded into the `opt` split.
+
+
     @test haskey(jld2_optimizer_defaults(), :hop0_phyonly)
     @test jld2_optimizer_defaults().hop0_phyonly === true
     _, opt_h0, _ = _jld2_split_kwargs((; hop0_phyonly=false))
@@ -376,7 +372,7 @@ end
     @test length(arp.control_cfg) == 3
     @test all(c.kind === :wurst for c in arp.control_cfg)
 
-    # Old positional n_signal=1 would steal the first WURST as "signal".
+
     sig_pos, ctrl_pos = split_signal_control(E2E_3ARP_PC; n_signal=1)
     @test length(sig_pos) == 1 && sig_pos[1].kind === :wurst
     arp_n1 = try_parse_pulse_config((PULSE_CONFIG=E2E_3ARP_PC,); n_signal=1, d=E2E_D_ID)
@@ -476,7 +472,7 @@ end
     @test pulse2.k == pulse.k
     @test isfinite(best_cost)
     @test length(history) >= 1
-    @test !haskey(settings, :signal_E_of_t)  # closure is captured, not serialised
+    @test !haskey(settings, :signal_E_of_t)
     @test isfinite(initial_metrics[1]) && isfinite(final_metrics[1])
 end
 
@@ -540,7 +536,7 @@ end
         @test irep.inversion_in == forward.metrics.inversion
         @test irep.silencing_in == forward.metrics.silencing
 
-        # Count-check still works for ROSE; 3ARP-style n_signal=1 must not load.
+
         ref_n1 = load_jld2_reference(path; n_signal=1, verbose=false, fit_N=501)
         @test ref_n1.parse_ok
         @test_throws ErrorException load_jld2_reference(path; n_signal=2, verbose=false)
@@ -565,7 +561,7 @@ end
         @test log.use_signal === false
         @test log.optimizer_settings.use_interior === false
         @test length(log.final_u) == length(best_u)
-        # Saved pulsemat is CONTROL only (no Gaussian lobe).
+
         t_end_csv, Exs, Eps = load_E_samples(pmat)
         tcsv = collect(range(0.0, t_end_csv; length=length(Exs)))
         i_g = argmin(abs.(tcsv .- 15e-6))
@@ -631,8 +627,8 @@ end
         @test hypot(ref.control_Ex[i_sig], ref.control_Ep[i_sig]) <
               1e-3 * hypot(ref.control_Ex[i_w1], ref.control_Ep[i_w1])
         @test hypot(ref.control_Ex[i_w1], ref.control_Ep[i_w1]) > 0
-        @test e2e_iq_at(ref.recorded_E_of_t, 15e-6) > 0  # mixed recorded drive still has signal
-        @test ref.signal_E_of_t(15e-6) == 0  # default use_signal=false zeros the opt background
+        @test e2e_iq_at(ref.recorded_E_of_t, 15e-6) > 0
+        @test ref.signal_E_of_t(15e-6) == 0
         @test e2e_iq_at(ref.signal_E_always, 15e-6) > 0
         pulse, u_fit, _, segs = fit_linear_seed(ref; param_budget=40, verbose=false)
         @test pulse.k >= 1

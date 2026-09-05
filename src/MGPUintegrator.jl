@@ -1,20 +1,5 @@
-# ============================================================
-# MULTI-GPU ADAPTIVE RUNGE-KUTTA DRIVER
-#
-# A general ODE library cannot own the state here: it lives in pieces on
-# several GPUs, and every vector operation has to be issued per shard.  The
-# stepper below is therefore explicit, but it reproduces the pieces that
-# matter for reproducibility against the single-GPU package: the same Tsit5
-# tableau, the same PI step-size controller, the same RMS error norm taken
-# over the whole (global) state.
-# ============================================================
 
-"""
-    PIController{T}
 
-The proportional-integral step-size controller used by OrdinaryDiffEq, with
-the same defaults, so accepted step sequences track the single-GPU reference.
-"""
 mutable struct PIController{T}
     gamma::T
     qmin::T
@@ -30,7 +15,7 @@ function PIController(::Type{T}, order::Int) where {T}
                            T(2 / (5 * order)), T(1e-4), T(1e-4))
 end
 
-"Step-size factor after an accepted or rejected step."
+
 function controller_factors(ctrl::PIController{T}, EEst::T) where {T}
     e = max(EEst, eps(T))
     q11 = e^ctrl.beta1
@@ -45,18 +30,7 @@ function accept_step!(ctrl::PIController{T}, EEst::T) where {T}
 end
 
 
-"""
-    SolverOptions
 
-Runtime knobs for [`solve_mgpu!`](@ref).
-
-* `integrator`  `:tsit5` (5th order, 9 registers) or `:ck45`
-  (RK4(3)5[2R+]C, 4th order, 5 registers — the memory-lean choice).
-* `save_mode`   `:tstops` forces a step onto every output time, exactly like
-  the `PresetTimeCallback` of the single-GPU package.  `:interpolate` uses
-  the Tsit5 dense output instead, which leaves the step-size selection to the
-  controller alone and is much faster when many output times are requested.
-"""
 Base.@kwdef struct SolverOptions{T}
     integrator::Symbol = :tsit5
     save_mode::Symbol = :tstops
@@ -83,11 +57,6 @@ end
 SolveStats() = SolveStats(0, 0, 0, 0, Inf, 0.0, 0.0)
 
 
-# ------------------------------------------------------------
-# Register conventions
-#   tsit5 : 1 = u, 2 = tmp/u_new, 3..9 = k1..k7
-#   ck45  : 1 = uprev, 2 = stage, 3 = accumulator, 4 = k, 5 = error
-# ------------------------------------------------------------
 
 const TSIT5_U, TSIT5_TMP = 1, 2
 const TSIT5_K = (3, 4, 5, 6, 7, 8, 9)
@@ -113,13 +82,7 @@ function initial_step(prob::MGPUProblem{T}, tab, t0::Real, tend::Real,
 end
 
 
-"""
-    solve_mgpu!(prob, t0, tend, tsave, on_save; opts)
 
-Integrate the sharded problem from `t0` to `tend`, calling
-`on_save(index, t, ireg)` at every requested output time, where `ireg` names
-the register holding the solution there.
-"""
 function solve_mgpu!(prob::MGPUProblem{T}, t0::Real, tend::Real,
                      tsave::AbstractVector, on_save::F,
                      opts::SolverOptions{T}) where {T,F}
@@ -133,7 +96,7 @@ function solve_mgpu!(prob::MGPUProblem{T}, t0::Real, tend::Real,
     t = T(t0)
     tfinal = T(tend)
 
-    # output requested exactly at the initial time
+
     if nsave >= 1 && abs(tsave[1] - t0) <= eps(T) * max(one(T), abs(T(t0)))
         on_save(1, T(t0), TSIT5_U)
         isave = 2
@@ -145,7 +108,7 @@ function solve_mgpu!(prob::MGPUProblem{T}, t0::Real, tend::Real,
               "(the low-storage method has no dense output).")
     end
 
-    # prime the first derivative (also used for the initial step size)
+
     if opts.integrator === :tsit5
         rhs!(prob, TSIT5_U, TSIT5_K[1], t)
         dt = initial_step(prob, tab, t, tfinal, TSIT5_U, TSIT5_K[1], opts)
@@ -186,15 +149,15 @@ function solve_mgpu!(prob::MGPUProblem{T}, t0::Real, tend::Real,
             t = forced ? t_target : t + dt
 
             if opts.integrator === :tsit5
-                # observables live in the small block; interpolate only that
+
                 if opts.save_mode === :interpolate
                     while isave <= nsave &&
                           T(tsave[isave]) <= t + 100 * eps(T) * max(one(T), abs(t))
                         Θ = min(one(T), max(zero(T), (T(tsave[isave]) - tprev) / dt))
                         w = interp_weights(interp, Θ)
-                        # k2..k6 are dead once the error estimate is formed and
-                        # are fully rewritten by the next step, so k2 doubles as
-                        # the dense-output scratch register
+
+
+
                         combine!(prob, TSIT5_INTERP, TSIT5_U, TSIT5_K, w, dt;
                                  n = :save)
                         on_save(isave, T(tsave[isave]), TSIT5_INTERP)
@@ -248,10 +211,6 @@ function solve_mgpu!(prob::MGPUProblem{T}, t0::Real, tend::Real,
 end
 
 
-# ------------------------------------------------------------
-# One Tsit5 step.  Returns the error estimate; the new solution is left in
-# TSIT5_TMP and the FSAL derivative in k7.
-# ------------------------------------------------------------
 function tsit5_step!(prob::MGPUProblem{T}, tab::Tsit5Tableau{T}, t::T, dt::T) where {T}
     k1, k2, k3, k4, k5, k6, k7 = TSIT5_K
     u, tmp = TSIT5_U, TSIT5_TMP
@@ -283,15 +242,12 @@ function tsit5_step!(prob::MGPUProblem{T}, tab::Tsit5Tableau{T}, t::T, dt::T) wh
 end
 
 
-# ------------------------------------------------------------
-# One RK4(3)5[2R+]C step.  The new solution is left in the accumulator.
-# ------------------------------------------------------------
 function ck45_step!(prob::MGPUProblem{T}, tab::CK45Tableau{T}, t::T, dt::T) where {T}
     ns = 5
     for i in 1:ns
         first = i == 1
-        # the first derivative is already in CK_K, primed from the previous
-        # accepted step (or at start-up), so a step costs five evaluations
+
+
         if !first
             rhs!(prob, CK_STAGE, CK_K, t + tab.c[i] * dt)
         end
@@ -301,7 +257,7 @@ function ck45_step!(prob::MGPUProblem{T}, tab::CK45Tableau{T}, t::T, dt::T) wher
 
     EEst = error_norm(prob, CK_UPREV, CK_ACC, (CK_ERR,), (one(T),), one(T))
 
-    # prime the next step's first derivative from the accepted state
+
     if EEst <= one(T)
         rhs!(prob, CK_ACC, CK_K, t + dt)
     else

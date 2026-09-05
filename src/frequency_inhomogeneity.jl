@@ -1,23 +1,5 @@
-# ============================================================
-# Frequency inhomogeneity
-#
-# Supported choices:
-#
-#     :gaussian
-#     :lorentzian
-#
-# This file handles:
-#
-#     1. validation
-#     2. frequency distribution construction
-#     3. detuning-bin edge construction
-#     4. cooperativity -> total spin number conversion
-# ============================================================
 
 
-# ============================================================
-# Validation
-# ============================================================
 
 function validate_frequency_inhomogeneity(freq_inhomogeneity)
     kind = freq_inhomogeneity.kind
@@ -57,9 +39,6 @@ function validate_frequency_inhomogeneity(freq_inhomogeneity)
 end
 
 
-# ============================================================
-# Width conversion
-# ============================================================
 
 function gaussian_sigma_from_FWHM(FWHM)
     return FWHM / (2 * sqrt(2 * log(2)))
@@ -70,9 +49,6 @@ function lorentzian_gamma_from_FWHM(FWHM)
 end
 
 
-# ============================================================
-# Build detuning distribution
-# ============================================================
 
 function build_frequency_distribution(freq_inhomogeneity)
     validate_frequency_inhomogeneity(freq_inhomogeneity)
@@ -91,9 +67,6 @@ function build_frequency_distribution(freq_inhomogeneity)
 end
 
 
-# ============================================================
-# Build detuning bin edges
-# ============================================================
 
 function build_frequency_edges(freq_inhomogeneity, M_delta)
     validate_frequency_inhomogeneity(freq_inhomogeneity)
@@ -124,15 +97,6 @@ function build_frequency_edges(freq_inhomogeneity, M_delta)
 end
 
 
-# ============================================================
-# Optional probability renormalization
-#
-# If renormalize = true, the probability inside the chosen
-# finite simulation range is normalized to 1.
-#
-# If renormalize = false, the probability outside the finite
-# range is excluded, so sum(p_delta) may be less than 1.
-# ============================================================
 
 function renormalize_frequency_probs_enabled(freq_inhomogeneity)
     if hasproperty(freq_inhomogeneity, :renormalize)
@@ -157,33 +121,6 @@ function maybe_renormalize_frequency_probs!(p_delta, freq_inhomogeneity)
 end
 
 
-# ============================================================
-# Cooperativity -> total spin number
-#
-# General formula:
-#
-#     C_ens = 2π N <g²> ρ(0) / κt
-#
-# where:
-#
-#     ρ(0) is the normalized detuning density at resonance.
-#
-# Lorentzian:
-#
-#     ρ(0) = 2 / (π FWHM)
-#
-#     C_ens = 4 N <g²> / (κt FWHM)
-#
-#     N = C_ens κt FWHM / (4 <g²>)
-#
-# Gaussian:
-#
-#     ρ(0) = 2 sqrt(log(2)) / (sqrt(π) FWHM)
-#
-#     C_ens = 4 sqrt(π log(2)) N <g²> / (κt FWHM)
-#
-#     N = C_ens κt FWHM / (4 sqrt(π log(2)) <g²>)
-# ============================================================
 
 function total_spin_number_from_cooperativity(
     C_ens,
@@ -217,9 +154,6 @@ function total_spin_number_from_cooperativity(
 end
 
 
-# ============================================================
-# Frequency info for saving / debugging
-# ============================================================
 
 function build_frequency_info(freq_inhomogeneity, edges_delta)
     validate_frequency_inhomogeneity(freq_inhomogeneity)

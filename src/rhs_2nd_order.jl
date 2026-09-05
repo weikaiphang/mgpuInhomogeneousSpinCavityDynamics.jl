@@ -1,6 +1,3 @@
-# ============================================================
-# 2nd-order RHS
-# ============================================================
 
 function rhs_2nd_order!(du, u, p, t)
     delta0, kappa_e, kappa_i, delta_b_gpu, g_b_gpu, M, diag_mask, E_of_t = p
@@ -24,26 +21,26 @@ function rhs_2nd_order!(du, u, p, t)
     κt = kappa_e + kappa_i
     E_t = E_of_t(t)
 
-    # ----------------------------
-    # 1) cavity equation
-    # ----------------------------
+
+
+
     du[IDX2_a] = sqrt(κe) * E_t - 1im * delta0 * a - 1im * sum(g_b_gpu .* conj.(Sp)) - 0.5 * κt * a
 
-    # ----------------------------
-    # 2) first-order spin equations
-    # ----------------------------
+
+
+
     dSp .= 1im .* delta_b_gpu .* Sp - 2im .* g_b_gpu .* adSz
     dSz .= -1im .* g_b_gpu .* conj.(adSm) + 1im .* g_b_gpu .* adSm
 
-    # ----------------------------
-    # 3) cavity second-order equations
-    # ----------------------------
+
+
+
     du[IDX2_ad_ad] = 2im * delta0 * ad_ad + 2im * sum(g_b_gpu .* adSp) - κt * ad_ad + 2 * sqrt(κe) * conj(a) * conj(E_t)
     du[IDX2_ad_a] = 1im * sum(g_b_gpu .* conj.(adSm)) - 1im * sum(g_b_gpu .* adSm) - κt * ad_a + sqrt(κe) * E_t * conj(a) + sqrt(κe) * conj(E_t) * a
 
-    # ----------------------------
-    # 4) cavity-spin correlations
-    # ----------------------------
+
+
+
     sumgSpSp_jk = SpSp_same .* g_b_gpu .+ SpSp_cross * g_b_gpu
     sumgSmSp_jk = SmSp_same .* g_b_gpu .+ SmSp_cross * g_b_gpu
     sumgSzSp_jk = SzSp_same .* g_b_gpu .+ SzSp_cross * g_b_gpu
@@ -68,9 +65,9 @@ function rhs_2nd_order!(du, u, p, t)
     .+ 1im .* g_b_gpu .* (2 .* conj(a) .* adSm .+ ad_ad .* conj.(Sp) .- 2 .* conj(a).^2 .* conj.(Sp))
     )
 
-    # ----------------------------
-    # 5) same-bin spin correlations
-    # ----------------------------
+
+
+
     dSpSp_same .= (
     2im .* delta_b_gpu .* SpSp_same .+ 2im .* g_b_gpu .* adSp
     .- 4im .* g_b_gpu .* (Sp .* adSz .+ SzSp_same .* conj(a) .+ adSp .* Sz .- 2 .* Sp .* conj(a) .* Sz)
@@ -94,9 +91,9 @@ function rhs_2nd_order!(du, u, p, t)
     .+ 2im .* g_b_gpu .* (conj(a) .* conj.(SzSp_same) .+ conj.(Sp) .* adSz .+ adSm .* Sz .- 2 .* conj(a) .* conj.(Sp) .* Sz)
     )
 
-    # ----------------------------
-    # 6) different-bin spin correlations
-    # ----------------------------
+
+
+
     Δ_col = reshape(delta_b_gpu, M, 1)
     Δ_row = reshape(delta_b_gpu, 1, M)
 

@@ -1,25 +1,15 @@
-# ============================================================
-# SHARDS, PROBLEM ASSEMBLY AND THE DISTRIBUTED RIGHT-HAND SIDE
-# ============================================================
 
-"""
-    Shard{T}
 
-Everything that lives on one GPU: the owned slice of the ensemble, the
-register set, scratch buffers and the launch configuration tuned for that
-device.  All registers are single contiguous vectors holding the replicated
-small block followed by the sharded large block.
-"""
 mutable struct Shard{T}
     id::Int
     dev::CuDevice
     stream::CuStream
 
-    joff::Int          # 0-based global offset of the first owned bin
-    mloc::Int          # owned bins
-    n::Int             # register length
+    joff::Int
+    mloc::Int
+    n::Int
     nsmall::Int
-    lo::Int            # offset of the large block inside a register
+    lo::Int
 
     delta_b::CuVector{T}
     g_b::CuVector{T}
@@ -27,7 +17,7 @@ mutable struct Shard{T}
 
     regs::Vector{CuVector{Complex{T}}}
 
-    rowsum::Vector{CuVector{Complex{T}}}   # double buffered
+    rowsum::Vector{CuVector{Complex{T}}}
     part::CuVector{Complex{T}}
     gsums::CuVector{Complex{T}}
     normpart::CuVector{T}
@@ -42,12 +32,7 @@ mutable struct Shard{T}
     nblocks_norm::Int
 end
 
-"""
-    MGPUProblem{T}
 
-Immutable description of one sharded simulation: the shards, the physical
-constants, the drive, and the solver tolerances.
-"""
 struct MGPUProblem{T,F}
     M::Int
     part::EnsemblePartition
@@ -67,22 +52,19 @@ struct MGPUProblem{T,F}
     rowparity::Base.RefValue{Int}
     nrhs::Base.RefValue{Int}
 
-    # Pinned, permanently-referenced row-sum staging buffer (see
-    # exchange_rowsums!). Living for the whole problem's lifetime is what
-    # makes the async H2D copy safe: a buffer that was freshly `Vector`-
-    # allocated per call could be collected by the GC before CUDA actually
-    # finished reading it, since `GC.@preserve` only protects it for the
-    # (near-instant) duration of *issuing* the async copy, not until the
-    # transfer completes.
+
+
+
+
+
+
+
     hostbuf::Vector{Complex{T}}
 end
 
 nshards(prob::MGPUProblem) = length(prob.shards)
 
 
-# ------------------------------------------------------------
-# Launch configuration
-# ------------------------------------------------------------
 
 function launch_config(dev::CuDevice, M::Int, mloc::Int, n::Int)
     CUDA.device!(dev)
@@ -93,8 +75,8 @@ function launch_config(dev::CuDevice, M::Int, mloc::Int, n::Int)
         nthreads = max(32, 32 * cld(M, 32))
     end
 
-    # split the k range so that the grid keeps every SM busy even when a
-    # shard owns few bins
+
+
     want = 8 * nsm
     nchunk = clamp(cld(want, max(mloc, 1)), 1, max(1, cld(M, nthreads)))
     chunk_len = cld(M, nchunk)
@@ -108,9 +90,6 @@ function launch_config(dev::CuDevice, M::Int, mloc::Int, n::Int)
 end
 
 
-# ------------------------------------------------------------
-# Construction
-# ------------------------------------------------------------
 
 function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T}
     ns = length(devs)
@@ -162,23 +141,6 @@ function free_shards!(shards)
 end
 
 
-# ------------------------------------------------------------
-# Right-hand side
-#
-#   phase 1 (per shard, fully parallel)
-#       * global coupling sums from the replicated small block
-#       * the fused O(M²) cross kernel, which also produces this shard's
-#         row sums
-#       * push the row-sum slice to every peer, then record an event
-#
-#   phase 2 (per shard)
-#       * wait on the peers' events
-#       * evaluate the small block redundantly, giving bit-identical
-#         replicated state on every shard
-#
-# The only bytes that cross the interconnect are 3 complex numbers per
-# ensemble bin.  Everything of size M² stays on its own GPU.
-# ------------------------------------------------------------
 
 function rhs!(prob::MGPUProblem{T}, iu::Int, idu::Int, t::Real) where {T}
     shards = prob.shards
@@ -220,20 +182,7 @@ function rhs!(prob::MGPUProblem{T}, iu::Int, idu::Int, t::Real) where {T}
     return nothing
 end
 
-"""
-    exchange_rowsums!(prob, rb)
 
-All-gather the per-shard row-sum slices.  The payload is `3M` complex
-numbers, so a host staging buffer is both simple and cheap next to the
-O(M²) kernel.
-
-Uses `prob.hostbuf`, a pinned buffer allocated once in [`assemble_problem`](@ref)
-and kept alive for the problem's whole lifetime, rather than a fresh
-`Vector` per call: the async H2D copy below needs its source memory to
-stay valid (and page-locked, for the transfer to be a genuine DMA rather
-than a driver-internal staged copy) until CUDA has actually finished
-reading it, which a per-call throwaway buffer cannot guarantee.
-"""
 function exchange_rowsums!(prob::MGPUProblem{T}, rb) where {T}
     shards = prob.shards
     M = prob.M
@@ -259,17 +208,8 @@ function exchange_rowsums!(prob::MGPUProblem{T}, rb) where {T}
 end
 
 
-# ------------------------------------------------------------
-# Distributed vector operations
-# ------------------------------------------------------------
 
-"""
-    combine!(prob, iout, ibase, iks, coeffs, dt; n=:full)
 
-`u[iout] = u[ibase] + dt * Σ coeffs[s] * u[iks[s]]` on every shard.  `n` may
-be `:save` to restrict the update to the observable prefix, which is what the
-dense-output path uses.
-"""
 function combine!(prob::MGPUProblem{T}, iout::Int, ibase::Int, iks, coeffs,
                   dt::T; n::Symbol = :full) where {T}
     ks_idx = Tuple(iks)
@@ -313,13 +253,7 @@ function sync_shards!(prob::MGPUProblem)
     return nothing
 end
 
-"""
-    error_norm(prob, iuprev, iu, iks, es, dt)
 
-RMS of the embedded error estimate over the *global* state.  Each shard
-reduces its own large block; the replicated small block is counted once, on
-shard 1, so the norm is exactly what a single-GPU run would produce.
-"""
 function error_norm(prob::MGPUProblem{T}, iuprev::Int, iu::Int, iks, es,
                     dt::T) where {T}
     ks_idx = Tuple(iks)
@@ -339,12 +273,7 @@ function error_norm(prob::MGPUProblem{T}, iuprev::Int, iu::Int, iks, es,
     return gather_norm(prob)
 end
 
-"""
-    diff_norm(prob, ix, iy, iref)
 
-RMS of `(x - y)` (or of `x` alone when `iy == 0`) in the tolerance-weighted
-norm.  Used by the low-storage stepper and the initial step-size heuristic.
-"""
 function diff_norm(prob::MGPUProblem{T}, ix::Int, iy::Int, iref::Int) where {T}
     each_shard(prob.shards, prob.exec) do s
         istart = s.id == 1 ? 1 : s.nsmall + 1
@@ -361,7 +290,7 @@ end
 
 function szspt_range(s::Shard)
     bs = s.nsmall == 0 ? 0 : (s.n - s.nsmall) ÷ NBLOCK
-    # SzSpT is block 3 of the large region
+
     a = s.lo + 2 * bs + 1
     b = s.lo + 3 * bs
     return a, b

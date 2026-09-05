@@ -1,69 +1,3 @@
-# ============================================================
-# accel_solver_1st_order.jl
-#
-# DROP-IN REPLACEMENT for src/solver_1st_order.jl.
-#
-# Exposes the exact same entry point
-#
-#     run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu = true)
-#         -> data::NamedTuple   (identical field set to the stock solver)
-#
-# so no calling code changes: swap
-#
-#     include("solver_1st_order.jl")   ->   include("accel_solver_1st_order.jl")
-#
-# in src/InhomogeneousSpinCavityDynamics.jl and nothing else.
-#
-# Internally the integration is done by a self-contained port of AccelISCD
-# (accel_iscd/src/: system.jl, pulses.jl, ensemble.jl, metrics.jl, rhs_1st.jl,
-# gpu_detect.jl, resources.jl, gpu_kernels.jl, gpu_rk.jl, solve_1st.jl,
-# gpu_solve.jl) wrapped in the `AccelSolver1stOrder` submodule below. The
-# first-order mean-field equations are bit-for-bit the same system as
-# rhs_1st_order!; only the discretisation options and the time stepper differ:
-#
-#   * fused single / multi-GPU Tsit5 (one kernel per RK stage, cavity kept on
-#     device on a single shard) -- the default when a CUDA device is visible,
-#   * OrdinaryDiffEq Tsit5 on the CPU as the fallback,
-#   * optional measure-adapted quadrature ensemble (tan-mapped Gauss-Legendre
-#     x Gauss-Hermite) instead of the stock equal-width histogram bins,
-#   * optional co-rotating chirp frame + sweep active set for chirped drives.
-#
-# All of that is opt-in through OPTIONAL fields on SIM_SETTING; with none of
-# them set the behaviour matches the stock lab-frame GPU solve (same bins from
-# prepare_derived, same lab frame, GPU when available):
-#
-#   SIM_SETTING.accel_ensemble :: Symbol   # :histogram (default) | :quadrature
-#                                          #   | :auto  -- parse SYSTEM_CONFIG and
-#                                          #   pick the measure-matched quadrature
-#                                          #   rule per axis (see below), falling
-#                                          #   back to :histogram when a
-#                                          #   distribution has no spectral rule
-#                                          #   (e.g. g_inhomogeneity :user_defined)
-#   SIM_SETTING.accel_M_delta              # quadrature δ node count
-#                                          #   (default CONFIG.M_delta; :quadrature/:auto)
-#   SIM_SETTING.accel_M_g                  # quadrature g node count (default CONFIG.M_g)
-#   SIM_SETTING.accel_frame    :: Symbol   # :lab (default) | :ip | :chirp
-#   SIM_SETTING.accel_active   :: Bool     # sweep active set (needs a chirped
-#                                          #   drive + :ground/:inverted IC)
-#   SIM_SETTING.accel_compute  :: Symbol   # :default (GPU if functional else CPU)
-#                                          #   | :auto | :cpu | :gpu
-#   SIM_SETTING.accel_gpus                 # :auto (default) | Int  (sharding)
-#   SIM_SETTING.accel_nshards              # nothing (default) | Int
-#
-# accel_ensemble=:auto quadrature-rule selection (from SYSTEM_CONFIG):
-#   freq_inhomogeneity.kind :lorentzian -> tan-mapped Gauss-Legendre
-#                           :gaussian   -> Gauss-Hermite
-#                           :powerlaw   -> Pearson-VII tan-mapped Gauss-Legendre
-#   g_inhomogeneity.kind    :constant   -> single collapsed node
-#                           :gaussian   -> Gauss-Hermite
-#                           :powerlaw_g -> Gauss-Legendre in log g
-#                           :lorentzian -> truncated-Cauchy tan-mapped Gauss-Legendre
-#                           :user_defined / other -> no rule => :histogram fallback
-#
-# NOTE: the stepper is a different Tsit5 implementation from the stock
-# DifferentialEquations one, so trajectories agree to ~reltol rather than
-# bit-for-bit; detected peak indices are unchanged for a well-resolved run.
-# ============================================================
 
 module AccelSolver1stOrder
 
@@ -71,22 +5,6 @@ using CUDA
 using LinearAlgebra
 using OrdinaryDiffEq
 
-# ------------------------------------------------------------------
-# accel_iscd/src/system.jl  (verbatim)
-# ------------------------------------------------------------------
-# Cavity + ensemble parameters. Angular frequencies in rad/s, times in s.
-#
-# The model is a first-order (mean-field) Tavis–Cummings / Heisenberg–Langevin
-# system with an *inhomogeneous* spin ensemble, a single classical drive, and
-# optional homogeneous spin relaxation:
-#
-#   ȧ    = √κe E(t) − iδ₀ a − i Σⱼ gⱼ⟨Sⱼ⁺⟩* − ½κt a
-#   Ṡ⁺ⱼ = iδⱼ Sⱼ⁺ − 2i gⱼ a* Sⱼᶻ − γ⊥ Sⱼ⁺
-#   Ṡᶻⱼ = −i gⱼ a Sⱼ⁺ + c.c. − γ∥ (Sⱼᶻ − w_eq Nⱼ/2)
-#
-# γ⊥ (`gamma_perp`) is the homogeneous transverse rate (1/T2 on top of the
-# inhomogeneous line); γ∥ (`gamma_par`) is the longitudinal rate (1/T1) pulling
-# each macrospin toward w_eq·Nⱼ/2 (w_eq ∈ [−1, 1], −1 = ground).
 
 struct System
     C_ens::Float64
@@ -94,20 +12,20 @@ struct System
     kappa_e::Float64
     kappa_i::Float64
     FWHM::Float64
-    freq_kind::Symbol          # :lorentzian | :gaussian | :powerlaw
-    freq_n::Int                # Pearson-VII exponent, ρ ∝ [1+(δ/w)²]^(-n) (freq_kind == :powerlaw)
-    g_kind::Symbol             # :constant | :gaussian | :lorentzian | :powerlaw
-    g_mean::Float64            # :gaussian mean, :lorentzian centre
-    g_std::Float64             # :gaussian std
-    g_value::Float64           # :constant coupling
-    g_hwhm::Float64            # :lorentzian half-width
-    g_span::Float64            # :lorentzian / :gaussian truncation (units of hwhm / σ)
-    g_alpha::Float64           # :powerlaw exponent, p(g) ∝ g^(-α)
-    g_min::Float64             # :powerlaw support
+    freq_kind::Symbol
+    freq_n::Int
+    g_kind::Symbol
+    g_mean::Float64
+    g_std::Float64
+    g_value::Float64
+    g_hwhm::Float64
+    g_span::Float64
+    g_alpha::Float64
+    g_min::Float64
     g_max::Float64
-    gamma_perp::Float64        # homogeneous transverse (1/T2) rate, rad/s
-    gamma_par::Float64         # longitudinal (1/T1) rate, rad/s
-    w_eq::Float64              # equilibrium ⟨σᶻ⟩ ∈ [−1, 1]
+    gamma_perp::Float64
+    gamma_par::Float64
+    w_eq::Float64
 end
 
 function System(;
@@ -164,18 +82,18 @@ kappa_t(sys::System) = sys.kappa_e + sys.kappa_i
 gammaL(sys::System) = sys.FWHM / 2
 gaussian_sigma_from_FWHM(FWHM) = FWHM / (2 * sqrt(2 * log(2)))
 
-"""Pearson-VII half-width scale `w` so that `FWHM` is the true full width at half max."""
+
 pearson_w(FWHM, n) = FWHM / (2 * sqrt(2.0^(1 / n) - 1))
 pearson_norm(w, n) = 4.0^(n - 1) * factorial(big(n - 1))^2 / (π * w * factorial(big(2n - 2))) |> Float64
 
-"""Frequency-line scale: HWHM (Lorentzian), σ (Gaussian), or Pearson-VII `w`."""
+
 function freq_scale(sys::System)
     sys.freq_kind === :lorentzian && return gammaL(sys)
     sys.freq_kind === :gaussian && return gaussian_sigma_from_FWHM(sys.FWHM)
     return pearson_w(sys.FWHM, sys.freq_n)
 end
 
-"""Detuning density at the rotating-frame reference, ρ(δ = 0)."""
+
 function freq_density_at_zero(sys::System)
     if sys.freq_kind === :lorentzian
         return 1.0 / (π * gammaL(sys))
@@ -186,7 +104,7 @@ function freq_density_at_zero(sys::System)
     end
 end
 
-"""Integral of g^q over [lo, hi] (q = -1 gives a log)."""
+
 function _pow_integral(lo::Float64, hi::Float64, q::Float64)
     abs(q + 1) < 1e-14 && return log(hi / lo)
     return (hi^(q + 1) - lo^(q + 1)) / (q + 1)
@@ -196,22 +114,18 @@ function g2_avg(sys::System)
     if sys.g_kind === :constant
         return abs2(sys.g_value)
     elseif sys.g_kind === :gaussian
-        return sys.g_mean^2 + sys.g_std^2          # untruncated (span ≥ 4σ ⇒ negligible)
+        return sys.g_mean^2 + sys.g_std^2
     elseif sys.g_kind === :lorentzian
         z = sys.g_span
         return sys.g_mean^2 + sys.g_hwhm^2 * (z - atan(z)) / atan(z)
-    else # :powerlaw
+    else
         num = _pow_integral(sys.g_min, sys.g_max, 2 - sys.g_alpha)
         den = _pow_integral(sys.g_min, sys.g_max, -sys.g_alpha)
         return num / den
     end
 end
 
-"""
-Total spin number from the cooperativity: `C = 2π N ⟨g²⟩ ρ(0) / κt`, i.e.
-`N = C κt / (2π ⟨g²⟩ ρ(0))`. Reduces to `C κt FWHM/(4⟨g²⟩)` for a Lorentzian
-line and `C κt FWHM/(4√(π ln2)⟨g²⟩)` for a Gaussian.
-"""
+
 function N_spins(sys::System)
     g2 = g2_avg(sys)
     g2 > 0 || error("g2_avg must be positive")
@@ -226,22 +140,6 @@ function default_system(; kwargs...)
     return System(; kwargs...)
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/pulses.jl  (verbatim)
-# ------------------------------------------------------------------
-# Classical drives E(t) (complex amplitude; enters the cavity as √κe·E).
-#
-# Every drive answers four queries:
-#   drive_E(d, t)       lab-frame complex amplitude
-#   drive_omega(d, t)   instantaneous frequency offset dφ/dt (0 if unchirped)
-#   drive_phase(d, t)   accumulated carrier phase φ(t), continuous, frozen after
-#                       the pulse (0 if unchirped)
-#   drive_tstops(d)     time instants where E, ω, or φ̇ kink (fed to the solver)
-#
-# `:lab` and `:ip` frames need only drive_E. The `:chirp` rotating frame also
-# uses drive_phase / drive_omega, so it accelerates only genuinely chirped
-# drives (WurstPulse, chirped SechDrive); for an unchirped drive `:chirp`
-# degenerates to `:lab` (still correct, just no benefit).
 
 abstract type AbstractDrive end
 
@@ -253,13 +151,6 @@ drive_chirp_rate(::AbstractDrive) = 0.0
 drive_peak_amp(d::AbstractDrive) = abs(drive_E(d, 0.0))
 sweep_range(d::AbstractDrive; pad=0.0) = (-pad, pad)
 
-# ------------------------------------------------------------------
-# WURST ARP drive
-# ------------------------------------------------------------------
-#
-#   τ = t - t_start
-#   φ(τ) = phase0 + (ω0 - s·BW/2) τ + (s/2) (BW/T) τ²
-#   ω(τ) = ω0 - s·BW/2 + s (BW/T) τ            (ω(t_center) = ω0)
 
 struct WurstPulse <: AbstractDrive
     t_center::Float64
@@ -324,16 +215,14 @@ function _poly_omega(p::WurstPulse, τ)
            p.chirp_sign * (p.bandwidth / p.duration) * τ
 end
 
-"""Lab-frame drive E(t). Zero outside the tanh window."""
+
 function drive_E(p::WurstPulse, t)
     ts = t_start(p)
     τ = t - ts
     return _gate(p, t) * _envelope(p, τ) * cis(_poly_phase(p, τ))
 end
 
-"""
-Instantaneous frequency for the chirp frame / active set. Outside the pulse: 0.
-"""
+
 function drive_omega(p::WurstPulse, t)
     ts = t_start(p)
     te = t_end(p)
@@ -341,7 +230,7 @@ function drive_omega(p::WurstPulse, t)
     return _poly_omega(p, t - ts)
 end
 
-"""Carrier phase φ(t): 0 before, WURST polynomial during, frozen at φ(t_end) after."""
+
 function drive_phase(p::WurstPulse, t)
     ts = t_start(p)
     te = t_end(p)
@@ -373,9 +262,6 @@ function default_wurst(sys::System;
     )
 end
 
-# ------------------------------------------------------------------
-# Gaussian pulse:  E(t) = amp·exp(-(t-t0)²/2σ²)·exp(i(ω(t-t0) + phase))
-# ------------------------------------------------------------------
 
 struct GaussianDrive <: AbstractDrive
     t0::Float64
@@ -383,7 +269,7 @@ struct GaussianDrive <: AbstractDrive
     amp::ComplexF64
     omega::Float64
     phase::Float64
-    n_sigma::Float64        # tstops placed at t0 ± n_sigma·σ
+    n_sigma::Float64
 end
 
 function GaussianDrive(; t0, sigma, amp, omega=0.0, phase=0.0, n_sigma=8.0)
@@ -401,9 +287,6 @@ drive_phase(d::GaussianDrive, t) = d.omega * (t - d.t0) + d.phase
 drive_tstops(d::GaussianDrive) = [d.t0 - d.n_sigma * d.sigma, d.t0, d.t0 + d.n_sigma * d.sigma]
 drive_peak_amp(d::GaussianDrive) = abs(d.amp)
 
-# ------------------------------------------------------------------
-# Constant / CW drive
-# ------------------------------------------------------------------
 
 struct ConstantDrive <: AbstractDrive
     amp::ComplexF64
@@ -417,20 +300,15 @@ drive_omega(d::ConstantDrive, t) = d.omega
 drive_phase(d::ConstantDrive, t) = d.omega * t
 drive_peak_amp(d::ConstantDrive) = abs(d.amp)
 
-# ------------------------------------------------------------------
-# Hyperbolic-secant (HS1 / Silver–Hodgkinson) pulse, optionally chirped
-#   E(t) = amp·sech(β(t-t0))·exp(i(phase + μ·ln cosh(β(t-t0)) + ω0·(t-t0)))
-#   ω(t) = ω0 + μ·β·tanh(β(t-t0))          (adiabatic sweep of width 2μβ)
-# ------------------------------------------------------------------
 
 struct SechDrive <: AbstractDrive
     t0::Float64
-    beta::Float64          # inverse width
+    beta::Float64
     amp::ComplexF64
-    mu::Float64            # chirp parameter (0 ⇒ unchirped)
+    mu::Float64
     omega0::Float64
     phase::Float64
-    n_width::Float64       # tstops at t0 ± n_width/β
+    n_width::Float64
 end
 
 function SechDrive(; t0, beta, amp, mu=0.0, omega0=0.0, phase=0.0, n_width=12.0)
@@ -449,7 +327,7 @@ function drive_E(d::SechDrive, t)
     return d.amp * sech(d.beta * τ) * cis(drive_phase(d, t))
 end
 has_sweep(d::SechDrive) = d.mu != 0
-drive_chirp_rate(d::SechDrive) = d.mu * d.beta^2        # peak dω/dt at t0
+drive_chirp_rate(d::SechDrive) = d.mu * d.beta^2
 drive_peak_amp(d::SechDrive) = abs(d.amp)
 drive_tstops(d::SechDrive) = [d.t0 - d.n_width / d.beta, d.t0, d.t0 + d.n_width / d.beta]
 function sweep_range(d::SechDrive; pad=0.0)
@@ -457,24 +335,15 @@ function sweep_range(d::SechDrive; pad=0.0)
     return d.omega0 - w - pad, d.omega0 + w + pad
 end
 
-# ------------------------------------------------------------------
-# Arbitrary user callable
-# ------------------------------------------------------------------
 
 struct FuncDrive{F,G} <: AbstractDrive
-    f::F                    # t -> complex E
-    omega_f::G              # t -> real instantaneous frequency
+    f::F
+    omega_f::G
     tstops::Vector{Float64}
     chirped::Bool
 end
 
-"""
-    FuncDrive(f; tstops = Float64[], omega = nothing)
 
-Wrap an arbitrary `f(t) -> Complex`. Pass `omega = g(t)` (real instantaneous
-frequency) to make it usable in the `:chirp` frame; without it `:chirp`
-degenerates to `:lab`. `tstops` marks any kinks in `f` for the integrator.
-"""
 function FuncDrive(f; tstops=Float64[], omega=nothing)
     ts = collect(Float64, tstops)
     omega === nothing && return FuncDrive(f, (t -> 0.0), ts, false)
@@ -485,8 +354,6 @@ drive_E(d::FuncDrive, t) = ComplexF64(d.f(t))
 drive_omega(d::FuncDrive, t) = d.chirped ? Float64(d.omega_f(t)) : 0.0
 drive_tstops(d::FuncDrive) = d.tstops
 has_sweep(d::FuncDrive) = d.chirped
-# φ from ω by trapezoidal accumulation from the first tstop (only meaningful when
-# `chirped`; an unchirped FuncDrive in the :chirp frame just reduces to :lab).
 function drive_phase(d::FuncDrive, t)
     d.chirped || return 0.0
     t0 = isempty(d.tstops) ? 0.0 : first(d.tstops)
@@ -499,9 +366,6 @@ function drive_phase(d::FuncDrive, t)
     return s * h
 end
 
-# ------------------------------------------------------------------
-# Superposition
-# ------------------------------------------------------------------
 
 struct DriveSum{T<:Tuple} <: AbstractDrive
     drives::T
@@ -510,28 +374,20 @@ DriveSum(ds::AbstractDrive...) = DriveSum(ds)
 
 drive_E(d::DriveSum, t) = sum(drive_E(x, t) for x in d.drives)
 drive_tstops(d::DriveSum) = sort!(unique!(reduce(vcat, (drive_tstops(x) for x in d.drives); init=Float64[])))
-# A sum has no single well-defined carrier; :chirp is not meaningful for it.
 has_sweep(::DriveSum) = false
 drive_peak_amp(d::DriveSum) = sum(drive_peak_amp(x) for x in d.drives)
 
-# ------------------------------------------------------------------
-# accel_iscd/src/ensemble.jl  (quadrature path only; the :histogram path
-# in the drop-in reuses InhomogeneousSpinCavityDynamics' own prepare_derived
-# bins, so the equal-width histogram helpers and their `erf` dependency are
-# dropped here. `gausslegendre` / `gausshermite` are provided locally by
-# Golub-Welsch so FastGaussQuadrature is not needed.)
-# ------------------------------------------------------------------
 
 struct Ensemble
     M::Int
     M_delta::Int
     M_g::Int
-    method::Symbol             # :histogram | :quadrature
+    method::Symbol
     delta_1d::Vector{Float64}
     g_1d::Vector{Float64}
     p_delta::Vector{Float64}
     p_g::Vector{Float64}
-    delta_b::Vector{Float64}   # length M
+    delta_b::Vector{Float64}
     g_b::Vector{Float64}
     Nj::Vector{Float64}
     N_total::Float64
@@ -540,9 +396,8 @@ struct Ensemble
     g2_avg::Float64
 end
 
-# --- Golub-Welsch nodes/weights (replace FastGaussQuadrature) --------------
 
-"""Gauss-Legendre nodes/weights on [-1, 1] (∫ dx = 2)."""
+
 function gausslegendre(n::Int)
     n >= 1 || error("gausslegendre needs n >= 1")
     n == 1 && return [0.0], [2.0]
@@ -555,7 +410,7 @@ function gausslegendre(n::Int)
     return x[p], w[p]
 end
 
-"""Physicists' Gauss-Hermite nodes/weights (weight e^{-x^2}, ∫ = √π)."""
+
 function gausshermite(n::Int)
     n >= 1 || error("gausshermite needs n >= 1")
     n == 1 && return [0.0], [sqrt(π)]
@@ -568,12 +423,8 @@ function gausshermite(n::Int)
     return x[p], w[p]
 end
 
-# --- 1-D quadratures ------------------------------------------------------
 
-"""
-Tan-mapped Gauss-Legendre for a Lorentzian of half-width `γ` (FWHM/2).
-`δ = γ tan(θ)`, `θ ∈ (-π/2, π/2)` converts `ρ_L(δ) dδ` into `dθ/π`.
-"""
+
 function lorentzian_tan_nodes(M_delta::Int, γ::Float64; trim=1e-3)
     M_delta >= 1 || error("M_delta must be positive")
     γ > 0 || error("Lorentzian γ must be positive")
@@ -587,10 +438,7 @@ function lorentzian_tan_nodes(M_delta::Int, γ::Float64; trim=1e-3)
     return δ, p
 end
 
-"""
-Gauss-Hermite nodes for a Gaussian `N(μ, σ²)`.
-`x = (g-μ)/(σ√2)` converts `ρ(g) dg` into `π^{-1/2} e^{-x²} dx`.
-"""
+
 function gaussian_hermite_nodes(n::Int, μ::Float64, σ::Float64)
     n >= 1 || error("n must be positive")
     σ > 0 || error("Gaussian σ must be positive")
@@ -601,10 +449,7 @@ function gaussian_hermite_nodes(n::Int, μ::Float64, σ::Float64)
     return g, p
 end
 
-"""
-Tan-mapped Gauss-Legendre for a Pearson-VII (generalised-Lorentzian) line
-`ρ(δ) ∝ [1 + (δ/w)²]^(-n)`. `n = 1` is the plain Lorentzian.
-"""
+
 function pearson_tan_nodes(M_delta::Int, w::Float64, n::Int; trim=1e-3)
     M_delta >= 1 || error("M_delta must be positive")
     w > 0 || error("Pearson-VII w must be positive")
@@ -620,16 +465,13 @@ function pearson_tan_nodes(M_delta::Int, w::Float64, n::Int; trim=1e-3)
     return δ, p
 end
 
-"""Gauss-Legendre nodes/weights of `n` points mapped to `[a, b]`."""
+
 function _gl_on(n::Int, a::Float64, b::Float64)
     x, w = gausslegendre(n)
     return 0.5 * (b - a) .* x .+ 0.5 * (a + b), 0.5 * (b - a) .* w
 end
 
-"""
-Truncated Cauchy coupling, tan-mapped Gauss-Legendre. `g = center + hwhm·tan θ`
-with `θ ∈ [-atan(span), atan(span)]` turns `ρ_L(g) dg` into `dθ/π`.
-"""
+
 function lorentzian_trunc_nodes(M::Int, center::Float64, hwhm::Float64, span::Float64)
     M >= 1 || error("M must be positive")
     hwhm > 0 || error("Lorentzian hwhm must be positive")
@@ -643,7 +485,7 @@ function lorentzian_trunc_nodes(M::Int, center::Float64, hwhm::Float64, span::Fl
     return g, p
 end
 
-"""Power-law `p(g) ∝ g^(-α)` on `[g_min, g_max]`, Gauss-Legendre in `log g`."""
+
 function powerlaw_log_nodes(M::Int, g_min::Float64, g_max::Float64, α::Float64)
     M >= 1 || error("M must be positive")
     0 < g_min < g_max || error("powerlaw needs 0 < g_min < g_max")
@@ -654,7 +496,6 @@ function powerlaw_log_nodes(M::Int, g_min::Float64, g_max::Float64, α::Float64)
     return g, p
 end
 
-# --- product mesh ------------------------------------------------------
 
 function _product(delta_1d, p_delta, g_1d, p_g, N)
     M_delta = length(delta_1d)
@@ -688,7 +529,7 @@ function _g_nodes(sys::System, M_g; method, span_sigma, renormalize)
         return gaussian_hermite_nodes(M_g, sys.g_mean, sys.g_std)
     elseif sys.g_kind === :lorentzian
         return lorentzian_trunc_nodes(M_g, sys.g_mean, sys.g_hwhm, sys.g_span)
-    else # :powerlaw
+    else
         return powerlaw_log_nodes(M_g, sys.g_min, sys.g_max, sys.g_alpha)
     end
 end
@@ -704,7 +545,7 @@ function _delta_nodes(sys::System, M_delta; method, span, trim, renormalize)
         σ = gaussian_sigma_from_FWHM(sys.FWHM)
         δ, p = gaussian_hermite_nodes(M_delta, 0.0, σ)
         return δ, p, 1.0
-    else # :powerlaw (Pearson-VII)
+    else
         δ, p = pearson_tan_nodes(M_delta, pearson_w(sys.FWHM, sys.freq_n), sys.freq_n; trim=trim)
         return δ, p, 1.0
     end
@@ -722,7 +563,7 @@ function _finish_ensemble(method, sys, M_delta, M_g, delta_1d, p_delta, g_1d, p_
     )
 end
 
-"""Measure-adapted quadrature product mesh (tan-Lorentz × Hermite-Gauss)."""
+
 function quadrature_ensemble(sys::System; M_delta=48, M_g=8, trim=1e-3)
     δ, pδ, _ = _delta_nodes(sys, M_delta; method=:quadrature, span=2.5, trim=trim, renormalize=true)
     g, pg = _g_nodes(sys, M_g; method=:quadrature, span_sigma=4.0, renormalize=true)
@@ -739,10 +580,6 @@ function build_ensemble(sys::System; method=:quadrature, kwargs...)
           "drop-in; the :histogram path uses prepare_derived's bins directly.")
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/metrics.jl  (verbatim)
-# ------------------------------------------------------------------
-# Observables from a lab-frame 1st-order state u = [a; Sp; Sz].
 
 const WEAK_SEED = 1.0e-3
 
@@ -753,9 +590,6 @@ function unpack_1st(u::AbstractVector, M::Int)
     return a, Sp, Sz
 end
 
-# Group bin indices by shared detuning. The product mesh repeats `delta_1d`
-# verbatim across g-blocks, but tolerance grouping keeps this correct even if
-# a caller passes per-bin-perturbed detunings.
 function _frequency_slices(delta_b::AbstractVector)
     n = length(delta_b)
     n == 0 && return Vector{Int}[]
@@ -779,7 +613,7 @@ function _frequency_slices(delta_b::AbstractVector)
     return slices
 end
 
-"""Bright-mode weighted inversion `I ∈ [0,1]` (paper App. H)."""
+
 function weighted_inversion(Sz, g_b, Nj)
     W = 0.0
     acc = 0.0
@@ -792,12 +626,7 @@ function weighted_inversion(Sz, g_b, Nj)
     return acc / (W + 1e-30)
 end
 
-"""
-Per-frequency-slice silencing `|F|_⋆ = ⟨|F(ω)|⟩` (paper Eq. 5 / A.132).
 
-`F(ω) = Σ_{j∈B(ω)} g_j² Sp_j / Σ_{j∈B(ω)} g_j² Sp_j(0)`,
-then average `|F(ω)|` with bright-mode density `n(ω) = Σ Nj g²`.
-"""
 function weighted_silencing(Sp, g_b, Nj, delta_b; eps_seed=WEAK_SEED, slices=nothing)
     slices === nothing && (slices = _frequency_slices(delta_b))
     num = 0.0
@@ -820,22 +649,6 @@ function weighted_silencing(Sp, g_b, Nj, delta_b; eps_seed=WEAK_SEED, slices=not
     return clamp(num / (den + 1e-30), 0.0, 1.0)
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/rhs_1st.jl  (verbatim)
-# ------------------------------------------------------------------
-# 1st-order mean-field Heisenberg–Langevin RHS, three frames, optional
-# sweep active set, optional homogeneous spin relaxation.
-#
-# Lab:
-#   ȧ  = √κe E − i δ0 a − i Σ g_j S^{+*}_j − (κt/2) a
-#   Ṡ⁺ = i δ S⁺ − 2i g a* Sz − gperp S⁺
-#   Ṡz = −i g a S⁺ + i g a* S^{+*} − gpar (Sz − w_eq Nⱼ/2)
-#
-# Interaction picture (`:ip`): S̃⁺ = S⁺ e^{-i δ t}, Sz unchanged.
-# Chirp frame (`:chirp`): ã = a e^{-i φ(t)}, s̃⁺ = S⁺ e^{+i φ(t)} — the two
-#   counter-rotate so g·a·S⁺ stays phase-free. The cavity then picks up +ω,
-#   the spin sees δ + ω, and a spin is driven when δ = −ω(t). gperp / gpar are
-#   scalar and commute with the frame rotation.
 
 const IDX_A = 1
 state_length_1st(M) = 1 + 2M
@@ -845,14 +658,14 @@ mutable struct IntegratorCache
     eligible::Vector{Bool}
     n_live::Int
     n_eval::Int
-    n_rhs_bins::Int            # cumulative live-bin updates
+    n_rhs_bins::Int
     halfwidth::Float64
 end
 
 function IntegratorCache(ens::Ensemble, drive::AbstractDrive; halfwidth, pad)
     M = ens.M
-    # A spin is driven when δ ≈ −ω(t) (see rhs_chirp!), so the addressed
-    # detuning band is the *negated* frequency sweep, widened by `pad`.
+
+
     ωlo, ωhi = sweep_range(drive; pad=0.0)
     lo, hi = -ωhi - pad, -ωlo + pad
     eligible = Vector{Bool}(undef, M)
@@ -866,9 +679,9 @@ end
 
 function default_halfwidth(sys::System, drive::AbstractDrive; n_win=4.0)
     k = abs(drive_chirp_rate(drive))
-    # Steady-state |a| ≈ 2√κe |E| / κt, Ω = 2 g |a|. The activation window is
-    # a few times the Landau–Zener / Rabi width max(Ω, √|k|); κt is not part
-    # of it, and a large n_win would make every tan-mapped tail eligible.
+
+
+
     a_ss = 2 * sqrt(sys.kappa_e) * drive_peak_amp(drive) / max(kappa_t(sys), eps(Float64))
     g0 = sys.g_kind === :constant ? abs(sys.g_value) :
          sys.g_kind === :powerlaw ? sqrt(g2_avg(sys)) : abs(sys.g_mean)
@@ -879,9 +692,9 @@ end
 _activation_start(drive::AbstractDrive) = isempty(drive_tstops(drive)) ? -Inf : first(drive_tstops(drive))
 
 function _activate!(cache::IntegratorCache, ens::Ensemble, drive::AbstractDrive, t)
-    # Bins ahead of the sweep (and the whole line before the pulse) keep their
-    # initial S⁺ and must not enter ȧ: tan-mapped tails have huge |δ| and would
-    # stiffen the cavity for no physics.
+
+
+
     t < _activation_start(drive) && return nothing
     ω = drive_omega(drive, t)
     hw = cache.halfwidth
@@ -896,9 +709,6 @@ function _activate!(cache::IntegratorCache, ens::Ensemble, drive::AbstractDrive,
     return nothing
 end
 
-# Per-bin macrospin of length Nj/2. `:weak` seeds a tiny +x coherence
-# (matches weighted_silencing's denominator); it sits O(WEAK_SEED²) off the
-# Bloch sphere, which is negligible. `:equator` is Sz = 0, Sp = Nj/2.
 function build_u0_1st(ens::Ensemble, initial_condition::Symbol)
     M = ens.M
     u0 = zeros(ComplexF64, state_length_1st(M))
@@ -919,12 +729,7 @@ function build_u0_1st(ens::Ensemble, initial_condition::Symbol)
     return u0
 end
 
-"""
-    frame_from_lab(a, Sp, Sz, ens, drive, t, frame) -> u
 
-Inverse of [`lab_state`](@ref): pack a lab-frame `(a, Sp, Sz)` into the stored
-state vector of `frame` at time `t`. `Sp`, `Sz` may be scalars or length-M.
-"""
 function frame_from_lab(a, Sp, Sz, ens::Ensemble, drive::AbstractDrive, t, frame::Symbol)
     M = ens.M
     u = Vector{ComplexF64}(undef, state_length_1st(M))
@@ -938,13 +743,13 @@ function frame_from_lab(a, Sp, Sz, ens::Ensemble, drive::AbstractDrive, t, frame
     elseif frame === :ip
         u[1] = a
         @inbounds for j in 1:M
-            us[j] *= cis(-ens.delta_b[j] * t)          # S̃⁺ = S⁺ e^{-iδt}
+            us[j] *= cis(-ens.delta_b[j] * t)
         end
     elseif frame === :chirp
         φ = drive_phase(drive, t)
-        u[1] = a * cis(-φ)                             # ã = a e^{-iφ}
+        u[1] = a * cis(-φ)
         @inbounds for j in 1:M
-            us[j] *= cis(φ)                            # s̃⁺ = S⁺ e^{+iφ}
+            us[j] *= cis(φ)
         end
     else
         error("unknown frame $frame")
@@ -952,7 +757,6 @@ function frame_from_lab(a, Sp, Sz, ens::Ensemble, drive::AbstractDrive, t, frame
     return u
 end
 
-# ----- lab frame -----
 
 function rhs_lab!(du, u, p, t)
     sys, ens, drive, cache, active = p
@@ -977,7 +781,7 @@ function rhs_lab!(du, u, p, t)
         δj = ens.delta_b[j]
         Spj = Sp[j]
         Szj = Sz[j]
-        # every bin freely precesses and relaxes; only live bins are driven
+
         dSp[j] = 1im * δj * Spj - gperp * Spj
         dSz[j] = -gpar * (Szj - weq * ens.Nj[j] / 2)
         (active && !cache.live[j]) && continue
@@ -991,7 +795,6 @@ function rhs_lab!(du, u, p, t)
     return nothing
 end
 
-# ----- interaction picture: stored Sp is S̃⁺ = S⁺ e^{-i δ t} -----
 
 function rhs_ip!(du, u, p, t)
     sys, ens, drive, cache, active = p
@@ -1015,12 +818,12 @@ function rhs_ip!(du, u, p, t)
     @inbounds for j in 1:M
         Stj = St[j]
         Szj = Sz[j]
-        # the integrating factor already removes free precession; relaxation stays
+
         dSt[j] = -gperp * Stj
         dSz[j] = -gpar * (Szj - weq * ens.Nj[j] / 2)
         (active && !cache.live[j]) && continue
         gj = ens.g_b[j]
-        phase = cis(ens.delta_b[j] * t)               # e^{i δ t}: S⁺ = S̃⁺ * phase
+        phase = cis(ens.delta_b[j] * t)
         Spj = Stj * phase
         src += gj * conj(Spj)
         dSt[j] += -2im * gj * ac * Szj * conj(phase)
@@ -1031,7 +834,6 @@ function rhs_ip!(du, u, p, t)
     return nothing
 end
 
-# ----- chirp frame: ã = a e^{-iφ}, s̃⁺ = S⁺ e^{+iφ} (counter-rotating) -----
 
 function rhs_chirp!(du, u, p, t)
     sys, ens, drive, cache, active = p
@@ -1071,7 +873,7 @@ function rhs_chirp!(du, u, p, t)
     return nothing
 end
 
-"""Convert a stored state at time `t` to lab-frame `(a, Sp, Sz)` copies."""
+
 function lab_state(u, ens::Ensemble, drive::AbstractDrive, t, frame::Symbol)
     M = ens.M
     a = u[1]
@@ -1087,7 +889,7 @@ function lab_state(u, ens::Ensemble, drive::AbstractDrive, t, frame::Symbol)
         end
         return a, Sp, copy(Sz)
     elseif frame === :chirp
-        # ã = a e^{-iφ}, s̃⁺ = S⁺ e^{+iφ}: invert each with the opposite sign.
+
         φ = drive_phase(drive, t)
         za = cis(φ)
         zs = cis(-φ)
@@ -1100,12 +902,6 @@ function lab_state(u, ens::Ensemble, drive::AbstractDrive, t, frame::Symbol)
     end
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/gpu_detect.jl  (AccelISCD -> @__MODULE__)
-# ------------------------------------------------------------------
-# GPU discovery. `gpus=:auto` uses every visible GPU (capped at MAX_GPUS).
-# More requested shards than devices → several shards share a device
-# (virtual sharding), which is how the multi-GPU path is tested on 1 GPU.
 
 const MAX_GPUS = 16
 
@@ -1113,7 +909,7 @@ struct GPUPlan
     functional::Bool
     ndev::Int
     nshards::Int
-    devices::Vector{Any}     # CuDevice, or empty
+    devices::Vector{Any}
 end
 
 gpu_functional() = isdefined(@__MODULE__, :CUDA) && CUDA.functional() && CUDA.ndevices() >= 1
@@ -1124,11 +920,7 @@ function detect_gpus()
     return GPUPlan(true, ndev, ndev, Any[dev for (i, dev) in enumerate(CUDA.devices()) if i <= ndev])
 end
 
-"""
-    gpu_info() -> NamedTuple
 
-Visible CUDA devices. Safe to call with no GPU (returns `functional=false`).
-"""
 function gpu_info()
     if !gpu_functional()
         return (functional=false, ndevices=0, names=String[], cap=MAX_GPUS)
@@ -1137,22 +929,9 @@ function gpu_info()
     return (functional=true, ndevices=length(names), names=names, cap=MAX_GPUS)
 end
 
-# Below this many bins per shard, sharding overhead beats the parallelism, so
-# `:auto` uses fewer GPUs (or one).
 const MIN_BINS_PER_SHARD = 1024
 
-"""
-    make_gpu_plan(M; gpus=:auto, nshards=nothing, min_bins=MIN_BINS_PER_SHARD) -> GPUPlan
 
-`gpus`:
-- `:auto` (default) — one shard per visible GPU, but no more than
-  `M ÷ min_bins` (so small problems stay on one device). Nothing changes in
-  the caller from 1 to 8 GPUs.
-- integer `1:MAX_GPUS` — exactly that many shards, round-robin over the
-  visible devices, so `gpus=8` on a 1-GPU box still exercises the 8-shard path.
-
-`nshards` overrides the count while keeping the `:auto` device round-robin.
-"""
 function make_gpu_plan(M::Integer; gpus=:auto, nshards=nothing,
                        min_bins::Integer=MIN_BINS_PER_SHARD)
     gpu_functional() || return GPUPlan(false, 0, 0, Any[])
@@ -1188,7 +967,7 @@ function enable_peer_access!(devices)
                 nok += 1
             end
         catch
-            # staged host copies for the scalar cavity source anyway
+
         end
     end
     return npair == 0 ? 1.0 : nok / npair
@@ -1198,7 +977,7 @@ struct BinPartition
     M::Int
     nshards::Int
     counts::Vector{Int}
-    offsets::Vector{Int}   # 0-based
+    offsets::Vector{Int}
 end
 
 function BinPartition(M::Integer, nshards::Integer)
@@ -1217,28 +996,19 @@ end
 shard_range(part::BinPartition, p::Integer) =
     (part.offsets[p] + 1):(part.offsets[p] + part.counts[p])
 
-# ------------------------------------------------------------------
-# accel_iscd/src/resources.jl  (verbatim)
-# ------------------------------------------------------------------
-# Compute resources visible to the engine selector.
-#
-# `detect_resources` is cached for a few seconds: probing every GPU's
-# `free_memory` calls `CUDA.device!` and must not run on every `solve_1st`.
 
-# GPU is worthwhile only when per-step bin work amortises the host-scalar
-# cavity syncs (7 Tsit5 stages). WSL2's CUDA D2H latency is ~20× native.
 const GPU_M_MIN_NATIVE = 8_192
 const GPU_M_MIN_WSL    = 32_768
 const GPU_BYTES_PER_BIN = 320
 const _RES_TTL = 5.0
 
 struct Resources
-    ncores::Int              # physical/logical CPU threads (Sys.CPU_THREADS)
-    nthreads::Int            # Julia threads in this session
-    ngpu::Int                # visible CUDA devices (0 if CUDA is not functional)
-    gpu_free_bytes::Int      # free memory on the smallest visible device (0 if none)
+    ncores::Int
+    nthreads::Int
+    ngpu::Int
+    gpu_free_bytes::Int
     gpu_names::Vector{String}
-    is_wsl::Bool             # WSL2 has ~20× the CUDA host-sync latency of native Linux
+    is_wsl::Bool
 end
 
 const _RES_LOCK = ReentrantLock()
@@ -1256,15 +1026,7 @@ function _detect_wsl()
     end
 end
 
-"""
-    detect_resources(; force=false) -> Resources
 
-Probe the machine: CPU threads, Julia threads, visible CUDA devices and
-their free memory, and whether we are on WSL2.
-
-The result is cached for a few seconds (`force=true` refreshes). The probe
-restores the previously selected CUDA device so it is safe on the hot path.
-"""
 function detect_resources(; force::Bool=false)
     lock(_RES_LOCK) do
         if !force && _RES[] !== nothing && (time() - _RES_T[]) < _RES_TTL
@@ -1310,18 +1072,7 @@ function _detect_resources_uncached()
     return Resources(ncores, nthreads, ngpu, free_bytes, names, _detect_wsl())
 end
 
-"""
-    gpu_compute_worthwhile(M, resources; gpu_M_min=nothing) -> Bool
 
-Whether the fused multi-GPU Tsit5 path is expected to beat CPU OrdinaryDiffEq
-for a 1st-order problem with `M` bins. False when there is no device, `M` is
-below the platform threshold (8192 native, 32768 on WSL2), bins-per-GPU is
-below `MIN_BINS_PER_SHARD`, or the 320 B/bin footprint would exceed 70% of
-the smallest card's free memory.
-
-`solve_1st(...; compute=:auto)` and `select_engine` share this predicate.
-`compute=:gpu` still forces the device path.
-"""
 function gpu_compute_worthwhile(M::Integer, res::Resources; gpu_M_min::Union{Int,Nothing}=nothing)
     res.ngpu < 1 && return false
     gmin = gpu_M_min !== nothing ? Int(gpu_M_min) : (res.is_wsl ? GPU_M_MIN_WSL : GPU_M_MIN_NATIVE)
@@ -1331,20 +1082,6 @@ function gpu_compute_worthwhile(M::Integer, res::Resources; gpu_M_min::Union{Int
     return dev_bytes < 0.7 * max(res.gpu_free_bytes, 1)
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/gpu_kernels.jl  (verbatim)
-# ------------------------------------------------------------------
-# Fused 1st-order GPU kernels. One thread per owned bin.
-#
-# `_stage_kernel!` does the whole RK stage in one launch: form
-#   y = u + dt·Σ_{i<stage} c_i·k_i,
-# evaluate the mean-field RHS, write column `stage` of k, and block-reduce
-# Σ g·conj(S⁺) into `partial` (one ComplexF64 per block).
-#
-# Host-cavity: `a` is passed as (a_re, a_im) kernel args — no 1-thread store.
-# Device-cavity: each thread forms `a` from `a_acc` + `ka` (L1-broadcast);
-# a 1-block follow-up writes `ka[stage]` from the reduced source. No 1-thread
-# kernels on the hot path.
 
 const GPU_THREADS = 128
 const GPU_N_WARPS = GPU_THREADS ÷ 32
@@ -1422,9 +1159,6 @@ end
     return Complex{Float64}(a_re, a_im)
 end
 
-# frame: 1 lab, 2 ip, 3 chirp.
-# use_dev_a=1 → a from a_acc + dt Σ c_i ka (device-resident cavity).
-# use_dev_a=0 → a = (a_re, a_im) host scalars.
 function _stage_kernel!(kSp, kSz, ySp, ySz, stage, partial, uSp, uSz,
                         delta, g, Nj, live, eligible,
                         a_eval, a_acc, ka, a_re, a_im, use_dev_a,
@@ -1518,7 +1252,6 @@ end
     return ske * E - 1im * delta0 * a - 1im * s - halfκt * a
 end
 
-# 1-block reduction of `n` ComplexF64 partials → out[1]
 function _reduce_complex!(out, partial, n)
     tid = Int(threadIdx().x)
     acc_re = 0.0
@@ -1553,7 +1286,6 @@ function _reduce_complex!(out, partial, n)
     return nothing
 end
 
-# Reduce source and write ka[stage] (device-cavity). 1 block.
 function _reduce_complex_cavity!(out, partial, n, ka, stage, a_eval,
                                  E_re, E_im, φ, ω, delta0, halfκt, ske, frame)
     tid = Int(threadIdx().x)
@@ -1617,7 +1349,6 @@ function _reduce_real!(out, partial, n)
     return nothing
 end
 
-# Reduce spin error + cavity 5th-order candidate / scaled error. 1 block.
 function _reduce_real_cavity_err!(out, partial, n, a_new, err0, a_acc, ka, dt,
                                   b1, b2, b3, b4, b5, b6,
                                   bt1, bt2, bt3, bt4, bt5, bt6, bt7,
@@ -1659,7 +1390,6 @@ function _reduce_real_cavity_err!(out, partial, n, a_new, err0, a_acc, ka, dt,
     return nothing
 end
 
-# error estimate: err = dt Σ bt_i k_i, scaled by the 5th-order solution ySp/ySz.
 function _err_kernel!(partial, kSp, kSz, ySp, ySz,
                       dt, b1, b2, b3, b4, b5, b6, b7, atol, reltol, n)
     tid = Int(threadIdx().x)
@@ -1678,7 +1408,6 @@ function _err_kernel!(partial, kSp, kSz, ySp, ySz,
     return nothing
 end
 
-# k[:, dst] ← k[:, src]  (FSAL). Optional cavity commit: a_acc ← a_new, ka[1] ← ka[7].
 function _kcol_copy!(kSp, kSz, dst, src, n, a_acc, a_new, ka, do_cav)
     i = (Int(blockIdx().x) - 1) * Int(blockDim().x) + Int(threadIdx().x)
     if i <= n
@@ -1700,24 +1429,6 @@ function _count_kernel!(partial, live, n)
     return nothing
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/gpu_rk.jl  (verbatim)
-# ------------------------------------------------------------------
-# Sharded multi-GPU state + a fused custom Tsit5 stepper.
-#
-# Spin arrays live on the device(s). On a *single* shard the cavity `a` and
-# `ka` stay on device for a whole Tsit5 attempt (one D2H at accept/reject).
-# On several shards `a` is a host scalar: each stage launches one fused kernel
-# per shard, then a 1-block reduction to one ComplexF64/shard; the host sums
-# those scalars. No NCCL. Multi-shard launches use one CUDA stream per shard
-# so distinct GPUs overlap and virtual shards on one GPU overlap.
-#
-# Device memory: `free_gpu=true` (default) returns arrays to CUDA.jl's pool
-# via `unsafe_free!` — it does **not** `GC.gc` / `CUDA.reclaim()` (that would
-# hand the pool back to the driver and re-allocate on the next solve).
-# `free_gpu=false` keeps a process-wide workspace cache so the next matching
-# solve skips `cudaMalloc` entirely. `reclaim_gpu=true` is the explicit
-# "return memory to the driver" knob.
 
 mutable struct GPUShard
     id::Int
@@ -1725,29 +1436,29 @@ mutable struct GPUShard
     j0::Int
     mloc::Int
     nblocks::Int
-    uSp::Any            # accepted state
+    uSp::Any
     uSz::Any
-    ySp::Any            # stage scratch; after stage 7 holds the 5th-order solution
+    ySp::Any
     ySz::Any
-    kSp::Any            # mloc × 7 stage derivatives
+    kSp::Any
     kSz::Any
     delta::Any
     g::Any
     Nj::Any
     live::Any
     eligible::Any
-    partial::Any        # nblocks ComplexF64 (cavity source)
-    errpartial::Any     # nblocks Float64 (error norm)
-    a_eval::Any         # length-1 cavity amplitude at this stage
-    src1::Any           # length-1 reduced source
-    err1::Any           # length-1 reduced spin error
-    ka::Any             # length-7 cavity stage derivatives (single-shard path)
-    a_acc::Any          # length-1 accepted cavity amplitude
-    a_new::Any          # length-1 5th-order cavity candidate
-    err0::Any           # length-1 cavity error contribution
+    partial::Any
+    errpartial::Any
+    a_eval::Any
+    src1::Any
+    err1::Any
+    ka::Any
+    a_acc::Any
+    a_new::Any
+    err0::Any
     src_h::Vector{ComplexF64}
     err_h::Vector{Float64}
-    stream::Any            # CuStream when nshards>1 so devices / virtual shards overlap
+    stream::Any
 end
 
 struct Tsit5Tab{T}
@@ -1802,7 +1513,6 @@ function _pin_host(::Type{T}, n::Int) where {T}
     end
 end
 
-# CUDA.jl has no bulk copyto! from a SubArray; iterating would scalar-index.
 @inline _dense_host(src::Vector) = src
 @inline _dense_host(src) = copy(src)
 
@@ -1842,10 +1552,6 @@ function _sync_shard(s::GPUShard)
     return nothing
 end
 
-# Run a body on every shard. Kernel launches are asynchronous: one host thread
-# queues every shard (each on its own stream when nshards>1) so distinct GPUs
-# overlap and virtual shards on one GPU overlap. Do not spawn — CUDA.jl's
-# context is task-local, and two tasks on one device is undefined.
 function _for_each_shard(body, shards)
     n = length(shards)
     if n == 1
@@ -1962,7 +1668,6 @@ function _reload_shards!(shards, ens::Ensemble, u0::Vector{ComplexF64}, cache::I
     return part
 end
 
-# -------- workspace cache (free_gpu=false) --------
 
 mutable struct GPUWorkspace
     nshards::Int
@@ -1984,12 +1689,7 @@ function _ws_matches(ws::GPUWorkspace, plan::GPUPlan, M::Int)
     return true
 end
 
-"""
-    free_gpu_workspace!()
 
-Drop the process-wide GPU workspace cache (`free_gpu=false`) and return its
-arrays to CUDA.jl's pool. Does not `CUDA.reclaim()`.
-"""
 function free_gpu_workspace!()
     lock(_WS_LOCK) do
         ws = _WS[]
@@ -2015,7 +1715,7 @@ function _acquire_shards(ens::Ensemble, drive::AbstractDrive, u0::Vector{Complex
             _reload_shards!(taken, ens, u0, cache)
             return taken, BinPartition(ens.M, length(taken))
         end
-        # stale cache of a different shape
+
         free_gpu_workspace!()
     end
     return _build_shards(ens, drive, u0, plan, cache)
@@ -2025,7 +1725,7 @@ function _release_shards!(shards; keep::Bool, reclaim::Bool)
     if keep
         lock(_WS_LOCK) do
             if _WS[] !== nothing
-                # another workspace is parked; drop the incoming one
+
                 free_shards!(shards)
             else
                 _WS[] = GPUWorkspace(length(shards),
@@ -2051,7 +1751,7 @@ function _release_shards!(shards; keep::Bool, reclaim::Bool)
     return nothing
 end
 
-"""Release every device allocation held by the shards (idempotent)."""
+
 function free_shards!(shards)
     for s in shards
         try
@@ -2076,8 +1776,6 @@ function _frame_id(frame::Symbol)
     error("unknown frame $frame")
 end
 
-# One RK stage across all shards. Returns the combined cavity source Σ g conj(S⁺).
-# `a` is a host scalar (no 1-thread store kernel).
 function _stage!(shards, stage::Int, a_eval::ComplexF64, tstage::Float64,
                  ω::Float64, sys::System, drive::AbstractDrive, frame::Symbol,
                  active::Bool, cache::IntegratorCache, dt::Float64,
@@ -2120,7 +1818,6 @@ function _stage!(shards, stage::Int, a_eval::ComplexF64, tstage::Float64,
     return src
 end
 
-# Combined scaled error norm across all shards (plus the cavity component).
 function _error_est!(shards, a_err::ComplexF64, a_new::ComplexF64,
                      tab::Tsit5Tab{Float64}, dt::Float64,
                      atol::Float64, reltol::Float64, M::Int)
@@ -2144,8 +1841,6 @@ function _error_est!(shards, a_err::ComplexF64, a_new::ComplexF64,
     return sqrt(acc / (1 + 2 * M))
 end
 
-# Accept the step: y (5th-order solution) becomes the new u; FSAL k7 -> k1.
-# `do_cav=true` also commits device-resident a_acc / ka (single-shard path).
 function _accept!(shards; do_cav::Bool=false)
     dc = do_cav ? Int32(1) : Int32(0)
     _for_each_shard(shards) do s
@@ -2184,7 +1879,6 @@ function _n_live(shards)
     return n
 end
 
-# Packed scalars for the single-shard device-resident cavity path.
 function _devcav_params(sys::System, drive::AbstractDrive, frame::Symbol, active::Bool, cache::IntegratorCache)
     ts0 = _activation_start(drive)
     ts = isfinite(ts0) ? ts0 : -floatmax(Float64) / 4
@@ -2202,8 +1896,6 @@ function _devcav_params(sys::System, drive::AbstractDrive, frame::Symbol, active
     )
 end
 
-# Queue spin RHS + reduce + cavity ka[stage] on one shard. No host sync.
-# Each thread forms `a` from `a_acc`+`ka`; the 1-block reduce writes `ka[stage]`.
 function _queue_fused_stage!(s::GPUShard, P, stage::Int, ω::Float64, tstage::Float64,
                              dt::Float64, coeffs::NTuple{6,Float64}, nused::Int, write_y::Bool,
                              E::ComplexF64, φ::Float64)
@@ -2221,10 +1913,6 @@ function _queue_fused_stage!(s::GPUShard, P, stage::Int, ω::Float64, tstage::Fl
     return nothing
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/solve_1st.jl  (verbatim)
-# ------------------------------------------------------------------
-# Public 1st-order integrator.
 
 struct SolveResult
     sol
@@ -2260,24 +1948,14 @@ function _want_gpu(compute::Symbol, M::Int)
     error("compute must be :auto, :cpu, or :gpu; got $compute")
 end
 
-# `saveat`: nothing -> 201 uniform points; a number -> that time step;
-# anything else -> an explicit vector of save times.
 function _resolve_saveat(saveat, t0, tfinal)
     saveat === nothing && return collect(range(t0, tfinal; length=201))
     saveat isa Number && return collect(range(t0, tfinal; step=Float64(saveat)))
     return collect(Float64.(saveat))
 end
 
-# The active set drops the drive/source terms for bins the sweep has not reached.
-# That is exact only when those bins carry no coherence — i.e. S⁺(0) = 0. `:weak`
-# seeds S⁺(0) ≠ 0, so freezing the unswept tan-map tails would remove their
-# contribution to the cavity source and bias the linear susceptibility Π(s).
 const _IC_ACTIVE_OK = (:ground, :inverted)
 
-# Build the stored initial state for `frame` at `t0`, from either a symbolic
-# initial condition or an explicit `initial_state` (a length-(1+2M) lab vector,
-# a NamedTuple `(; a, Sp, Sz)` of lab quantities, or a previous SolveResult to
-# restart from).
 function _initial_state(ens, drive, frame, t0, initial_condition, initial_state)
     M = ens.M
     initial_state === nothing && return build_u0_1st_framed(ens, drive, frame, t0, initial_condition)
@@ -2302,7 +1980,6 @@ function _initial_state(ens, drive, frame, t0, initial_condition, initial_state)
     error("initial_state must be nothing, a lab-frame Vector, a NamedTuple (; a, Sp, Sz), or a SolveResult")
 end
 
-# symbolic IC is built in the lab frame at t0 then rotated into `frame`
 function build_u0_1st_framed(ens, drive, frame, t0, initial_condition)
     u_lab = build_u0_1st(ens, initial_condition)
     frame === :lab && return u_lab
@@ -2313,48 +1990,7 @@ function build_u0_1st_framed(ens, drive, frame, t0, initial_condition)
     return frame_from_lab(a, Sp, Sz, ens, drive, t0, frame)
 end
 
-"""
-    solve_1st(sys, drive, ens; kwargs...) -> SolveResult
 
-Integrate the 1st-order mean-field equations for a cavity + inhomogeneous spin
-ensemble driven by `drive::AbstractDrive` (a `WurstPulse`, `GaussianDrive`,
-`SechDrive`, `ConstantDrive`, `FuncDrive`, or `DriveSum`).
-
-# Keywords
-- `frame = :chirp`  — `:lab` and `:ip` accept any drive; `:chirp` co-rotates
-  with the drive's carrier phase and helps only for a genuinely chirped drive
-  (WURST / chirped sech), otherwise it silently reduces to `:lab`.
-- `active = true`   — sweep active set. Engages only when the drive has a
-  frequency sweep **and** `initial_condition ∈ (:ground, :inverted)` **and** no
-  explicit `initial_state`; otherwise it is disabled (with a warning if it was
-  explicitly requested). Not available for `:weak` — its seed coherence in the
-  unswept tails is part of the linear response and must keep driving the cavity.
-- `initial_condition = :ground` — `:ground | :inverted | :weak | :equator`
-- `initial_state = nothing` — overrides `initial_condition`: a lab-frame
-  `Vector` `[a; Sp(1:M); Sz(1:M)]`, a `NamedTuple (; a, Sp, Sz)` of lab
-  quantities (scalars broadcast), or a previous `SolveResult` to restart from.
-- `tspan`, `saveat` (`nothing` | step number | vector), `reltol`, `abstol`,
-  `halfwidth`, `pad`, `n_win`
-- `alg = Tsit5()`   — CPU integrator only; the GPU path always runs a fused Tsit5
-- `compute = :auto` — `:auto` uses CUDA only when a device is visible **and**
-  `gpu_compute_worthwhile(M)` (same predicate as `select_engine`: M large
-  enough that per-stage host syncs are amortised). `:gpu` forces the device
-  path; `:cpu` forces OrdinaryDiffEq.
-- `gpus = :auto`, `nshards = nothing` — sharding (see `make_gpu_plan`); `:auto`
-  spreads across every visible GPU with no other change
-- `free_gpu = true` — `unsafe_free!` shard arrays into CUDA.jl's pool before
-  returning (no `GC.gc` / `CUDA.reclaim()`, so the next same-size solve reuses
-  the pool). `false` parks a process-wide workspace so the next matching
-  `M`/shard layout skips `cudaMalloc` (`free_gpu_workspace!` drops it)
-- `reclaim_gpu = false` — `true` additionally `GC.gc(false); CUDA.reclaim()`s
-  (returns memory to the driver; slow, for leak checks / end of session)
-- `save_states = true` — GPU path only; `false` drops the full per-save state
-  vectors (`r.sol.u`) to save host RAM on large-`M`, many-`saveat` sweeps
-  (`r.a` / `r.inversion` / `r.silencing` are still filled)
-
-Homogeneous spin relaxation (`sys.gamma_perp`, `sys.gamma_par`, `sys.w_eq`) is
-integrated on every frame and on both the CPU and GPU paths.
-"""
 function solve_1st(sys::System, drive::AbstractDrive, ens::Ensemble;
                    frame::Symbol=:chirp,
                    active::Bool=true,
@@ -2438,18 +2074,6 @@ function solve_1st(sys::System, drive::AbstractDrive, ens::Ensemble;
     )
 end
 
-# ------------------------------------------------------------------
-# accel_iscd/src/gpu_solve.jl  (verbatim)
-# ------------------------------------------------------------------
-# Multi-GPU 1st-order driver. `solve_1st(...; compute=:auto)` lands here when
-# `gpu_compute_worthwhile(M)` is true (same predicate as `select_engine`).
-# `compute=:gpu` forces the device path. `gpus=:auto` shards across every
-# visible GPU. Multi-shard launches use one CUDA stream per shard.
-#
-# Memory: `free_gpu=true` (default) `unsafe_free!`s shard arrays into CUDA.jl's
-# pool — no `GC.gc` / `CUDA.reclaim()` (those belong to `reclaim_gpu=true`).
-# `free_gpu=false` parks the workspace for the next matching solve. Process
-# exit also drops the workspace cache.
 
 struct GPUSol
     t::Vector{Float64}
@@ -2462,14 +2086,11 @@ struct GPUSol
     nshards::Int
 end
 
-# Lab-frame cavity amplitude from the stored (possibly rotating-frame) `a`.
-# Sz is frame-invariant. A global chirp phase drops out of `|F|`.
 @inline function _a_lab(a_stored::ComplexF64, drive::AbstractDrive, t, frame::Symbol)
     frame === :chirp || return a_stored
     return a_stored * cis(drive_phase(drive, t))
 end
 
-# Cavity RHS on the host: da/dt given the (already reduced) spin source `src`.
 function _cavity_rhs(sys::System, frame::Symbol, a_eval::ComplexF64, src::ComplexF64,
                      E_lab::ComplexF64, φ::Float64, ω::Float64)
     κt = kappa_t(sys)
@@ -2553,7 +2174,7 @@ function _run_gpu_stepper_hostcav!(shards, sys, drive, ens, cache, plan, a0, fra
     ka = zeros(ComplexF64, 7)
     a = ComplexF64(a0)
 
-    # k1 = RHS(u, t0)
+
     ω = drive_omega(drive, t0)
     src = _stage!(shards, 1, a, t0, ω, sys, drive, frame, active, cache, 0.0, Z6, 0, false)
     ka[1] = _cavity_rhs(sys, frame, a, src, drive_E(drive, t0), drive_phase(drive, t0), ω)
@@ -2618,7 +2239,7 @@ function _run_gpu_stepper_hostcav!(shards, sys, drive, ens, cache, plan, a0, fra
         end
         dt = min(dt, gap)
 
-        # stages 2..7 (fused: each forms y = u + dt Σ c_i k_i, evaluates RHS)
+
         @inbounds for st in 2:7
             cf = stagecoeffs[st - 1]
             tstage = st == 7 ? t + dt : t + dt * cnode[st - 1]
@@ -2650,7 +2271,7 @@ function _run_gpu_stepper_hostcav!(shards, sys, drive, ens, cache, plan, a0, fra
             ctrl.qold = max(EEst, ctrl.qoldinit)
             t += dt
             a = a_new
-            _accept!(shards)          # y -> u (pointer swap), FSAL k7 -> k1
+            _accept!(shards)
             ka[1] = ka[7]
             dt = max(min(dt / q, tfinal - t, 10 * dt), 1e-18)
             while isave <= Nt && t_save[isave] <= t + 1e-18
@@ -2687,9 +2308,6 @@ function _run_gpu_stepper_hostcav!(shards, sys, drive, ens, cache, plan, a0, fra
     )
 end
 
-# Single-shard path: cavity `a` and `ka` live on the device. Stages of one
-# Tsit5 attempt are queued on the same stream; the host syncs once per
-# accept/reject for the PI controller, not seven times per attempt.
 function _run_gpu_stepper_devcav!(s, sys, drive, ens, cache, plan, a0, frame, active,
                                   initial_condition, tspan, saveat, reltol, abstol, maxiters,
                                   save_states::Bool)
@@ -2721,7 +2339,7 @@ function _run_gpu_stepper_devcav!(s, sys, drive, ens, cache, plan, a0, frame, ac
     φ0 = drive_phase(drive, t0)
     _queue_fused_stage!(s, P, 1, ω, t0, 0.0, Z6, 0, false, E0, φ0)
     cache.n_eval += 1
-    copyto!(s.src_h, 1, s.ka, 1, 1)   # sync: |k1| for the initial dt
+    copyto!(s.src_h, 1, s.ka, 1, 1)
     span = abs(tfinal - t0)
     dt = max(min(1e-6 * span, 0.01 / (abs(s.src_h[1]) + 1.0), span / 10), 1e-16)
 
@@ -2853,14 +2471,9 @@ function _run_gpu_stepper_devcav!(s, sys, drive, ens, cache, plan, a0, frame, ac
     )
 end
 
-end # module AccelSolver1stOrder
+end
 
-# ============================================================
-# ISCD-level adapter: same signature / return as the stock run_sim_1st_order.
-# ============================================================
 
-# Parity with the stock solver_1st_order.jl: `_is_gpu` true-branch for
-# ISCD's own rhs_1st_order! GPU path (unused by this drop-in, harmless).
 _is_gpu(::CUDA.AnyCuArray) = true
 
 const _ACCEL_WEAK_SEED = 1.0e-3
@@ -2870,10 +2483,6 @@ _accel_get(nt, k, default) = hasproperty(nt, k) ? getproperty(nt, k) : default
 _accel_freq_kind_safe(SYSTEM_CONFIG) =
     SYSTEM_CONFIG.freq_inhomogeneity.kind === :gaussian ? :gaussian : :lorentzian
 
-# Auto quadrature selector: parse SYSTEM_CONFIG and name the measure-matched
-# quadrature rule for each ensemble axis. `freq_rule` / `g_rule` are `nothing`
-# when that distribution has no spectral rule, in which case `quadrature_ok`
-# is false and the caller must use the equal-width histogram bins.
 function _accel_quadrature_plan(SYSTEM_CONFIG)
     fk = SYSTEM_CONFIG.freq_inhomogeneity.kind
     freq_rule =
@@ -2888,16 +2497,16 @@ function _accel_quadrature_plan(SYSTEM_CONFIG)
         gk === :gaussian   ? :gauss_hermite              :
         gk === :powerlaw_g ? :log_gauss_legendre         :
         gk === :lorentzian ? :truncated_cauchy_tan       :
-        nothing   # :user_defined / anything else
+        nothing
     return (; freq_kind = fk, freq_rule, g_kind = gk, g_rule,
               quadrature_ok = (freq_rule !== nothing && g_rule !== nothing))
 end
 
 function _accel_system(SYSTEM_CONFIG, d; for_quadrature::Bool)
     if !for_quadrature
-        # Only the scalar cavity params and (unused) relaxation matter for the
-        # histogram path; g_kind=:constant with g_value=√⟨g²⟩ keeps the
-        # activation-window heuristic well-defined.
+
+
+
         return AccelSolver1stOrder.System(;
             C_ens = d.C_ens, delta0 = d.delta0,
             kappa_e = d.kappa_e, kappa_i = d.kappa_i,
@@ -2940,8 +2549,6 @@ function _accel_system(SYSTEM_CONFIG, d; for_quadrature::Bool)
     end
 end
 
-# Wrap prepare_derived's histogram bins as an AccelISCD Ensemble (same flatten:
-# flat = iδ + (ig-1)*M_delta, i.e. vec(M_delta × M_g)).
 function _accel_ensemble_from_derived(d)
     M_delta = length(d.delta_b_1d)
     M_g     = length(d.g_b_1d)
@@ -2957,8 +2564,8 @@ end
 
 function _accel_build_drive(PULSE_CONFIG, E_of_t, tspan; structured::Bool)
     if !structured
-        # Faithful substitution: the integrator sees the exact same E(t) as
-        # E_of_t_arr / a_out / save_run_data. Pulse edges become tstops.
+
+
         ts = Float64[]
         for cfg in PULSE_CONFIG
             if cfg.kind === :wurst
@@ -2999,14 +2606,7 @@ function _accel_build_drive(PULSE_CONFIG, E_of_t, tspan; structured::Bool)
     return length(drives) == 1 ? drives[1] : AccelSolver1stOrder.DriveSum(drives...)
 end
 
-"""
-    run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu = true)
 
-Drop-in for the stock first-order runner. Same arguments, same returned
-`data` NamedTuple, same `save_run_data(CONFIG.saved_file_name, data)` side
-effect. Integration is performed by the ported AccelISCD stepper (see the
-file header for the optional `SIM_SETTING.accel_*` knobs).
-"""
 function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu = true)
     CONFIG = build_full_config(SIM_SETTING, SYSTEM_CONFIG)
     validate_config(CONFIG)
@@ -3022,7 +2622,7 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
 
     E_of_t = build_E_of_t(PULSE_CONFIG)
 
-    # ---- optional accel knobs (defaults reproduce the stock lab GPU solve) ----
+
     accel_ensemble = _accel_get(SIM_SETTING, :accel_ensemble, :histogram)
     accel_frame    = _accel_get(SIM_SETTING, :accel_frame, :lab)
     accel_active   = _accel_get(SIM_SETTING, :accel_active, false) === true
@@ -3039,8 +2639,8 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     compute = accel_compute === :default ?
         (AccelSolver1stOrder.gpu_functional() ? :gpu : :cpu) : accel_compute
 
-    # auto quadrature selector: match the quadrature rule to the SYSTEM_CONFIG
-    # distribution types; fall back to histogram if any axis has no rule.
+
+
     qplan = _accel_quadrature_plan(SYSTEM_CONFIG)
     if accel_ensemble === :auto
         if qplan.quadrature_ok
@@ -3076,7 +2676,7 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
 
     drive = _accel_build_drive(PULSE_CONFIG, E_of_t, d.timespan; structured = structured)
 
-    # ---- initial condition ----
+
     ic = get_initial_condition(CONFIG)
     ic_sym = :ground
     ic_vec = nothing
@@ -3120,7 +2720,7 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     println("Time taken: $elapsed_seconds seconds " *
             "(n_eval=$(r.n_eval), compute=$(r.compute), ngpus=$(r.ngpus), nshards=$(r.nshards))")
 
-    # ---- ensemble 1-D axes / resonant-δ bin (same semantics as the stock run) ----
+
     delta_b_1d = use_quad ? collect(Float64, ens.delta_1d) : collect(d.delta_b_1d)
     g_b_1d     = use_quad ? collect(Float64, ens.g_1d)     : collect(d.g_b_1d)
     Nj_2d      = use_quad ? reshape(collect(Float64, ens.Nj), M_delta, M_g) : d.Nj_2d
@@ -3148,7 +2748,7 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
         end
     end
 
-    # ---- walk saved states in the lab frame ----
+
     a_save  = Vector{ComplexF64}(undef, Nt)
     Σp_save = Vector{ComplexF64}(undef, Nt)
     Σz_save = Vector{ComplexF64}(undef, Nt)
@@ -3178,7 +2778,7 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
     a_out_p   = imag.(a_out)
     a_out_abs = abs.(a_out)
 
-    # ---- offline peak detection (same rule as the stock GPU callback) ----
+
     peak_detection_config = nothing
     peak_detection_results = nothing
     if peak_config !== nothing

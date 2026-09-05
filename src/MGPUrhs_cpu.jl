@@ -1,9 +1,3 @@
-# ============================================================
-# CPU REFERENCE RIGHT-HAND SIDE
-#
-# A direct transcription of the original single-GPU broadcast equations,
-# used only by the test suite.  Not a computational path.
-# ============================================================
 
 function rhs_cpu!(du::AbstractVector{Complex{T}}, u::AbstractVector{Complex{T}},
                   delta0::T, kappa_e::T, kappa_i::T,

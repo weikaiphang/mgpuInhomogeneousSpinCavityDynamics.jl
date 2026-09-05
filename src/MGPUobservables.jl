@@ -1,18 +1,5 @@
-# ============================================================
-# OBSERVABLE RECORDING
-#
-# Every saved quantity lives in the replicated small block, so the transfer
-# is one contiguous device-to-host copy of `3 + 5M` complex numbers from
-# shard 1 per output time — the O(M²) part never leaves the GPU.
-# ============================================================
 
-"""
-    ObservableStore{T}
 
-Pre-allocated host storage for the time series written by the solver.  Set
-`save_spins = false` for very large ensembles, where the `M × Nt` spin
-histories would dominate host memory; the cavity observables are always kept.
-"""
 struct ObservableStore{T}
     M::Int
     Nt::Int
@@ -47,12 +34,7 @@ function ObservableStore(::Type{T}, M::Int, Nt::Int; save_spins::Bool = true) wh
     )
 end
 
-"""
-    record!(store, prob, ireg, k, t)
 
-Copy the observable prefix of register `ireg` from shard 1 and unpack it into
-column `k` of the store.
-"""
 function record!(store::ObservableStore{T}, prob::MGPUProblem{T}, ireg::Int,
                  k::Int, t::Real) where {T}
     s = prob.shards[1]

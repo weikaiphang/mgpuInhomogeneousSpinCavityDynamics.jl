@@ -1,6 +1,3 @@
-# ============================================================
-# Paths, run-rule constants, manifest, and filename stems.
-# ============================================================
 
 const DATAGEN_ROOT = normpath(joinpath(@__DIR__, "..", "..", "data", "datagen"))
 const DATAGEN_CONFIG_DIR = joinpath(DATAGEN_ROOT, "configs")
@@ -19,9 +16,6 @@ const RULE_M_CAP = 60000
 const RULE_M_G_MAX = 30
 const RULE_SAFETY_MIN = 3.0
 
-# Allowed simulate-time ICs. These are pulse_optimizer2.jl's named
-# initial conditions (`build_u0_1st_order_cpu`), not the cost-mode
-# `track` (`:weak` default / `:dual` opt-in). Default is cannon = ground+equator.
 const DATAGEN_TRACKS = (:ground, :inverted, :equator, :weak, :weak_inverted)
 const DATAGEN_ICS = (:ground, :equator)
 const DATAGEN_TRACK_POLES = (:ground, :inverted)
@@ -39,11 +33,7 @@ function ensure_datagen_dirs()
     return nothing
 end
 
-"""
-Unwrap `TaskFailedException` / `CompositeException` so Ctrl-C from a
-`Threads.@spawn` worker is visible as `InterruptException`. Prefers an
-interrupt if several tasks failed. Cycle-safe.
-"""
+
 function unwrap_task_failure(err)
     seen = IdDict{Any, Nothing}()
     while true
@@ -86,7 +76,6 @@ function json_get(obj, key::AbstractString)
     return get(obj, Symbol(key), nothing)
 end
 
-# FNV-1a 64: process-stable (unlike hash()), no extra dependency.
 function fnv1a64(s::AbstractString)
     h = UInt64(0xcbf29ce484222325)
     for b in codeunits(s)
@@ -100,7 +89,6 @@ function stable_stem_tag(s::AbstractString)
     return lpad(string(fnv1a64(s); base=16), 16, '0')[1:8]
 end
 
-# Filename tokens match data/data_1st_order: 0p05, 1em06, units glued on.
 function fmt_plain(x::Real)
     x = Float64(x)
     isfinite(x) || error("fmt_plain requires a finite number, got $x.")

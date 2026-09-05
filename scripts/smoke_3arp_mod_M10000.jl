@@ -1,6 +1,3 @@
-# Smoke test: composite_arp_pulses___mod.jl at M = M_delta*M_g = 10000,
-# 3-ARP (n_pairs=1), target_silencing = 0 and 1. Base config = run_105
-# (lorentzian freq + gaussian coupling inhomogeneity). CPU solve.
 using InhomogeneousSpinCavityDynamics, JLD2, Printf
 const MOD = InhomogeneousSpinCavityDynamics
 Base.eval(MOD, :(include("/home/weika/projects/InhomogeneousSpinCavityDynamics.jl/src/composite_arp_pulses___mod.jl")))
@@ -9,7 +6,7 @@ base = load("/home/weika/projects/InhomogeneousSpinCavityDynamics.jl/data/sweep_
 SIM  = merge(base.SIM_SETTING, (M_delta = 500, M_g = 20, saved_file_name = "unused.jld2"))
 SYS  = base.SYSTEM_CONFIG
 d = prepare_derived(build_full_config(SIM, SYS))
-@assert d.M == 10000  "M = $(d.M) != 10000"
+@assert d.M == 10000
 
 println("M_delta x M_g            = ", SIM.M_delta, " x ", SIM.M_g, " = ", d.M)
 println("Ttotal                  = ", SIM.Ttotal)

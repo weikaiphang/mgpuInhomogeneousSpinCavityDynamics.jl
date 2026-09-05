@@ -1,6 +1,3 @@
-# ============================================================
-# ENSEMBLE DISCRETIZATION
-# ============================================================
 
 function bin_means_and_probs(dist, edges)
     Mloc = length(edges) - 1
@@ -63,28 +60,8 @@ function build_2d_bins(N, delta_b_1d, p_delta, g_b_1d, p_g)
 end
 
 
-# ============================================================
-# ENSEMBLE-METHOD SELECTOR  (auto quadrature vs equal-width histogram)
-#
-# These three helpers live here (not in ensemble_quadrature.jl) so the
-# histogram path of prepare_derived has NO cross-file dependency -- a
-# partial-include harness that loads only ensemble.jl still gets the
-# unchanged histogram behaviour. Only the :quadrature branch reaches into
-# ensemble_quadrature.jl.
-# ============================================================
 
-"""
-    ensemble_method_for(freq_cfg, g_cfg) -> NamedTuple
 
-Parse the two distribution configs and name the measure-matched quadrature
-rule per ensemble axis. `method` is `:quadrature` when BOTH axes have a
-spectral rule, else `:histogram` (`reason` set). `freq_rule` / `g_rule`
-are `nothing` on the axis that has no rule.
-
-  freq :lorentzian -> :tan_gauss_legendre    g :constant   -> :single_node
-       :gaussian   -> :gauss_legendre_pdf      :gaussian   -> :gauss_legendre_pdf
-                                               :powerlaw_g -> :log_gauss_legendre
-"""
 function ensemble_method_for(freq_cfg, g_cfg)
     fk = hasproperty(freq_cfg, :kind) ? freq_cfg.kind : :unknown
     gk = hasproperty(g_cfg, :kind)    ? g_cfg.kind    : :unknown
@@ -102,15 +79,7 @@ function ensemble_method_for(freq_cfg, g_cfg)
               g_kind = gk, g_rule = g_rule, reason = reason)
 end
 
-"""
-    resolve_ensemble_method(CONFIG, want::Symbol = :config) -> NamedTuple
 
-`want`: `:config` (read `CONFIG.ensemble_method`, default `:histogram`),
-`:histogram`, `:quadrature`, or `:auto`. Same NamedTuple shape as
-[`ensemble_method_for`](@ref) with a concrete `method`. `:quadrature`
-errors if the configs are not quadrature-representable; `:auto` silently
-falls back to `:histogram`.
-"""
 function resolve_ensemble_method(CONFIG, want::Symbol = :config)
     if want === :config
         want = hasproperty(CONFIG, :ensemble_method) ? Symbol(CONFIG.ensemble_method) : :histogram
@@ -145,12 +114,6 @@ function _log_ensemble_choice(plan, M_delta_req, M_g_req, M_delta, M_g, M)
     return nothing
 end
 
-# `ensemble_method`:
-#   :config     -- read CONFIG.ensemble_method (default :histogram for a bare call)
-#   :histogram  -- original equal-width bins (this body, unchanged)
-#   :quadrature -- Gauss quadrature nodes (prepare_derived_quadrature, ensemble_quadrature.jl)
-#   :auto       -- pick :quadrature when the line shapes have a spectral rule, else :histogram
-# The :histogram path below is byte-for-byte identical to before this hook.
 function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
     _ens_plan = resolve_ensemble_method(CONFIG, ensemble_method)
     if _ens_plan.method === :quadrature
@@ -171,9 +134,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
 
     sqrt_kappa_e = sqrt(kappa_e)
 
-    # ========================================================
-    # Frequency inhomogeneity
-    # ========================================================
+
+
+
 
     freq_cfg = CONFIG.freq_inhomogeneity
 
@@ -201,9 +164,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
 
     FWHM = freq_info.FWHM
 
-    # ========================================================
-    # Coupling inhomogeneity
-    # ========================================================
+
+
+
 
     g_inhomogeneity = CONFIG.g_inhomogeneity
 
@@ -213,9 +176,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
             M_g,
         )
 
-    # ========================================================
-    # Cooperativity -> total spin number
-    # ========================================================
+
+
+
 
     N = total_spin_number_from_cooperativity(
         C_ens,
@@ -226,9 +189,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
 
     println("Total spin number N = $N")
 
-    # ========================================================
-    # Build 2D bins
-    # ========================================================
+
+
+
 
     Nj, delta_b, g_b, N_total, Nj_2d = build_2d_bins(
         N,
@@ -238,9 +201,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
         p_g,
     )
 
-    # ========================================================
-    # Time grid
-    # ========================================================
+
+
+
 
     timespan = (0.0, CONFIG.Ttotal)
 

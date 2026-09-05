@@ -1,21 +1,5 @@
-# ============================================================
-# INITIAL CONDITIONS
-#
-# The small block is tiny, so it is built on the host and broadcast to every
-# shard.  The O(M²) block is written directly on the device: the only
-# non-zero entry for pole ICs is <Sz_j Sz_k> = Nj_j Nj_k / 4 off the
-# diagonal, so no host buffer of that size is ever allocated.
-#
-# IC symbols match `build_u0_1st_order_cpu` in pulse_optimizer2.jl.
-# :ground / :inverted / :custom small-block assignments are unchanged.
-# ============================================================
 
-"""
-    small_block_initial(M, Nj, kind, T)
 
-Host vector of length `3 + 9M` holding the replicated part of the initial
-state for `kind ∈ (:ground, :inverted, :equator, :weak, :weak_inverted, :custom)`.
-"""
 function small_block_initial(M::Int, Nj::AbstractVector, kind::Symbol, ::Type{T}) where {T}
     u = zeros(Complex{T}, small_length(M))
 
@@ -28,7 +12,7 @@ function small_block_initial(M::Int, Nj::AbstractVector, kind::Symbol, ::Type{T}
         u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
         u[small_range(M, F_SzSz_s)] .= Complex{T}.((Nj .^ 2) ./ 4)
     elseif kind === :custom
-        # all zero
+
     elseif kind === :equator || kind === :weak || kind === :weak_inverted
         Sp0, Sz0 = _mgpu_spin_means(Nj, kind)
         u[small_range(M, F_Sp)]     .= Complex{T}.(Sp0)
@@ -56,11 +40,7 @@ function _mgpu_spin_means(Nj, kind::Symbol)
     end
 end
 
-"""
-    set_initial_condition!(prob, Nj, kind)
 
-Write the initial state into register 1 on every shard.
-"""
 function set_initial_condition!(prob::MGPUProblem{T}, Nj::AbstractVector,
                                 kind::Symbol) where {T}
     M = prob.M
@@ -71,11 +51,11 @@ function set_initial_condition!(prob::MGPUProblem{T}, Nj::AbstractVector,
 
     each_shard(prob.shards, prob.exec) do s
         u = s.regs[1]
-        # See scatter_state!'s comment: fill!/copyto! must be pinned to
-        # s.stream, the same stream init_szsz_cross_kernel! below runs on --
-        # otherwise fill! (on the untargeted default stream) can race with
-        # (and even overwrite, since it zeros the whole register) the
-        # kernel's writes.
+
+
+
+
+
         CUDA.stream!(s.stream) do
             CUDA.fill!(u, zero(Complex{T}))
             copyto!(u, 1, small, 1, length(small))

@@ -1,15 +1,4 @@
-############################################################
-# GPU correlation calculations
-#
-# Solver choice:
-#   ASE-RASE   -> adaptive Tsit5
-#   ASE-ASE    -> fixed-step RK4
-#   RASE-RASE  -> fixed-step RK4
-############################################################
 
-# ============================================================
-# 1) PUBLIC SETTINGS
-# ============================================================
 
 Base.@kwdef struct CorrelationSettings
     tpi_us::Float64
@@ -27,7 +16,7 @@ Base.@kwdef struct CorrelationSettings
     tau_max_us::Float64 = 20.0
     dtau_us::Float64 = 0.01
 
-    # Used only by the adaptive ASE-RASE calculation.
+
     reltol::Float64 = 1e-8
     abstol::Float64 = 1e-8
 end
@@ -59,9 +48,6 @@ struct CorrelationWorkspace
     delta0_us::Float64
 end
 
-# ============================================================
-# 2) DATA-LOADING HELPERS
-# ============================================================
 
 function _has_value(container, name::Symbol)
     if container isa AbstractDict
@@ -118,10 +104,10 @@ function _load_time_axis_us(source)
     if _has_value(source, :times_us)
         return Float64.(_get_value(source, :times_us))
     elseif _has_value(source, :times)
-        # The original standalone correlation files store this axis in μs.
+
         return Float64.(_get_value(source, :times))
     elseif _has_value(source, :t_saved)
-        # InhomogeneousSpinCavityDynamics simulation output stores t_saved in seconds.
+
         return Float64.(_get_value(source, :t_saved)) .* 1e6
     end
 
@@ -167,7 +153,7 @@ function _load_kappa_arrays_us(source, Nt::Int)
     )
 
     kappa_t_full_us = if kappa_t_raw === nothing
-        # Preserve the behavior of the original correlation implementation.
+
         copy(kappa_e_full_us)
     elseif kappa_t_raw isa Number
         fill(Float64(kappa_t_raw) * 1e-6, Nt)
@@ -226,16 +212,7 @@ function _validate_workspace(workspace::CorrelationWorkspace)
     return nothing
 end
 
-"""
-    load_correlation_workspace(input_file)
 
-Load one second-order simulation file and convert all frequencies to rad/μs
-and the saved time axis to μs.
-
-Supported field aliases include both the older standalone layout
-(`times`, `Sp`, `Sz`, ...) and the InhomogeneousSpinCavityDynamics layout
-(`t_saved`, `Sp_sol`, `Sz_sol`, ...).
-"""
 function load_correlation_workspace(input_file::AbstractString)
     isfile(input_file) || error("Input file does not exist: $input_file")
 
@@ -256,16 +233,16 @@ function load_correlation_workspace(input_file::AbstractString)
     adSm_sol = ComplexF64.(_get_first(source, (:adSm_sol, :adSm)))
     adSz_sol = ComplexF64.(_get_first(source, (:adSz_sol, :adSz)))
 
-    # The saved second-order data contains separate one-dimensional
-    # detuning and coupling axes:
-    #
-    #   delta_b_1d: length M_delta
-    #   g_b_1d:     length M_g
-    #   Nj_2d:      size (M_delta, M_g)
-    #
-    # The spin arrays use one flattened ensemble index with
-    # M = M_delta * M_g rows. Reconstruct the flattened axes using
-    # Julia column-major ordering, where detuning changes fastest.
+
+
+
+
+
+
+
+
+
+
     if _has_value(source, :delta_b_1d) || _has_value(source, :g_b_1d)
         _has_value(source, :delta_b_1d) || error(
             "Saved data contains g_b_1d but is missing delta_b_1d.",
@@ -300,11 +277,11 @@ function load_correlation_workspace(input_file::AbstractString)
             )
         end
 
-        # Flattening convention:
-        #
-        #   j = i_delta + (i_g - 1) * M_delta
-        #
-        # Therefore delta changes fastest and g changes slowest.
+
+
+
+
+
         delta_b_us = repeat(
             delta_b_1d_us;
             outer = M_g,
@@ -315,8 +292,8 @@ function load_correlation_workspace(input_file::AbstractString)
             inner = M_delta,
         )
     else
-        # Compatibility with older files that already contain flattened
-        # delta_b and g_b arrays.
+
+
         delta_b_us =
             vec(Float64.(_get_first(source, (:delta_b,)))) .* 1e-6
 
@@ -377,9 +354,6 @@ function load_correlation_workspace(input_file::AbstractString)
     return workspace
 end
 
-# ============================================================
-# 3) INDEX HELPERS
-# ============================================================
 
 function _downsample_indices(idxs::Vector{Int}, Nkeep::Int)
     Nkeep > 0 || error("Nkeep must be positive.")
@@ -502,9 +476,6 @@ function _build_correlation_indices(
     )
 end
 
-# ============================================================
-# 4) INITIAL QRT COLUMN
-# ============================================================
 
 function _build_g0_adag_column_cpu(
     j0::Int,
@@ -535,9 +506,6 @@ function _build_g0_adag_column_cpu(
     return ComplexF64(g_a), ComplexF64(g_adag), gSp, gSm, gSz
 end
 
-# ============================================================
-# 5) RK4 QRT EQUATIONS
-# ============================================================
 
 function _qrt_rhs_one_gpu!(
     dSp,
@@ -728,9 +696,6 @@ function _rk4_step_one_gpu!(
     return ComplexF64(a_new), ComplexF64(adag_new)
 end
 
-# ============================================================
-# 6) TSIT5 QRT EQUATIONS
-# ============================================================
 
 function _tsit5_step_one_gpu!(
     a_col::ComplexF64,
@@ -834,9 +799,6 @@ function _tsit5_step_one_gpu!(
     return ComplexF64(cavity_end[1]), ComplexF64(cavity_end[2])
 end
 
-# ============================================================
-# 7) FORWARD CURVE FROM ONE FIXED TIME
-# ============================================================
 
 function _direct_gpu_curve(
     jfix::Int,
@@ -961,9 +923,6 @@ function _direct_gpu_curve(
     return Cxx, Cpp, Cadaga, Cadagadag
 end
 
-# ============================================================
-# 8) FORWARD AND SYMMETRIC CORRELATION MATRICES
-# ============================================================
 
 function _fixed_point_scan_curves_gpu(
     fixed_indices::Vector{Int},
@@ -1096,19 +1055,8 @@ function _fixed_point_scan_curves_symmetric_gpu(
     return Cxx_matrix, Cpp_matrix, Cadaga_matrix, Cadagadag_matrix
 end
 
-# ============================================================
-# 9) PUBLIC CORRELATION CALCULATION
-# ============================================================
 
-"""
-    compute_ase_rase_correlations_gpu(workspace, settings; verbose=true)
 
-Compute all three correlation groups on the GPU:
-
-- ASE-RASE with adaptive `Tsit5()`
-- ASE-ASE with fixed-step RK4
-- RASE-RASE with fixed-step RK4
-"""
 function compute_ase_rase_correlations_gpu(
     workspace::CorrelationWorkspace,
     settings::CorrelationSettings;
@@ -1289,15 +1237,8 @@ function compute_ase_rase_correlations_gpu(
     end
 end
 
-# ============================================================
-# 10) SAVE RESULTS
-# ============================================================
 
-"""
-    save_correlation_results(output_file, correlation_data)
 
-Save the returned correlation named tuple under the JLD2 key `data`.
-"""
 function save_correlation_results(
     output_file::AbstractString,
     correlation_data,

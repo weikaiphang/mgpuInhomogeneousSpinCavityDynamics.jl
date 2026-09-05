@@ -1,12 +1,3 @@
-# Datagen correctness and stress tests. Does not write under data/datagen/.
-# Not part of Pkg.test(); run this script.
-#
-#   julia --project=. src/datagen/datagen_selftest.jl
-#   julia --project=. src/datagen/datagen_selftest.jl --quick
-#   julia --project=. src/datagen/datagen_selftest.jl --skip-ode
-#
-# --quick skips full catalog pairing and the live ODE.
-# --skip-ode skips only the live ODE.
 
 include(joinpath(@__DIR__, "datagen_run.jl"))
 
@@ -40,7 +31,7 @@ function canonical_rase_spec()
     return sys, DG.bind_pulse(design, sys)
 end
 
-ts = @testset verbose = true "datagen selftest" begin
+ts = @testset verbose = true begin
 
     @testset "CLI parse" begin
         @test_throws ErrorException DG.parse_args(String[])

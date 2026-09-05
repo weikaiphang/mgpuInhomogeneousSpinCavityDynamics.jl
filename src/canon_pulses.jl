@@ -1,25 +1,5 @@
-# ============================================================
-# CANONICAL WARM-STARTS (HS1 / CORPSE / BB1 / BIR-4)
-#
-# These build a raw parameter vector `u` for an already-constructed
-# CompositePulse. They are optimizer INITIALISATIONS, not drop-in
-# replacements for analytic HS1/CORPSE/BB1/BIR-4 on the cavity:
-# build_E_of_t still applies the C^∞ taper window, so "rectangular"
-# composite envelopes are windowed, and the smooth-modulation seeds (HS1,
-# BIR-4) store collocation samples rather than an L2 projection onto the
-# B-spline basis.
-#
-# k is discrete -- each seed requires a fixed pulse.k (1 / 5 / 7 / 4).
-# Use optimise_composite_pulse_over_k to run independent continuous
-# optimisations in parallel, one per k, and keep the best.
-# ============================================================
 
-"""
-    k_of_seed_kind(kind::Symbol) -> Int
 
-Sub-pulse count required by a canonical seed: `:hs1 => 1`, `:corpse => 5`,
-`:bb1 => 7`, `:bir4 => 4`. `:random` has no fixed `k` (the caller chooses it).
-"""
 function k_of_seed_kind(kind::Symbol)
     kind === :hs1 && return 1
     kind === :corpse && return 5
@@ -31,18 +11,12 @@ function k_of_seed_kind(kind::Symbol)
     error("Unknown seed kind $(kind). Use :hs1, :corpse, :bb1, :bir4, or :random.")
 end
 
-"""
-    seed_hs1(pulse, Omega_max, beta, mu)
 
-Raw `u` for a complex hyperbolic-secant (HS1) adiabatic passage.
-Requires `pulse.k == 1`. `Omega_max` is a cavity-input peak for `E(t)`
-(same units as `pulse.amp_scale`), not a spin Rabi frequency.
-"""
 function seed_hs1(pulse::CompositePulse, Omega_max::Real, beta::Real, mu::Real)
     pulse.k == 1 || error("HS1 seed requires k=1, got k=$(pulse.k).")
     nA, nf = pulse.n_coeff_A, pulse.n_coeff_f
 
-    # Cover ±3/β of the sech envelope (sech(3) ≈ 0.1 at the edge)
+
     dur = 6.0 / beta
 
     raw_gap = [_softplus_inv(1e-5 / pulse.gap_scale)]
@@ -52,9 +26,9 @@ function seed_hs1(pulse::CompositePulse, Omega_max::Real, beta::Real, mu::Real)
     raw_cA = zeros(nA, 1)
     raw_cf = zeros(nf, 1)
 
-    # Collocate sech / tanh at equally spaced local times (not an L2
-    # projection onto the B-spline basis; clamped cubics interpolate
-    # endpoints only).
+
+
+
     t_nodes = range(-dur / 2, dur / 2; length=nA)
     for i in 1:nA
         A_val = Omega_max * sech(beta * t_nodes[i])
@@ -70,15 +44,7 @@ function seed_hs1(pulse::CompositePulse, Omega_max::Real, beta::Real, mu::Real)
     return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 end
 
-"""
-    seed_composite_with_ghosts(pulse, Omega_max, areas, phase_jumps)
 
-Active rectangular (constant-coefficient) sub-pulses separated by
-near-zero-amplitude "ghost" sub-pulses whose frequency-spline integral
-injects `phase_jumps[i]` into the next active pulse's phase offset.
-Requires `pulse.k == 2*length(areas)-1` and
-`length(phase_jumps) == length(areas)-1`.
-"""
 function seed_composite_with_ghosts(
     pulse::CompositePulse,
     Omega_max::Real,
@@ -114,7 +80,7 @@ function seed_composite_with_ghosts(
             idx = div(i, 2)
             raw_dur[i] = _softplus_inv((ghost_dur_target - pulse.dur_floor) / pulse.dur_scale)
             raw_cA[:, i] .= -30.0
-            # Constant-coefficient spline: ∫f dt = c * duration
+
             req_f = phase_jumps[idx] / ghost_dur_target
             raw_cf[:, i] .= req_f / pulse.freq_scale
         end
@@ -123,24 +89,14 @@ function seed_composite_with_ghosts(
     return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 end
 
-"""
-    seed_corpse(pulse, Omega_max)
 
-k=5. Net π with phases 0, π, 0 (jumps +π, −π). Cancels first-order
-detuning error in the ideal rectangular limit.
-"""
 function seed_corpse(pulse::CompositePulse, Omega_max::Real)
     areas = [7pi / 3, 5pi / 3, pi / 3]
     phase_jumps = [pi, -pi]
     return seed_composite_with_ghosts(pulse, Omega_max, areas, phase_jumps)
 end
 
-"""
-    seed_bb1(pulse, Omega_max)
 
-k=7. Wimperis BB1 around a π pulse: areas π, π, 2π, π with
-φ = arccos(−1/4) and phases 0, φ, 3φ, φ.
-"""
 function seed_bb1(pulse::CompositePulse, Omega_max::Real)
     phi = acos(-0.25)
     areas = [pi, pi, 2pi, pi]
@@ -148,37 +104,7 @@ function seed_bb1(pulse::CompositePulse, Omega_max::Real)
     return seed_composite_with_ghosts(pulse, Omega_max, areas, phase_jumps)
 end
 
-"""
-    seed_bir4(pulse, Omega_max; flip_angle=pi, duration=nothing,
-              beta=10.0, kappa=atan(20.0), dwmax=pulse.freq_scale)
 
-k=4. BIR-4 (B1-Insensitive Rotation, 4-segment) adiabatic composite for
-an arbitrary on-resonance flip angle `flip_angle` (default `pi`, i.e.
-inversion), robust to drive-amplitude (B1) errors and, via the tan/tanh
-frequency sweep, to a band of resonance offsets (Garwood & Ke, J. Magn.
-Reson. 1991). Four equal-duration segments of `duration/4` each;
-`duration` defaults to `pulse.T_max/2` (matching the HS1 seed). With a
-per-segment local normalised time `s ∈ [0, 1]`:
-
-    AM (seg 1, 3):  Omega_max * tanh(beta * (1 - s))
-    AM (seg 2, 4):  Omega_max * tanh(beta * s)
-    FM (seg 1, 3):  dwmax * tan(kappa * s)       / tan(kappa)
-    FM (seg 2, 4):  dwmax * tan(kappa * (s - 1)) / tan(kappa)
-
-so the amplitude is a full/zero/full/zero/full sequence with nodes at the
-quarter points, and the frequency sweeps 0→+dwmax, −dwmax→0, 0→+dwmax,
-−dwmax→0. Two discrete phase jumps of `Δφ = pi + flip_angle/2` at
-`t = duration/4` and `−Δφ` at `t = 3·duration/4` set the net rotation;
-they are carried in `raw_phi0 = [0, Δφ, 0, −Δφ]` (the phase from the FM
-sweep itself accumulates across segments automatically -- see
-[`build_E_of_t`](@ref)).
-
-`kappa` must lie in `(0, pi/2)` so `tan(kappa·s)` stays finite. As with
-[`seed_hs1`](@ref), the coefficients are collocation samples of the AM/FM
-functions, not an L2 projection onto the B-spline basis; `build_E_of_t`'s
-`C^∞` taper window additionally forces the envelope to 0 at every segment
-edge -- consistent with BIR-4's own amplitude nodes at the quarter points.
-"""
 function seed_bir4(
     pulse::CompositePulse,
     Omega_max::Real;
@@ -210,12 +136,12 @@ function seed_bir4(
     raw_cf = zeros(nf, 4)
 
     tan_k = tan(kappa)
-    # Segments 1,3 share the "falling amplitude / rising frequency" form;
-    # segments 2,4 share its mirror image (BIR-4 is time-symmetric).
-    amp_falling(s) = Omega_max * tanh(beta * (1 - s))       # seg 1, 3
-    amp_rising(s) = Omega_max * tanh(beta * s)              # seg 2, 4
-    fm_up(s) = dwmax * tan(kappa * s) / tan_k               # seg 1, 3
-    fm_down(s) = dwmax * tan(kappa * (s - 1)) / tan_k       # seg 2, 4
+
+
+    amp_falling(s) = Omega_max * tanh(beta * (1 - s))
+    amp_rising(s) = Omega_max * tanh(beta * s)
+    fm_up(s) = dwmax * tan(kappa * s) / tan_k
+    fm_down(s) = dwmax * tan(kappa * (s - 1)) / tan_k
 
     sA = range(0.0, 1.0; length=nA)
     sf = range(0.0, 1.0; length=nf)
@@ -234,16 +160,7 @@ function seed_bir4(
     return pack(pulse, raw_gap, raw_dur, raw_phi0, raw_cA, raw_cf)
 end
 
-"""
-    seed_canonical(pulse, kind; Omega_max=pulse.amp_scale, beta=nothing, mu=nothing, flip_angle=pi, seed=42)
 
-Dispatch on `kind` (`:hs1`, `:corpse`, `:bb1`, `:bir4`, `:random`) to a
-raw `u` for `pulse`. Defaults: `Omega_max` is this pulse's own `amp_scale`
-(cavity-input units); HS1 `beta` is chosen so the sech width is `T_max/2`;
-HS1 `mu` is chosen so the peak chirp is `freq_scale` (the ensemble FWHM).
-For `:bir4`, `flip_angle` sets the net rotation (default `pi`) and `beta`,
-when given, overrides the AM sharpness (see [`seed_bir4`](@ref)).
-"""
 function seed_canonical(
     pulse::CompositePulse,
     kind::Symbol;
