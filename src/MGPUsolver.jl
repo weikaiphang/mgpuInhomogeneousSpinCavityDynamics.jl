@@ -8,7 +8,7 @@ function assemble_problem(M::Integer,
                           delta0::Real, kappa_e::Real, kappa_i::Real;
                           nshards::Union{Nothing,Integer} = nothing,
                           device_ids::Union{Nothing,AbstractVector} = nothing,
-                          integrator::Symbol = :tsit5,
+                          integrator::Symbol = :ck45,
                           atol::Real = 1e-8,
                           rtol::Real = 1e-8,
                           threaded::Union{Nothing,Bool} = nothing,
@@ -26,9 +26,20 @@ function assemble_problem(M::Integer,
     nreg = register_count(integrator)
 
     pfrac = enable_peer_access!(devs)
-    if ns > 1 && pfrac < 1 && verbose
+    peer_ok = ns <= 1 || pfrac >= 1
+    if ns > 1 && !peer_ok && verbose
         @warn "Peer-to-peer access is not available on every GPU pair; " *
-              "the O(M) row-sum exchange will stage through the host." pfrac
+              "row-sum exchange will use NCCL if possible, else the host." pfrac
+    end
+
+    comms = nothing
+    if ns > 1 && _NCCL !== nothing
+        try
+            comms = _NCCL.Communicators(devs)
+        catch err
+            verbose && @warn "NCCL communicators unavailable; using P2P or host row-sum exchange" exception=err
+            comms = nothing
+        end
     end
 
     if verbose
@@ -57,7 +68,7 @@ function assemble_problem(M::Integer,
     return MGPUProblem{T,typeof(E_of_t)}(
         Int(M), part, shards, exec, nreg,
         T(delta0), T(kappa_e), T(kappa_e + kappa_i), T(sqrt(kappa_e)),
-        E_of_t, T(atol), T(rtol), Ref(0), Ref(0), hostbuf,
+        E_of_t, T(atol), T(rtol), Ref(0), Ref(0), hostbuf, comms, peer_ok,
     )
 end
 
@@ -77,13 +88,14 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
                            verbose::Bool = true,
                            clean_gpu::Bool = true)
 
+    SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, :second_order)
     CONFIG = mgpu_build_full_config(SIM_SETTING, SYSTEM_CONFIG)
     validate_config(CONFIG)
     validate_pulse_config(PULSE_CONFIG)
 
     ns_kw     = pick(SIM_SETTING, :nshards, nshards, nothing)
     dev_kw    = pick(SIM_SETTING, :device_ids, device_ids, nothing)
-    integ     = pick(SIM_SETTING, :integrator, integrator, :tsit5)
+    integ     = pick(SIM_SETTING, :integrator, integrator, :ck45)
     smode     = pick(SIM_SETTING, :save_mode, save_mode, :tstops)
     s_spins   = pick(SIM_SETTING, :save_spins, save_spins, true)
     th_kw     = pick(SIM_SETTING, :threaded, threaded, nothing)
@@ -141,7 +153,9 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
 
         verbose && begin
             println("Callback saved $(store.saved[]) / $Nt requested time points")
-            store.saved[] != Nt && @warn "Did not save all requested time points" saved=store.saved[] expected=Nt
+            store.saved[] == Nt || error(
+                "Callback saved $(store.saved[]) points, but expected $Nt."
+            )
             println("Time taken: $(stats.elapsed) seconds")
             println("  accepted steps : $(stats.naccept)")
             println("  rejected steps : $(stats.nreject)")
@@ -172,6 +186,10 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
             g_b_1d = d.g_b_1d,
             Nj_2d = d.Nj_2d,
             N_total = d.N_total,
+            C_ens = d.C_ens,
+            C_eff = d.C_eff,
+            p_delta_sum = d.p_delta_sum,
+            p_g_sum = d.p_g_sum,
             elapsed_seconds = stats.elapsed,
             solver_stats = stats,
             nshards = length(prob.shards),
@@ -196,6 +214,7 @@ end
 
 function mgpu_run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...)
     order = get_simulation_order(SIM_SETTING)
+    SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, order)
     if order in (:first_order, :order1, :first, 1)
         println("Start running 1st-order cumulant spin-cavity simulation...")
 
@@ -211,6 +230,8 @@ function mgpu_run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...
         error("Unknown simulation_order = $(order). Use :order1 or :order2.")
     end
 end
+
+const mgpu_run = mgpu_run_simulation
 
 mgpu_build_full_config(SIM_SETTING, SYSTEM_CONFIG) = merge(SIM_SETTING, SYSTEM_CONFIG)
 

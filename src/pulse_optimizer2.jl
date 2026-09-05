@@ -1,5 +1,7 @@
 
 
+# Transverse seed for :weak / :weak_inverted. 1e-3 is outside the Bloch
+# ball |⟨S⟩| = Nj/2 by design — it is a numerical seed, not a CSS.
 const _WEAK_SEED = 1.0e-3
 
 

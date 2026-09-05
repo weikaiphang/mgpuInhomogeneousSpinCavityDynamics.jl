@@ -29,7 +29,7 @@ function frozen_case(; outdir)
             mean       = 2π * 100.0,
             std        = 2π * 12.0,
             span_sigma = 2.5,
-            renormalize = false,
+            renormalize = PAPER_G_RENORMALIZE,
         ),
     )
 
@@ -99,6 +99,7 @@ end
 function run_case()
     outdir = mktempdir()
     SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG = frozen_case(; outdir = outdir)
+    print_cooperativity_honesty(SYSTEM_CONFIG)
     data = run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu = true)
     return data
 end

@@ -68,6 +68,7 @@ PULSE_CONFIG = (
     ),
 )
 
+print_cooperativity_honesty(SYSTEM_CONFIG)
 run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG)
 
 println("Run finished.")

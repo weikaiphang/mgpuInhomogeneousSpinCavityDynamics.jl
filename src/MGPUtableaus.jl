@@ -95,3 +95,33 @@ build_tableau(alg::Symbol, ::Type{T}) where {T} =
     alg === :tsit5 ? Tsit5Tableau(T) :
     alg === :ck45  ? CK45Tableau(T)  :
     error("Unknown integrator = $(alg). Use :tsit5 or :ck45.")
+
+
+# Shared by the MGPU integrator and the CPU DiffEq twin (solver_2nd_workspace.jl).
+mutable struct PIController{T}
+    gamma::T
+    qmin::T
+    qmax::T
+    beta1::T
+    beta2::T
+    qoldinit::T
+    qold::T
+end
+
+function PIController(::Type{T}, order::Int) where {T}
+    return PIController{T}(T(0.9), T(1 / 5), T(10), T(7 / (10 * order)),
+                           T(2 / (5 * order)), T(1e-4), T(1e-4))
+end
+
+function controller_factors(ctrl::PIController{T}, EEst::T) where {T}
+    e = max(EEst, eps(T))
+    q11 = e^ctrl.beta1
+    q = q11 / ctrl.qold^ctrl.beta2
+    q = max(inv(ctrl.qmax), min(inv(ctrl.qmin), q / ctrl.gamma))
+    return q, q11
+end
+
+function accept_step!(ctrl::PIController{T}, EEst::T) where {T}
+    ctrl.qold = max(EEst, ctrl.qoldinit)
+    return nothing
+end

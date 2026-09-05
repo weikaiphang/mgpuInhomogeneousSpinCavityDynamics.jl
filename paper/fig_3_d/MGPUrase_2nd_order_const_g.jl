@@ -66,7 +66,7 @@ BASE_SYSTEM_CONFIG = (
     g_inhomogeneity = (
         kind        = :constant,
         g_value     = 2π * 100.0,
-        renormalize = false,
+        renormalize = PAPER_G_RENORMALIZE,
     ),
 )
 
@@ -148,6 +148,8 @@ function run_sweep()
         println("------------------------------------------------------------")
         println("Run $run_index / $N_runs")
         println("C_ens       = $C_ens")
+        print_cooperativity_honesty(C_ens, BASE_SYSTEM_CONFIG.freq_inhomogeneity,
+                                    BASE_SYSTEM_CONFIG.g_inhomogeneity)
         println("g / 2π      = $g_value_Hz Hz")
         println("Output file = $saved_file_name")
         println("------------------------------------------------------------")

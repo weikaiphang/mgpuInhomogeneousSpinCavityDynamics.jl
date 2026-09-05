@@ -54,6 +54,7 @@ PULSE_CONFIG = (
     ),
 )
 
+print_cooperativity_honesty(SYSTEM_CONFIG)
 mgpu_run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; progress_every = 200)
 println("Run finished.")
 nothing

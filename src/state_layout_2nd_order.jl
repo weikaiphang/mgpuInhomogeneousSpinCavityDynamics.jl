@@ -17,8 +17,14 @@ state_length_2nd_order(M) =
     4M +
     4M*M
 
+# Off-diagonal ones; unused cross[j,j] is zero so same-bin + cross rowsums
+# do not double-count k==j (kernels skip that slot).
+function make_diag_mask_cpu(M)
+    return ComplexF64.(.!Matrix(I, M, M))
+end
+
 function make_diag_mask(M)
-    return CuArray(ComplexF64.(.!Matrix(I, M, M)))
+    return CuArray(make_diag_mask_cpu(M))
 end
 
 function unpack_state_2nd_order_u(u, M)
@@ -45,7 +51,7 @@ function unpack_state_2nd_order_u(u, M)
     SmSp_cross = reshape(@view(u[idx:idx+M*M-1]), M, M); idx += M*M
     SzSz_cross = reshape(@view(u[idx:idx+M*M-1]), M, M); idx += M*M
 
-    return (
+    return (;
         a, ad_ad, ad_a,
         Sp, Sz,
         adSp, adSm, adSz,
@@ -80,7 +86,7 @@ function unpack_state_2nd_order_du(du, M)
     dSmSp_cross = reshape(@view(du[idx:idx+M*M-1]), M, M); idx += M*M
     dSzSz_cross = reshape(@view(du[idx:idx+M*M-1]), M, M); idx += M*M
 
-    return (
+    return (;
         dSp, dSz,
         dadSp, dadSm, dadSz,
         dSpSp_same, dSzSp_same, dSmSp_same, dSzSz_same,

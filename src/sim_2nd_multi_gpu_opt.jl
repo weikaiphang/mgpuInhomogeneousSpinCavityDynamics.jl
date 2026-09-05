@@ -1,4 +1,9 @@
 
+# Standalone multi-GPU driver (not part of the package module).
+# The supported public 2nd-order multi-GPU API is
+# `mgpu_run` / `mgpu_run_simulation` / `run_simulation` (MGPUsolver.jl).
+# This file must stay in lockstep with rhs_2nd_order! / rhs_cpu! / kernels
+# (κt = κe + κi; same 2nd-order moments).
 using CUDA
 CUDA.set_runtime_version!(v"12.4")
 
@@ -45,6 +50,7 @@ const USER = (
 
 
     ke0 = 2*pi*1e6,
+    ki0 = 0.0,
 
 
     alpha0    = 2.0e4,
@@ -94,11 +100,19 @@ Tpi    = USER.Tpi
 Tw     = USER.Tw
 
 ke0     = USER.ke0
-kappa_t = ke0
+ki0     = USER.ki0
+kappa_t = ke0 + ki0
 
 g2_avg = g_mean^2 + g_std^2
 N_spin = (C_ens) * (kappa_t * FWHM) / (4 * g2_avg)
+# Full-line C_ens inverts N; Lorentzian edges are ±2.5 γ (renormalize=false).
+# The ODE sees C_eff = C_ens × ∑p_δ. Do not silently label the run as C_ens.
+p_delta_mass = 2 * atan(2.5) / π
+C_eff = C_ens * p_delta_mass
 println("N_spin = $N_spin")
+println("C_ens = $C_ens  (full-line; N is built from this)")
+println("∑p_δ  = $p_delta_mass  (Lorentzian span_gamma=2.5, renormalize=false)")
+println("C_eff = $C_eff  (ODE optical depth = C_ens × ∑p_δ)")
 
 alpha0  = USER.alpha0
 A0      = 0.5 * sqrt(ke0) * alpha0
@@ -223,6 +237,7 @@ const L_SzSz_x = L_SmSp_x[end]+1 : L_SmSp_x[end] + M_LOCAL*M
 
 
 kappa_e_of_t(t) = ke0
+kappa_i_of_t(t) = ki0
 g_gate_of_t(t)  = 1.0
 
 function E_of_t_num(t)
@@ -478,7 +493,7 @@ function local_rhs!(du_dst::CuVector{ComplexF64},
 
 
     κe_t = kappa_e_of_t(t)
-    κt_t = κe_t
+    κt_t = κe_t + kappa_i_of_t(t)
     g_t_loc  = gd.g_b_local .* g_gate_of_t(t)
     g_t_full = gd.g_b_full  .* g_gate_of_t(t)
     E_t  = E_of_t_num(t)
@@ -516,9 +531,18 @@ function local_rhs!(du_dst::CuVector{ComplexF64},
 
 
 
+    # Same-bin + off-diagonal cross only (kernels skip k==j). The unused
+    # cross diagonal is not a chimera merge — just the same diag_mask idea.
     sumgSpSp_jk = SpSp_s_loc .* g_t_loc .+ SpSp_x_loc * g_t_full
     sumgSmSp_jk = SmSp_s_loc .* g_t_loc .+ SmSp_x_loc * g_t_full
     sumgSzSp_jk = SzSp_s_loc .* g_t_loc .+ SzSp_x_loc * g_t_full
+    @inbounds for jl in 1:M_LOCAL
+        j = gd.offset + jl
+        gj = g_t_full[j]
+        sumgSpSp_jk[jl] -= SpSp_x_loc[jl, j] * gj
+        sumgSmSp_jk[jl] -= SmSp_x_loc[jl, j] * gj
+        sumgSzSp_jk[jl] -= SzSp_x_loc[jl, j] * gj
+    end
 
     dadSp_loc .= (
         1im * delta0 .* adSp_loc .+ 1im .* δ_loc .* adSp_loc

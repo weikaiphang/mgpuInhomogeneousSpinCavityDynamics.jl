@@ -49,7 +49,7 @@ SYSTEM_CONFIG = (
         mean = 2*pi*100,
         std  = 2*pi*5,
         span_sigma = 3.0,
-        renormalize = true,
+        renormalize = PAPER_G_RENORMALIZE,
     ),
 )
 
@@ -100,6 +100,7 @@ PULSE_CONFIG = (
     ),
 )
 
+print_cooperativity_honesty(SYSTEM_CONFIG)
 run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG)
 
 println("Run finished.")

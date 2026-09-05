@@ -200,6 +200,7 @@ function run_sweep()
         println("[$run_key] starting  (order=$(SIM_SETTING.simulation_order), " *
                 "M_delta=$(SIM_SETTING.M_delta), M_g=$(SIM_SETTING.M_g), " *
                 "C_ens=$(SYSTEM_CONFIG.C_ens), " *
+                "C_eff=$(cooperativity_honesty(SYSTEM_CONFIG).C_eff), " *
                 "g_kind=$(SYSTEM_CONFIG.g_inhomogeneity.kind))")
         println("=" ^ 60)
 
@@ -215,6 +216,7 @@ function run_sweep()
             ),
             "SYSTEM_CONFIG" => Dict(
                 "C_ens" => SYSTEM_CONFIG.C_ens,
+                "C_eff" => cooperativity_honesty(SYSTEM_CONFIG).C_eff,
                 "kappa_e" => SYSTEM_CONFIG.kappa_e,
                 "kappa_i" => SYSTEM_CONFIG.kappa_i,
                 "freq_inhomogeneity" => Dict(pairs(SYSTEM_CONFIG.freq_inhomogeneity)),

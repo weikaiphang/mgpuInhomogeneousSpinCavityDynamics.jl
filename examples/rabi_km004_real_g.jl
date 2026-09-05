@@ -268,6 +268,7 @@ function run_rabi_sweep(
     println("Starting second-pulse amplitude sweep")
     println("Number of simulations: $N_runs")
     println("Fixed C_ens:           $(system_config.C_ens)")
+    print_cooperativity_honesty(system_config)
     println("alpha range:           [$alpha_min, $alpha_max]")
     println("Pulse interval:        $(PULSE_TIME_INTERVAL_S * 1e6) us")
     println("First pulse center:    $(FIRST_PULSE_CENTER_S * 1e6) us")

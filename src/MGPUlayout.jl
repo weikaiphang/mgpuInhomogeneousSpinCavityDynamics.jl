@@ -15,6 +15,8 @@ const F_SmSp_s = 8
 const F_SzSz_s = 9
 const NSMALLFIELD = 9
 
+# Cross blocks. B_SzSpT is a stored transpose of B_SzSp (SzSp[k,j]), not an
+# independent moment. Physics truth is the 4-matrix layout + SzSp[k,j].
 const B_SpSp  = 1
 const B_SzSp  = 2
 const B_SzSpT = 3
@@ -96,7 +98,7 @@ function shard_bytes(M::Integer, mloc::Integer, integrator::Symbol, ::Type{T}) w
 end
 
 
-function memory_report(M::Integer, ns::Integer; integrator::Symbol = :tsit5,
+function memory_report(M::Integer, ns::Integer; integrator::Symbol = :ck45,
                        T::Type = Float64)
     part = EnsemblePartition(M, ns)
     mloc = maximum(part.counts)
@@ -117,7 +119,7 @@ function memory_report(M::Integer, ns::Integer; integrator::Symbol = :tsit5,
 end
 
 
-function max_bins(bytes_per_gpu::Real, ns::Integer; integrator::Symbol = :tsit5,
+function max_bins(bytes_per_gpu::Real, ns::Integer; integrator::Symbol = :ck45,
                   T::Type = Float64, safety::Real = 0.85)
     budget = safety * bytes_per_gpu
     lo, hi = 1, 1

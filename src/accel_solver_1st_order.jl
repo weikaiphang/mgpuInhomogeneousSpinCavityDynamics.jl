@@ -110,11 +110,24 @@ function _pow_integral(lo::Float64, hi::Float64, q::Float64)
     return (hi^(q + 1) - lo^(q + 1)) / (q + 1)
 end
 
+function _truncated_gaussian_second_moment(μ::Float64, σ::Float64, span::Float64)
+    σ <= 0 && return μ^2
+    lo = max(0.0, μ - span * σ)
+    hi = μ + span * σ
+    hi > lo || return μ^2
+    x, w = _gl_on(64, lo, hi)
+    invs = 1 / (σ * sqrt(2π))
+    p = w .* (invs .* exp.(-0.5 .* ((x .- μ) ./ σ).^2))
+    s = sum(p)
+    s <= 0 && return μ^2 + σ^2
+    return sum((p ./ s) .* (x .^ 2))
+end
+
 function g2_avg(sys::System)
     if sys.g_kind === :constant
         return abs2(sys.g_value)
     elseif sys.g_kind === :gaussian
-        return sys.g_mean^2 + sys.g_std^2
+        return _truncated_gaussian_second_moment(sys.g_mean, sys.g_std, sys.g_span)
     elseif sys.g_kind === :lorentzian
         z = sys.g_span
         return sys.g_mean^2 + sys.g_hwhm^2 * (z - atan(z)) / atan(z)
@@ -526,7 +539,13 @@ function _g_nodes(sys::System, M_g; method, span_sigma, renormalize)
     elseif sys.g_kind === :gaussian
         method === :quadrature ||
             error("accel_solver_1st_order: histogram g nodes unavailable in this port")
-        return gaussian_hermite_nodes(M_g, sys.g_mean, sys.g_std)
+        μ, σ, span = Float64(sys.g_mean), Float64(sys.g_std), Float64(sys.g_span)
+        lo = max(0.0, μ - span * σ)
+        hi = μ + span * σ
+        g, w = _gl_on(M_g, lo, hi)
+        p = w .* exp.(-0.5 .* ((g .- μ) ./ σ) .^ 2) ./ (σ * sqrt(2π))
+        renormalize && (p ./= sum(p))
+        return g, p
     elseif sys.g_kind === :lorentzian
         return lorentzian_trunc_nodes(M_g, sys.g_mean, sys.g_hwhm, sys.g_span)
     else
@@ -1459,6 +1478,8 @@ mutable struct GPUShard
     src_h::Vector{ComplexF64}
     err_h::Vector{Float64}
     stream::Any
+    root_src::Any
+    root_err::Any
 end
 
 struct Tsit5Tab{T}
@@ -1634,6 +1655,8 @@ function _alloc_shard(p::Int, dev, r, Sp0, Sz0, ens::Ensemble, cache::Integrator
         _pin_host(ComplexF64, 1),
         _pin_host(Float64, 1),
         st,
+        nothing,
+        nothing,
     )
     return s
 end
@@ -1651,6 +1674,12 @@ function _build_shards(ens::Ensemble, ::AbstractDrive, u0::Vector{ComplexF64},
         r = shard_range(part, p)
         push!(shards, _alloc_shard(p, plan.devices[p], r, Sp0, Sz0, ens, cache;
                                    with_stream=multi))
+    end
+    if plan.nshards > 1
+        root = shards[1]
+        CUDA.device!(root.dev)
+        root.root_src = CUDA.zeros(ComplexF64, plan.nshards)
+        root.root_err = CUDA.zeros(Float64, plan.nshards)
     end
     return shards, part
 end
@@ -1806,16 +1835,33 @@ function _stage!(shards, stage::Int, a_eval::ComplexF64, tstage::Float64,
         _launch_kernel(s, _reduce_complex!, s.src1, s.partial, s.nblocks;
                        threads=GPU_THREADS, blocks=1)
     end
-    _for_each_shard(shards) do s
-        _sync_shard(s)
-        copyto!(s.src_h, s.src1)
-    end
-    src = z0 + 0.0im
-    for s in shards
-        src += s.src_h[1]
-    end
+    src = _device_reduce_sources(shards, z0 + 0.0im)
     cache.n_eval += 1
     return src
+end
+
+function _device_reduce_sources(shards, z0::ComplexF64)
+    n = length(shards)
+    if n == 1
+        s = shards[1]
+        _sync_shard(s)
+        copyto!(s.src_h, s.src1)
+        return z0 + s.src_h[1]
+    end
+    _for_each_shard(shards) do s
+        _sync_shard(s)
+    end
+    root = shards[1]
+    _maybe_device!(root.dev)
+    slots = root.root_src
+    for s in shards
+        if s.dev == root.dev
+            copyto!(slots, s.id, s.src1, 1, 1)
+        else
+            copyto!(view(slots, s.id:s.id), s.src1)
+        end
+    end
+    return z0 + sum(slots)
 end
 
 function _error_est!(shards, a_err::ComplexF64, a_new::ComplexF64,
@@ -1830,15 +1876,33 @@ function _error_est!(shards, a_err::ComplexF64, a_new::ComplexF64,
         _launch_kernel(s, _reduce_real!, s.err1, s.errpartial, s.nblocks;
                        threads=GPU_THREADS, blocks=1)
     end
-    _for_each_shard(shards) do s
+    acc = abs2(a_err) / ((atol + reltol * abs(a_new))^2 + 1e-30)
+    acc += _device_reduce_errors(shards)
+    return sqrt(acc / (1 + 2 * M))
+end
+
+function _device_reduce_errors(shards)
+    n = length(shards)
+    if n == 1
+        s = shards[1]
         _sync_shard(s)
         copyto!(s.err_h, s.err1)
+        return s.err_h[1]
     end
-    acc = abs2(a_err) / ((atol + reltol * abs(a_new))^2 + 1e-30)
+    _for_each_shard(shards) do s
+        _sync_shard(s)
+    end
+    root = shards[1]
+    _maybe_device!(root.dev)
+    slots = root.root_err
     for s in shards
-        acc += s.err_h[1]
+        if s.dev == root.dev
+            copyto!(slots, s.id, s.err1, 1, 1)
+        else
+            copyto!(view(slots, s.id:s.id), s.err1)
+        end
     end
-    return sqrt(acc / (1 + 2 * M))
+    return sum(slots)
 end
 
 function _accept!(shards; do_cav::Bool=false)
@@ -2864,6 +2928,10 @@ function run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu =
         peak_detection_results = peak_detection_results,
 
         N_total = N_total,
+        C_ens = d.C_ens,
+        C_eff = d.C_eff,
+        p_delta_sum = d.p_delta_sum,
+        p_g_sum = d.p_g_sum,
         elapsed_seconds = elapsed_seconds,
     )
 

@@ -12,6 +12,15 @@ using Printf
 using QuadGK
 using Random
 
+# NCCL.jl / NCCL_jll need a working libnccl. Keep the package loadable
+# on CPU-only hosts; multi-GPU then falls back to P2P or host staging.
+const _NCCL = try
+    Base.require(Base.PkgId(
+        Base.UUID("3fe64909-d7a1-4096-9b7d-7a0f12cf0f6b"), "NCCL"))
+catch
+    nothing
+end
+
 include("config.jl")
 include("frequency_inhomogeneity.jl")
 include("coupling_inhomogeneity.jl")
@@ -42,18 +51,20 @@ include("pulse_report.jl")
 include("state_layout_2nd_order.jl")
 include("initial_conditions_2nd_order.jl")
 include("rhs_2nd_order.jl")
+include("MGPUtableaus.jl")
+include("solver_2nd_workspace.jl")
 include("solver_2nd_order.jl")
 
 include("MGPUlayout.jl")
 include("MGPUdevices.jl")
 include("MGPUkernels.jl")
-include("MGPUtableaus.jl")
 include("MGPUproblem.jl")
 include("MGPUintegrator.jl")
 include("MGPUinitial_conditions.jl")
 include("MGPUobservables.jl")
 include("MGPUstate_io.jl")
 include("MGPUrhs_cpu.jl")
+include("qrt_jacobian.jl")
 
 include("noise.jl")
 include("correlations.jl")
@@ -64,7 +75,13 @@ include("MGPUsolver.jl")
 export run_simulation
 export run_sim_1st_order
 export run_sim_2nd_order
+export build_u0_cpu_2nd_order
+export rhs_2nd_order!
+export rhs_cpu!
+export Solver2Workspace, Solve2Stats, solve_cpu_2nd!, record_save2!,
+       tsit5_cpu_step!, ck45_cpu_step!, attach_u0!
 
+export mgpu_run
 export mgpu_run_simulation
 export mgpu_run_sim_2nd_order
 export assemble_problem
@@ -84,7 +101,10 @@ export plot_E_of_t
 
 export build_full_config, prepare_derived
 export prepare_derived_quadrature, ensemble_method_for, resolve_ensemble_method
-export make_clamped_knots, bspline_basis, bspline_eval, bspline_area, bspline_antiderivative
+export frequency_truncation_mass, coupling_truncation_mass
+export effective_cooperativity, ensemble_optical_depth
+export cooperativity_honesty, print_cooperativity_honesty
+export make_clamped_knots, bspline_basis, bspline_basis!, bspline_eval, bspline_area, bspline_antiderivative
 export CompositePulse, n_params, decode, initial_guess, total_area, pulse_duration
 export points_per_segment_for_budget
 export k_of_seed_kind, seed_hs1, seed_composite_with_ghosts, seed_corpse, seed_bb1, seed_bir4, seed_canonical
@@ -116,6 +136,7 @@ export SignalControlRejected
 export generate_2n1_arp_pi_pulse
 export generate_2n1_arp_from_jld2
 export generate_3arp_pi_pulse
+export PAPER_G_RENORMALIZE, coupling_rms, arp_amp_scale, arp_drive_amplitude
 
 export NoiseSimulationData
 export load_noise_data
@@ -130,5 +151,12 @@ export CorrelationWorkspace
 export load_correlation_workspace
 export compute_ase_rase_correlations_gpu
 export save_correlation_results
+
+export QRT_PRODUCT, QRT_ORACLE
+export qrt_star_rhs!, qrt_product_apply!, qrt_oracle_apply!, qrt_oracle_dense
+export qrt_oracle_dense_mul
+export qrt_relabs_err, qrt_pad_product_tangent
+export qrt_seed_adag_column!, qrt_seed_a_column!
+export qrt_pack_product_state!, QRTProductScratch
 
 end

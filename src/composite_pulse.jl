@@ -243,6 +243,18 @@ function _subpulse_knots(pulse::CompositePulse, t_start::AbstractVector, t_end::
 end
 
 
+function _pulse_scratch(::Type{T}, knot_lists) where {T}
+    n0 = 0
+    @inbounds for kn in knot_lists
+        n0 = max(n0, length(kn) - 1)
+    end
+    return Vector{T}(undef, n0), Vector{T}(undef, n0)
+end
+
+# Scratch Vectors are closed over by one E (or A/f) and are not MT-safe if
+# that same closure is called concurrently. threaded_grad rebuilds E per
+# worker and the ODE is serial on E, so this is OK. If one E is ever shared
+# across tasks, switch these to task-local (see _bspline_tls).
 function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
     t_start, t_end, phi0, cA, cf = decode(pulse, u)
     k = pulse.k
@@ -262,17 +274,21 @@ function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
         running = phase_offset[i] + d_f[end]
     end
 
+    scrA_a, scrA_b = _pulse_scratch(T, knots_A_list)
+    scrP_a, scrP_b = _pulse_scratch(T, knots_fp_list)
+    z0 = zero(Complex{T})
     taper_frac = pulse.taper_frac
     return function E_of_t(t)
         @inbounds for i in 1:k
             if t >= t_start[i] && t <= t_end[i]
-                A_spline = bspline_eval(t, view(cA, :, i), knots_A_list[i], degree)
+                A_spline = _bspline_eval_dot!(scrA_a, scrA_b, t, cA, i, knots_A_list[i], degree)
                 A = A_spline * _taper_window(t, t_start[i], t_end[i], taper_frac)
-                phi = bspline_eval(t, d_f_list[i], knots_fp_list[i], degree + 1) + phase_offset[i]
+                phi = _bspline_eval_dot!(scrP_a, scrP_b, t, d_f_list[i], knots_fp_list[i], degree + 1) +
+                      phase_offset[i]
                 return A * cis(phi)
             end
         end
-        return zero(Complex{T})
+        return z0
     end
 end
 
@@ -285,22 +301,25 @@ function build_A_f_of_t(pulse::CompositePulse, u::AbstractVector)
     knots_A_list, knots_f_list = _subpulse_knots(pulse, t_start, t_end)
 
     taper_frac = pulse.taper_frac
+    scrA_a, scrA_b = _pulse_scratch(T, knots_A_list)
+    scrF_a, scrF_b = _pulse_scratch(T, knots_f_list)
+    zT = zero(T)
     A_of_t = function (t)
         @inbounds for i in 1:k
             if t >= t_start[i] && t <= t_end[i]
-                A_spline = bspline_eval(t, view(cA, :, i), knots_A_list[i], degree)
+                A_spline = _bspline_eval_dot!(scrA_a, scrA_b, t, cA, i, knots_A_list[i], degree)
                 return A_spline * _taper_window(t, t_start[i], t_end[i], taper_frac)
             end
         end
-        return zero(T)
+        return zT
     end
     f_of_t = function (t)
         @inbounds for i in 1:k
             if t >= t_start[i] && t <= t_end[i]
-                return bspline_eval(t, view(cf, :, i), knots_f_list[i], degree)
+                return _bspline_eval_dot!(scrF_a, scrF_b, t, cf, i, knots_f_list[i], degree)
             end
         end
-        return zero(T)
+        return zT
     end
     return A_of_t, f_of_t
 end
