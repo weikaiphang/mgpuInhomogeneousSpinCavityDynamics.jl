@@ -373,4 +373,101 @@ end
     @test g_fwd ≈ g_adj rtol=5e-3 atol=1e-6
 end
 
+# Named drive for 0-alloc benches (a capturing closure can allocate).
+_bench_Et(t) = ComplexF64(0.1, 0.05)
+
+@testset "integrator canon + Cash–Karp :ck45 (B6/B9)" begin
+    @test M._canon_integrator(:ck45) === :ck45
+    @test M._canon_integrator("ck45") === :ck45
+    @test M._canon_integrator(:cash_karp) === :ck45
+    @test M._canon_integrator(:CashKarp5) === :ck45
+    @test M._canon_integrator(:tsit5) === :tsit5
+    @test_throws ErrorException M._canon_integrator(:dp5)
+    @test_throws ErrorException M._canon_integrator(:Vern7)
+    @test_throws ErrorException M._canon_integrator(:auto)
+    # CI used to read only `integrator` and silent-Tsit5 when settings said method=:ck45
+    @test M._integrator_from_compute((method=:ck45,)) === :ck45
+    @test M._integrator_from_compute((integrator=:tsit5, method=:ck45)) === :tsit5
+    tab = M.CK45Tab(Float64)
+    tsit = M.Tsit5Tab(Float64)
+    @test tab.c[1] ≈ 1 / 5
+    @test tab.c[5] ≈ 7 / 8
+    @test tab.b[1] ≈ 37 / 378
+    @test tab.b[2] == 0
+    @test tab.b[6] ≈ 512 / 1771
+    @test tab.c[1] != tsit.c[1]
+    settings = M.load_settings(joinpath(@__DIR__, "..", "examples", "monolith_order2.jl"))
+    prep_ck = M.prepare(merge(settings, (compute=(backend=:cpu, method=:ck45),)))
+    @test prep_ck.integrator === :ck45
+    d1 = (
+        timespan = (0.0, 2e-8),
+        M = 2,
+        Nj = [3.0, 5.0],
+        delta_b = [0.0, 1e5],
+        g_b = [2π * 100, 2π * 90],
+        delta0 = 0.0,
+        kappa_e = 2π * 1e6,
+        kappa_i = 0.0,
+    )
+    a5, _, _, i5 = M.solve_1st_order(d1, _bench_Et, :equator; integrator=:tsit5, backend=:cpu)
+    ack, _, _, ick = M.solve_1st_order(d1, _bench_Et, :equator; integrator=:ck45, backend=:cpu)
+    @test i5.integrator === :tsit5
+    @test ick.integrator === :ck45
+    @test a5 != ack || i5.nsteps != ick.nsteps
+    _, info5 = M.solve_2nd_order(d1, _bench_Et, :equator; integrator=:tsit5, backend=:cpu)
+    _, infock = M.solve_2nd_order(d1, _bench_Et, :equator; integrator=:ck45, backend=:cpu)
+    @test info5.integrator === :tsit5
+    @test infock.integrator === :ck45
+    @test info5.u_end ≉ infock.u_end rtol=1e-14 atol=0
+    pulse, d, u, Ttotal = _tiny_pulse_problem()
+    @test_throws ErrorException M.pulse_cost_grad_adjoint(
+        u, pulse, d; integrator=:ck45, reltol=1e2, abstol=1e2, dt0=Ttotal)
+end
+
+@testset "0 alloc/stage with persistent pools (B1/B2/B3/B4/B5)" begin
+    Mbin = 8
+    Nj = fill(4.0, Mbin)
+    delta_b = [2π * 1e4 * (j - 4) for j in 1:Mbin]
+    g_b = fill(2π * 100.0, Mbin)
+    kappa_e = 2π * 1e6
+    kappa_i = 2π * 1e5
+    @test M.mg_large_length(Mbin, Mbin) == 5 * Mbin * Mbin
+    u1 = M.build_u0_1st_order(Mbin, Nj, Float64, :equator)
+    u1[1] = 0.01 + 0.002im
+    p = (0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, _bench_Et)
+    pool1 = M.StagePool(u1, 6)
+    tab5 = M.Tsit5Tab(Float64)
+    tabck = M.CK45Tab(Float64)
+    copyto!(pool1.u, u1)
+    M.tsit5_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tab5)
+    a1 = @allocated M.tsit5_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tab5)
+    M.ck45_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tabck)
+    a1c = @allocated M.ck45_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tabck)
+    u2 = M.build_u0_2nd_order(Mbin, Nj, Float64, :equator)
+    u2[1] = 0.01 + 0.002im
+    s, L, c, o = M.dense_to_shards(u2, Mbin, 1)
+    @test length(L) == 1                          # B5: default one contiguous shard
+    @test length(L[1]) == 5 * Mbin * Mbin
+    pool2 = M.Order2Pool(s, L)
+    M._rk6_order2!(pool2, s, L, c, o, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin,
+                   _bench_Et, 0.0, 1e-8, tab5)
+    a2 = @allocated M._rk6_order2!(pool2, s, L, c, o, 0.0, kappa_e, kappa_i, delta_b, g_b,
+                                    Mbin, _bench_Et, 0.0, 1e-8, tab5)
+    M._rk6_order2!(pool2, s, L, c, o, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin,
+                   _bench_Et, 0.0, 1e-8, tabck)
+    a2c = @allocated M._rk6_order2!(pool2, s, L, c, o, 0.0, kappa_e, kappa_i, delta_b, g_b,
+                                     Mbin, _bench_Et, 0.0, 1e-8, tabck)
+    # B3: Dual workspace must not evict the primal cache
+    _ = M.rhs2_work(Complex{ForwardDiff.Dual{Nothing,Float64,1}}, Mbin)
+    ds = zero(s); dL = [zero(x) for x in L]
+    M.rhs2_sharded!(ds, dL, s, L, c, o, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, _bench_Et(0.0))
+    arhs = @allocated M.rhs2_sharded!(ds, dL, s, L, c, o, 0.0, kappa_e, kappa_i,
+                                       delta_b, g_b, Mbin, _bench_Et(0.0))
+    @test a1 == 0
+    @test a1c == 0
+    @test a2 == 0
+    @test a2c == 0
+    @test arhs == 0
+end
+
 println("SpinCavityMonolith tests finished.")

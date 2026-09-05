@@ -78,18 +78,23 @@ SzSp_same = Sz·Sp·(1−1/N)
 cross j≠k = mean products
 ```
 
-## CPU Threads (this tip)
+## CPU Threads + integrators (this tip)
 
 Production path until Tuesday iron: **CPU multicore**, not fake GPUs.
 
 - `nshards` on CPU is a cache partition (`resolve_cpu_nshards`, default **1**
-  contiguous large buffer). It is **not** `gpu_count()`.
-- `rhs1!` / `rhs2_sharded!` use `Threads.@threads` over bins/columns when
-  `nthreads() > 1` and the work is large enough. Per-thread row-sum
-  buffers avoid false sharing.
-- `RHS2Work` preallocates `sumP/M/Z` + thread locals. Tsit5 reuses stage
-  buffers; `_axpy_shards!` / `_lincomb_shards!` are scalar loops (no
-  temporary Complex arrays).
+  contiguous large buffer). It is **not** `gpu_count()`. Large remains
+  `5×M×mloc` block-major (same packing as the GPU kernels).
+- `@threads` only when the **loop trip count** is ≥ 64. A flop estimate
+  (`nwork*M`) used to fork on M=8 and allocate under `JULIA_NUM_THREADS>1`.
+- Persistent workspaces: `RHS2Work` (owned by `Order2Pool` on the hot path;
+  process-global cache is primal-only so Dual-through-solve cannot evict it)
+  and `StagePool` / `Order2Pool` for Tsit5 and Cash–Karp stages.
+- `_lincomb_n!` is unrolled (no `kS[1:n]` slices, no `dt .* tuple`). After
+  warmup, one reused-pool RK stage is **0 alloc** (1st- and 2nd-order).
+- `:ck45` is Cash–Karp 5(4) and is honored. Unknown names and GPU/adjoint
+  `:ck45` **error** — they do not fall through to Tsit5. Settings may set
+  `integrator` or `method`.
 - Run with `julia -t auto` / `JULIA_NUM_THREADS`.
 
 ## Multi-GPU — Tuesday iron gate

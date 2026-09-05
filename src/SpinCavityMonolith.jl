@@ -414,6 +414,25 @@ function _canon_mode(mode)
     error("unknown mode $mode; expected forward | forward_bspline | order2 | order2_bspline | optimizer")
 end
 
+# B9: never silent-green. Settings may say `integrator` or `method`.
+function _canon_integrator(x)
+    s = _sym(x)
+    s === :cash_karp && return :ck45
+    s === :cashkarp && return :ck45
+    s === :CashKarp && return :ck45
+    s === :CashKarp5 && return :ck45
+    s === :cashkarp5 && return :ck45
+    s === :Tsit5 && return :tsit5
+    s in (:tsit5, :ck45) ||
+        error("integrator must be :tsit5 or :ck45; got :$s (not a silent Tsit5 fallback)")
+    return s
+end
+
+function _integrator_from_compute(cmp)
+    raw = _get(cmp, :integrator, _get(cmp, :method, :tsit5))
+    return _canon_integrator(raw)
+end
+
 _sym(x) = x isa Symbol ? x : Symbol(string(x))
 _get(nt, k, default) = hasproperty(nt, k) ? getproperty(nt, k) : default
 
@@ -837,7 +856,9 @@ end
 # CPU multicore: Threads over bins/columns. nshards is a cache partition, not a
 # fake GPU. Default CPU nshards = 1 (one contiguous large buffer).
 @inline _cpu_nthreads() = max(1, nthreads())
-@inline _cpu_should_thread(nwork::Integer) = _cpu_nthreads() > 1 && Int(nwork) >= 32
+# Thread on loop trip count, not flop estimate (B4). `nwork * M` made M=8
+# benches take @threads and blow the 0-alloc/stage claim under JULIA_NUM_THREADS>1.
+@inline _cpu_should_thread(nwork::Integer) = _cpu_nthreads() > 1 && Int(nwork) >= 64
 function resolve_cpu_nshards(M::Integer; nshards=nothing)
     nshards === nothing && return 1
     return clamp(Int(nshards), 1, Int(M))
@@ -924,7 +945,16 @@ end
 
 const _RHS2_WORK = Ref{Any}(nothing)
 
+@inline function _is_dual_eltype(::Type{T}) where {T}
+    T <: ForwardDiff.Dual && return true
+    T <: Complex && return eltype(T) <: ForwardDiff.Dual
+    return false
+end
+
+# Process-global cache is Float/Complex primal only (B3). Dual-through-solve
+# must not swap the cache and force the next primal RHS to realloc.
 function rhs2_work(::Type{T}, M::Integer) where {T}
+    _is_dual_eltype(T) && return RHS2Work(T, M)
     w = _RHS2_WORK[]
     nt = _cpu_nthreads()
     if w isa RHS2Work{T} && w.M == M && w.nt == nt
@@ -965,7 +995,7 @@ function _rowsums_shards!(work::RHS2Work, larges, g, M, counts, offsets)
     @inbounds for p in 1:ns
         nwork += counts[p]
     end
-    if _cpu_should_thread(nwork * M)
+    if _cpu_should_thread(nwork)
         @inbounds for tid in 1:work.nt
             fill!(work.locP[tid], 0)
             fill!(work.locM[tid], 0)
@@ -1146,7 +1176,7 @@ function _large_column!(dlarge, large, small, delta_b, g_b, M, mloc, lo, jl)
 end
 
 function rhs2_large!(dlarge, large, small, delta_b, g_b, M, mloc, lo)
-    if _cpu_should_thread(mloc * M)
+    if _cpu_should_thread(mloc)
         @threads :static for jl in 1:mloc
             _large_column!(dlarge, large, small, delta_b, g_b, M, mloc, lo, jl)
         end
@@ -1158,6 +1188,9 @@ function rhs2_large!(dlarge, large, small, delta_b, g_b, M, mloc, lo)
     return nothing
 end
 
+# Large layout is 5 × M × mloc, field-major, column-contiguous (B5).
+# Same block-major packing the GPU kernels use. CPU default is one shard
+# (mloc = M), not nshards = gpu_count().
 """Production 2nd-order RHS: one small eval + sharded large. No hot-path allocs."""
 function rhs2_sharded!(dsmall, dlarges, small, larges, counts, offsets,
                        delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
@@ -1173,16 +1206,15 @@ function rhs2_sharded!(dsmall, dlarges, small, larges, counts, offsets,
     rhs2_small!(dsmall, small, work.sumP, work.sumM, work.sumZ,
                 delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
     ns = length(counts)
+    # Thread over shards only when each shard is too small to thread internally.
     thread_shards = ns >= 2 && _cpu_should_thread(ns)
     if thread_shards
-        small_shards = true
         @inbounds for p in 1:ns
-            if counts[p] * M >= 32
-                small_shards = false
+            if _cpu_should_thread(counts[p])
+                thread_shards = false
                 break
             end
         end
-        thread_shards = small_shards
     end
     if thread_shards
         @threads :static for p in 1:ns
@@ -1393,31 +1425,32 @@ function Tsit5Tab(::Type{T}=Float64) where {T}
         b, e)
 end
 
+# Cash–Karp 5(4) — the name `:ck45` matches this tableau (OrdinaryDiffEq / Hairer).
+# Previous low-storage 5-stage A/b (Calvo-style) was a settings/tableau mismatch (B9).
 struct CK45Tab{T}
-    A::NTuple{4,T}
-    b::NTuple{5,T}
-    e::NTuple{5,T}
     c::NTuple{5,T}
+    a21::T
+    a31::T; a32::T
+    a41::T; a42::T; a43::T
+    a51::T; a52::T; a53::T; a54::T
+    a61::T; a62::T; a63::T; a64::T; a65::T
+    b::NTuple{6,T}
+    e::NTuple{6,T}
 end
 
 function CK45Tab(::Type{T}=Float64) where {T}
-    A = (T(970286171893 / 4311952581923),
-         T(6584761158862 / 12103376702013),
-         T(2251764453980 / 15575788980749),
-         T(26877169314380 / 34165994151039))
-    b = (T(1153189308089 / 22510343858157),
-         T(1772645290293 / 4653164025191),
-         T(-1672844663538 / 4480602732383),
-         T(2114624349019 / 3568978502595),
-         T(5198255086312 / 14908931495163))
-    bh = (T(1016888040809 / 7410784769900),
-          T(11231460423587 / 58533540763752),
-          T(-1563879915014 / 6823010717585),
-          T(606302364029 / 971179775848),
-          T(1097981568119 / 3980877426909))
-    e = ntuple(i -> b[i] - bh[i], 5)
-    c = (A[1], A[1] + A[2], A[1] + A[2] + A[3], A[1] + A[2] + A[3] + A[4], one(T))
-    return CK45Tab{T}(A, b, e, c)
+    b = (T(37 // 378), T(0), T(250 // 621), T(125 // 594), T(0), T(512 // 1771))
+    bh = (T(2825 // 27648), T(0), T(18575 // 48384), T(13525 // 55296),
+          T(277 // 14336), T(1 // 4))
+    e = ntuple(i -> b[i] - bh[i], 6)
+    return CK45Tab{T}(
+        (T(1 // 5), T(3 // 10), T(3 // 5), T(1), T(7 // 8)),
+        T(1 // 5),
+        T(3 // 40), T(9 // 40),
+        T(3 // 10), T(-9 // 10), T(6 // 5),
+        T(-11 // 54), T(5 // 2), T(-70 // 27), T(35 // 27),
+        T(1631 // 55296), T(175 // 512), T(575 // 13824), T(44275 // 110592), T(253 // 4096),
+        b, e)
 end
 
 mutable struct StagePool{T}
@@ -1449,7 +1482,7 @@ function _errnorm(u, u1, err, atol, rtol)
     return sqrt(acc / length(err))
 end
 
-function tsit5_step!(pool::StagePool, rhs!, p, t, dt, tab::Tsit5Tab)
+function rk6_step!(pool::StagePool, rhs!, p, t, dt, tab)
     u, k, y, u1, err = pool.u, pool.k, pool.y, pool.u1, pool.err
     rhs!(k[1], u, p, t)
     @inbounds for i in eachindex(u)
@@ -1472,7 +1505,7 @@ function tsit5_step!(pool::StagePool, rhs!, p, t, dt, tab::Tsit5Tab)
         y[i] = u[i] + dt * (tab.a61 * k[1][i] + tab.a62 * k[2][i] + tab.a63 * k[3][i] +
                             tab.a64 * k[4][i] + tab.a65 * k[5][i])
     end
-    rhs!(k[6], y, p, t + dt)
+    rhs!(k[6], y, p, t + tab.c[5] * dt)
     @inbounds for i in eachindex(u)
         u1[i] = u[i] + dt * (tab.b[1]*k[1][i] + tab.b[2]*k[2][i] + tab.b[3]*k[3][i] +
                              tab.b[4]*k[4][i] + tab.b[5]*k[5][i] + tab.b[6]*k[6][i])
@@ -1481,42 +1514,26 @@ function tsit5_step!(pool::StagePool, rhs!, p, t, dt, tab::Tsit5Tab)
     end
     return u1, err
 end
-
-function ck45_step!(pool::StagePool, rhs!, p, t, dt, tab::CK45Tab)
-    # Low-storage CK45: k stored in pool.k[1], accumulator in u1, stage in y.
-    u, k1, y, u1, err = pool.u, pool.k[1], pool.y, pool.u1, pool.err
-    fill!(u1, 0); fill!(err, 0)
-    copyto!(y, u)
-    rhs!(k1, y, p, t)
-    @inbounds for i in eachindex(u)
-        u1[i] = u[i] + dt * tab.b[1] * k1[i]
-        err[i] = dt * tab.e[1] * k1[i]
-        y[i] = u[i] + dt * tab.A[1] * k1[i]
-    end
-    for s in 2:5
-        rhs!(k1, y, p, t + tab.c[s-1] * dt)
-        @inbounds for i in eachindex(u)
-            u1[i] += dt * tab.b[s] * k1[i]
-            err[i] += dt * tab.e[s] * k1[i]
-            if s < 5
-                y[i] = u[i] + dt * tab.A[s] * k1[i]   # FSAL-style low-storage update
-            end
-        end
-    end
-    return u1, err
-end
+tsit5_step!(pool::StagePool, rhs!, p, t, dt, tab::Tsit5Tab) = rk6_step!(pool, rhs!, p, t, dt, tab)
+ck45_step!(pool::StagePool, rhs!, p, t, dt, tab::CK45Tab) = rk6_step!(pool, rhs!, p, t, dt, tab)
 
 mutable struct PICtrl{T}
     qold::T
 end
 PICtrl(::Type{T}) where {T} = PICtrl{T}(T(1e-4))
 
-function integrate!(rhs!, u0, p, tspan; integrator::Symbol=:tsit5,
+function integrate!(rhs!, u0, p, tspan; integrator=:tsit5,
                     reltol=1e-8, abstol=1e-8, dt0=0.0, dtmax=Inf,
-                    maxiters=10_000_000, tsave=nothing, save_states::Bool=false)
+                    maxiters=10_000_000, tsave=nothing, save_states::Bool=false,
+                    pool::Union{StagePool,Nothing}=nothing)
+    integ = _canon_integrator(integrator)
     T = Float64
     t, tfinal = T(tspan[1]), T(tspan[2])
-    pool = StagePool(u0, integrator === :ck45 ? 1 : 6)
+    if pool === nothing
+        pool = StagePool(u0, 6)
+    else
+        copyto!(pool.u, u0)
+    end
     tab5 = Tsit5Tab(T)
     tabck = CK45Tab(T)
     ctrl = PICtrl(T)
@@ -1554,7 +1571,7 @@ function integrate!(rhs!, u0, p, tspan; integrator::Symbol=:tsit5,
         end
         dt <= 0 && break
         nsteps += 1
-        if integrator === :ck45
+        if integ === :ck45
             u1, err = ck45_step!(pool, rhs!, p, t, dt, tabck)
         else
             u1, err = tsit5_step!(pool, rhs!, p, t, dt, tab5)
@@ -2567,17 +2584,47 @@ function solve_1st_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e
     u0 = _widen_u0(build_u0_1st_order(M, d.Nj, Float64, kind), E_of_t)
     p = _ode_p(d, E_of_t)
     tspan = d.timespan
+    integ = _canon_integrator(integrator)
     want_gpu = backend === :gpu || (backend === :auto && cuda_functional() && M >= 64)
     if want_gpu && cuda_functional()
+        integ === :tsit5 || error("GPU 1st-order is Tsit5-only until Tuesday iron; got integrator=:$integ")
         u, nsteps, how = solve_1st_gpu(u0, p, tspan; reltol=reltol, abstol=abstol,
                                        integrator=integrator, nshards=nshards, tsave=tsave)
         a, Sp, Sz = unpack_state_1st_order_u(u, M)
-        return a, collect(Sp), collect(Sz), (backend=:gpu, collective=how, nsteps=nsteps)
+        return a, collect(Sp), collect(Sz),
+               (backend=:gpu, collective=how, integrator=integ, nsteps=nsteps)
     end
-    u, ts, us, nsteps = integrate!(rhs1!, u0, p, tspan; integrator=integrator,
+    u, ts, us, nsteps = integrate!(rhs1!, u0, p, tspan; integrator=integ,
                                    reltol=reltol, abstol=abstol, tsave=tsave, dt0=dt0)
     a, Sp, Sz = unpack_state_1st_order_u(u, M)
-    return a, collect(Sp), collect(Sz), (backend=:cpu, collective=:none, nsteps=nsteps, t=ts, u=us)
+    return a, collect(Sp), collect(Sz),
+           (backend=:cpu, collective=:none, integrator=integ, nsteps=nsteps, t=ts, u=us)
+end
+
+# Persistent order-2 integrator + RHS scratch (B1/B2/B3). Owned by the solve,
+# not a per-stage alloc and not a process-global Ref on the hot path.
+mutable struct Order2Pool{T}
+    work::RHS2Work{T}
+    kS::NTuple{6,Vector{T}}
+    kL::NTuple{6,Vector{Vector{T}}}
+    yS::Vector{T}
+    yL::Vector{Vector{T}}
+    u1S::Vector{T}
+    u1L::Vector{Vector{T}}
+    eS::Vector{T}
+    eL::Vector{Vector{T}}
+end
+
+function Order2Pool(small, larges)
+    T = eltype(small)
+    ns = length(larges)
+    Mb = div(length(small) - MG_NSCALAR, MG_NSMALLFIELD)
+    kS = ntuple(_ -> zero(small), 6)
+    kL = ntuple(_ -> [zero(larges[p]) for p in 1:ns], 6)
+    return Order2Pool{T}(RHS2Work(T, Mb), kS, kL, zero(small),
+                         [zero(larges[p]) for p in 1:ns],
+                         zero(small), [zero(larges[p]) for p in 1:ns],
+                         zero(small), [zero(larges[p]) for p in 1:ns])
 end
 
 function _axpy_shards!(out_s, out_L, s, Ls, a, ks, kL)
@@ -2593,75 +2640,101 @@ function _axpy_shards!(out_s, out_L, s, Ls, a, ks, kL)
     return nothing
 end
 
-function _lincomb_shards!(out_s, out_L, s, Ls, coefs, ks, kL)
+# Unrolled lincomb — no kS[1:n] slices, no `dt .* tuple` temps (B1/B2).
+function _lincomb_n!(out_s, out_L, s, Ls, n::Int,
+                     c1, c2, c3, c4, c5, c6, kS, kL)
     @inbounds for i in eachindex(out_s)
         acc = s[i]
-        for c in eachindex(coefs)
-            acc += coefs[c] * ks[c][i]
-        end
+        n >= 1 && (acc += c1 * kS[1][i])
+        n >= 2 && (acc += c2 * kS[2][i])
+        n >= 3 && (acc += c3 * kS[3][i])
+        n >= 4 && (acc += c4 * kS[4][i])
+        n >= 5 && (acc += c5 * kS[5][i])
+        n >= 6 && (acc += c6 * kS[6][i])
         out_s[i] = acc
     end
     @inbounds for p in eachindex(out_L)
         out = out_L[p]; src = Ls[p]
         for i in eachindex(out)
             acc = src[i]
-            for c in eachindex(coefs)
-                acc += coefs[c] * kL[c][p][i]
-            end
+            n >= 1 && (acc += c1 * kL[1][p][i])
+            n >= 2 && (acc += c2 * kL[2][p][i])
+            n >= 3 && (acc += c3 * kL[3][p][i])
+            n >= 4 && (acc += c4 * kL[4][p][i])
+            n >= 5 && (acc += c5 * kL[5][p][i])
+            n >= 6 && (acc += c6 * kL[6][p][i])
             out[i] = acc
         end
     end
     return nothing
 end
 
-function _lincomb_from_zero_shards!(out_s, out_L, coefs, ks, kL)
-    z = zero(eltype(out_s))
-    @inbounds for i in eachindex(out_s)
-        acc = z
-        for c in eachindex(coefs)
-            acc += coefs[c] * ks[c][i]
-        end
-        out_s[i] = acc
+function _lincomb_err!(eS, eL, dt, e, kS, kL)
+    @inbounds for i in eachindex(eS)
+        eS[i] = dt * (e[1]*kS[1][i] + e[2]*kS[2][i] + e[3]*kS[3][i] +
+                      e[4]*kS[4][i] + e[5]*kS[5][i] + e[6]*kS[6][i])
     end
-    @inbounds for p in eachindex(out_L)
-        out = out_L[p]
-        zL = zero(eltype(out))
+    @inbounds for p in eachindex(eL)
+        out = eL[p]
         for i in eachindex(out)
-            acc = zL
-            for c in eachindex(coefs)
-                acc += coefs[c] * kL[c][p][i]
-            end
-            out[i] = acc
+            out[i] = dt * (e[1]*kL[1][p][i] + e[2]*kL[2][p][i] + e[3]*kL[3][p][i] +
+                           e[4]*kL[4][p][i] + e[5]*kL[5][p][i] + e[6]*kL[6][p][i])
         end
     end
+    return nothing
+end
+
+function _order2_rhs!(pool::Order2Pool, dS, dL, s, L, counts, offsets,
+                      delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
+    rhs2_sharded!(dS, dL, s, L, counts, offsets, delta0, kappa_e, kappa_i,
+                  delta_b, g_b, M, Et, pool.work)
+    return nothing
+end
+
+function _rk6_order2!(pool, small, larges, counts, offsets,
+                      delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, t, dt, tab)
+    kS, kL, yS, yL = pool.kS, pool.kL, pool.yS, pool.yL
+    _order2_rhs!(pool, kS[1], kL[1], small, larges, counts, offsets,
+                 delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t))
+    _axpy_shards!(yS, yL, small, larges, dt * tab.a21, kS[1], kL[1])
+    _order2_rhs!(pool, kS[2], kL[2], yS, yL, counts, offsets,
+                 delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t + tab.c[1] * dt))
+    z = zero(dt)
+    _lincomb_n!(yS, yL, small, larges, 2, dt*tab.a31, dt*tab.a32, z, z, z, z, kS, kL)
+    _order2_rhs!(pool, kS[3], kL[3], yS, yL, counts, offsets,
+                 delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t + tab.c[2] * dt))
+    _lincomb_n!(yS, yL, small, larges, 3, dt*tab.a41, dt*tab.a42, dt*tab.a43, z, z, z, kS, kL)
+    _order2_rhs!(pool, kS[4], kL[4], yS, yL, counts, offsets,
+                 delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t + tab.c[3] * dt))
+    _lincomb_n!(yS, yL, small, larges, 4, dt*tab.a51, dt*tab.a52, dt*tab.a53, dt*tab.a54, z, z, kS, kL)
+    _order2_rhs!(pool, kS[5], kL[5], yS, yL, counts, offsets,
+                 delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t + tab.c[4] * dt))
+    _lincomb_n!(yS, yL, small, larges, 5, dt*tab.a61, dt*tab.a62, dt*tab.a63, dt*tab.a64, dt*tab.a65, z, kS, kL)
+    _order2_rhs!(pool, kS[6], kL[6], yS, yL, counts, offsets,
+                 delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t + tab.c[5] * dt))
+    _lincomb_n!(pool.u1S, pool.u1L, small, larges, 6,
+                dt*tab.b[1], dt*tab.b[2], dt*tab.b[3], dt*tab.b[4], dt*tab.b[5], dt*tab.b[6], kS, kL)
+    _lincomb_err!(pool.eS, pool.eL, dt, tab.e, kS, kL)
     return nothing
 end
 
 function integrate_order2_sharded!(small, larges, counts, offsets,
                                    delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, tspan;
                                    reltol=1e-8, abstol=1e-8, dt0=0.0, dtmax=Inf,
-                                   maxiters=10_000_000, tsave=nothing)
+                                   maxiters=10_000_000, tsave=nothing,
+                                   integrator=:tsit5, pool::Union{Order2Pool,Nothing}=nothing)
+    integ = _canon_integrator(integrator)
     T = Float64
     t, tfinal = T(tspan[1]), T(tspan[2])
-    tab = Tsit5Tab(T)
+    tab = integ === :ck45 ? CK45Tab(T) : Tsit5Tab(T)
     ns = length(counts)
-    work = rhs2_work(eltype(small), M)
-    kS = [zero(small) for _ in 1:6]
-    kL = [[zero(larges[p]) for p in 1:ns] for _ in 1:6]
-    yS = zero(small)
-    yL = [zero(larges[p]) for p in 1:ns]
-    u1S = zero(small)
-    u1L = [zero(larges[p]) for p in 1:ns]
-    eS = zero(small)
-    eL = [zero(larges[p]) for p in 1:ns]
-    function rhs_at!(dS, dL, s, L, tt)
-        rhs2_sharded!(dS, dL, s, L, counts, offsets, delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(tt), work)
-    end
+    pl = pool === nothing ? Order2Pool(small, larges) : pool
     if dt0 > 0
         dt = T(dt0)
     else
-        rhs_at!(kS[1], kL[1], small, larges, t)
-        d1 = _primal(sqrt(sum(abs2, kS[1]) / length(kS[1])))
+        _order2_rhs!(pl, pl.kS[1], pl.kL[1], small, larges, counts, offsets,
+                     delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t))
+        d1 = _primal(sqrt(sum(abs2, pl.kS[1]) / length(pl.kS[1])))
         dt = d1 < 1e-8 ? T(1e-6) * (tfinal - t) : T(0.01) / max(d1, 1e-12)
         dt = min(dt, T(tfinal - t), T(dtmax))
     end
@@ -2679,27 +2752,16 @@ function integrate_order2_sharded!(small, larges, counts, offsets,
         end
         dt <= 0 && break
         nsteps += 1
-        rhs_at!(kS[1], kL[1], small, larges, t)
-        _axpy_shards!(yS, yL, small, larges, dt * tab.a21, kS[1], kL[1])
-        rhs_at!(kS[2], kL[2], yS, yL, t + tab.c[1] * dt)
-        _lincomb_shards!(yS, yL, small, larges, dt .* (tab.a31, tab.a32), kS[1:2], kL[1:2])
-        rhs_at!(kS[3], kL[3], yS, yL, t + tab.c[2] * dt)
-        _lincomb_shards!(yS, yL, small, larges, dt .* (tab.a41, tab.a42, tab.a43), kS[1:3], kL[1:3])
-        rhs_at!(kS[4], kL[4], yS, yL, t + tab.c[3] * dt)
-        _lincomb_shards!(yS, yL, small, larges, dt .* (tab.a51, tab.a52, tab.a53, tab.a54), kS[1:4], kL[1:4])
-        rhs_at!(kS[5], kL[5], yS, yL, t + tab.c[4] * dt)
-        _lincomb_shards!(yS, yL, small, larges, dt .* (tab.a61, tab.a62, tab.a63, tab.a64, tab.a65), kS[1:5], kL[1:5])
-        rhs_at!(kS[6], kL[6], yS, yL, t + dt)
-        _lincomb_shards!(u1S, u1L, small, larges, dt .* tab.b, kS, kL)
-        _lincomb_from_zero_shards!(eS, eL, dt .* tab.e, kS, kL)
-        EEst = _errnorm(small, u1S, eS, T(abstol), T(reltol))
+        _rk6_order2!(pl, small, larges, counts, offsets,
+                     delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, t, dt, tab)
+        EEst = _errnorm(small, pl.u1S, pl.eS, T(abstol), T(reltol))
         @inbounds for p in 1:ns
-            EEst = max(EEst, _errnorm(larges[p], u1L[p], eL[p], T(abstol), T(reltol)))
+            EEst = max(EEst, _errnorm(larges[p], pl.u1L[p], pl.eL[p], T(abstol), T(reltol)))
         end
         if EEst <= 1
-            copyto!(small, u1S)
+            copyto!(small, pl.u1S)
             @inbounds for p in 1:ns
-                copyto!(larges[p], u1L[p])
+                copyto!(larges[p], pl.u1L[p])
             end
             t = forced && tsave !== nothing ? T(tsave[isave]) : t + dt
             if forced && tsave !== nothing
@@ -2717,9 +2779,11 @@ end
 
 function solve_2nd_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e-8,
                          integrator=:tsit5, tsave=nothing, backend=:auto, nshards=nothing)
+    integ = _canon_integrator(integrator)
     M = Int(d.M)
     want_gpu = backend === :gpu || (backend === :auto && cuda_functional())
     if want_gpu && cuda_functional()
+        integ === :tsit5 || error("GPU order-2 is Tsit5-only until Tuesday iron; got integrator=:$integ")
         ns = nshards === nothing ? max(gpu_count(), 1) : clamp(Int(nshards), 1, M)
         small, larges, counts, offsets = build_u0_2nd_mgpu(M, d.Nj, kind, ns)
         delta0, kappa_e, kappa_i = Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i)
@@ -2740,11 +2804,11 @@ function solve_2nd_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e
     g_b = collect(Float64, d.g_b)
     small, larges, nsteps = integrate_order2_sharded!(
         small, larges, counts, offsets, delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, d.timespan;
-        reltol=reltol, abstol=abstol, tsave=tsave)
+        reltol=reltol, abstol=abstol, tsave=tsave, integrator=integ)
     u = zeros(ComplexF64, state_length_2nd_order(M))
     shards_to_dense!(u, small, larges, counts, offsets, M)
     return unpack_state_2nd_order_u(u, M),
-           (backend=:cpu, nshards=ns, nthreads=_cpu_nthreads(), nsteps=nsteps, u_end=u)
+           (backend=:cpu, integrator=integ, nshards=ns, nthreads=_cpu_nthreads(), nsteps=nsteps, u_end=u)
 end
 
 function pulse_metrics_from_state(Sp, Sz, d)
@@ -2790,7 +2854,10 @@ end
 function pulse_cost_grad_adjoint(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                                  I_min=0.85, kappa_I=50.0, S_min=0.85, kappa_S=50.0,
                                  track=:weak, reltol=1e-8, abstol=1e-8,
-                                 checkpoint_stride::Integer=typemax(Int), dt0=0.0)
+                                 checkpoint_stride::Integer=typemax(Int), dt0=0.0,
+                                 integrator=:tsit5)
+    integ = _canon_integrator(integrator)
+    integ === :tsit5 || error("discrete adjoint is Tsit5-only; set integrator=:tsit5 or grad=:forward")
     M = Int(d.M)
     E = build_E_of_t(pulse, u)
     p = _ode_p(d, E)
@@ -2903,7 +2970,8 @@ function optimize_bspline!(u, pulse, d; num_epochs=20, learning_rate=0.05, patie
                            w_time=0.15, w_power=0.05, w_tmax=1.0, target_F=1.0,
                            I_min=0.85, kappa_I=50.0, S_min=0.85, kappa_S=50.0,
                            track=:weak, reltol=1e-8, abstol=1e-8, cf_lr_scale=0.25,
-                           grad::Symbol=:adjoint, checkpoint_stride::Integer=typemax(Int))
+                           grad::Symbol=:adjoint, checkpoint_stride::Integer=typemax(Int),
+                           integrator=:tsit5)
     n = length(u)
     n == n_params(pulse) || error("optimizer: length(u)=$(length(u)) != n_params=$(n_params(pulse))")
     grad in (:adjoint, :forward) || error("grad must be :adjoint or :forward, got $grad")
@@ -2921,12 +2989,13 @@ function optimize_bspline!(u, pulse, d; num_epochs=20, learning_rate=0.05, patie
             g, cost, inv, sil, dur = pulse_cost_grad_forward(
                 u, pulse, d; target_F=target_F, w_time=w_time, w_power=w_power, w_tmax=w_tmax,
                 I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S, track=track,
-                reltol=reltol, abstol=abstol)
+                reltol=reltol, abstol=abstol, integrator=integrator)
         else
             g, cost, inv, sil, dur = pulse_cost_grad_adjoint(
                 u, pulse, d; target_F=target_F, w_time=w_time, w_power=w_power, w_tmax=w_tmax,
                 I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S, track=track,
-                reltol=reltol, abstol=abstol, checkpoint_stride=checkpoint_stride)
+                reltol=reltol, abstol=abstol, checkpoint_stride=checkpoint_stride,
+                integrator=integrator)
         end
         push!(hist, (epoch=epoch, cost=cost, inversion=inv, silencing=sil, duration=dur))
         @printf("[optimizer] epoch %d  cost=%.6g  I=%.4f  S=%.4f  T=%.3g\n", epoch, cost, inv, sil, dur)
@@ -3177,7 +3246,7 @@ function prepare(src; ensemble_method::Symbol=:auto)
         settings, d,
         _sym(_get(settings.sim, :initial_condition, :ground)),
         _sym(_get(cmp, :backend, :auto)),
-        _sym(_get(cmp, :integrator, :tsit5)),
+        _integrator_from_compute(cmp),
         _get(cmp, :nshards, nothing),
         Float64(_get(settings.sim, :reltol, 1e-8)),
         Float64(_get(settings.sim, :abstol, 1e-8)),
@@ -3256,7 +3325,8 @@ function order2_bspline(prep::Prepared, u=nothing; kind=prep.kind)
             pulse=pulse, u=uθ, info=info)
 end
 
-function optimize(prep::Prepared, u=nothing; grad::Symbol=:adjoint, kwargs...)
+function optimize(prep::Prepared, u=nothing; grad::Symbol=:adjoint,
+                  integrator=prep.integrator, kwargs...)
     pulse, uθ = _ensure_pulse(prep, u)
     opt = prep.settings.optimizer
     gsym = _sym(grad)
@@ -3278,6 +3348,7 @@ function optimize(prep::Prepared, u=nothing; grad::Symbol=:adjoint, kwargs...)
         cf_lr_scale=Float64(_get(opt, :cf_lr_scale, 0.25)),
         grad=gsym,
         checkpoint_stride=Int(_get(opt, :checkpoint_stride, typemax(Int))),
+        integrator=integrator,
         kwargs...)
     extra = (best_cost=best, n_params=n_params(pulse), epochs=length(hist), grad=gsym)
     summarize_result(:optimizer, prep.d, extra)
