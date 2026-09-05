@@ -15,7 +15,8 @@ function _want_gpu_2nd(backend::Symbol)
 end
 
 function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
-                           clean_gpu=true, backend::Symbol=:auto)
+                           clean_gpu=true, backend::Symbol=:auto,
+                           integrator::Symbol=:tsit5)
     SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, :second_order)
     CONFIG = build_full_config(SIM_SETTING, SYSTEM_CONFIG)
 
@@ -41,8 +42,10 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
     end
 
     if !use_gpu
+        integrator in (:tsit5, :ck45) || error(
+            "CPU integrator must be :tsit5 or :ck45; got $(integrator).")
         u0 = build_u0_cpu_2nd_order(M, d.Nj, initial_condition)
-        ws = Solver2Workspace(Float64, M, Nt; stages = true)
+        ws = Solver2Workspace(Float64, M, Nt; stages = true, integrator = integrator)
         attach_u0!(ws, u0)
         p = (
             d.delta0,
@@ -89,11 +92,17 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
             elapsed_seconds = elapsed_seconds,
             solver_stats = stats,
             backend = :cpu,
+            integrator = integrator,
         )
         filename = CONFIG.saved_file_name
         save_run_data(filename, data)
         println("Saving to: ", filename)
         return data
+    end
+
+    if integrator !== :tsit5
+        @warn "GPU run_sim_2nd_order uses DiffEq Tsit5; " *
+              "integrator=$(integrator) is CPU-only this tip (no multi-GPU claim)."
     end
 
     u0_gpu = build_u0_gpu_2nd_order(M, d.Nj, initial_condition)

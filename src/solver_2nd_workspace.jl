@@ -1,15 +1,36 @@
 # Persistent caches above the warm serial RHS (`@allocated == 0`).
-# Owns save buffers, callback host scratch, Tsit5 stages, and the PI controller
+# Owns save buffers, callback host scratch, RK stages, and the PI controller
 # so the CPU integrator / DiffEq callbacks do not allocate per step.
-# Stages follow the MGPU Tsit5 register map: U, TMP, K1..K7.
+#
+# Tsit5 (default): 9 registers — U, TMP, K1..K7 (MGPU Tsit5 map). Dense
+# interpolant unused on this :tstops path.
+# CK45: 5 registers — UPREV, STAGE, ACC, K, ERR (MGPU CK_* / Ark B6-style
+# low-storage). Mapped onto u, tmp, k1, k2, k3; k4..k7 stay empty.
 
 const _SAVE2_PREFIX_FIELDS = 5  # Sp, Sz, adSp, adSm, adSz
 
 @inline _save2_prefix_length(M::Integer) = 3 + _SAVE2_PREFIX_FIELDS * M
 
+@inline function _cpu_stage_count(integrator::Symbol)
+    integrator === :tsit5 && return 9
+    integrator === :ck45 && return 5
+    error("Unknown integrator = $(integrator). Use :tsit5 or :ck45.")
+end
+
+mutable struct Solve2Stats
+    nsteps::Int
+    naccept::Int
+    nreject::Int
+    nrhs::Int
+    elapsed::Float64
+end
+
+Solve2Stats() = Solve2Stats(0, 0, 0, 0, 0.0)
+
 mutable struct Solver2Workspace{T,U,V,Tab}
     M::Int
     Nt::Int
+    integrator::Symbol
     u::U
     tmp::U
     k1::U
@@ -33,18 +54,23 @@ mutable struct Solver2Workspace{T,U,V,Tab}
     ctrl::PIController{T}
     saved::Base.RefValue{Int}
     nrhs::Base.RefValue{Int}
+    stats::Solve2Stats
 end
 
 function Solver2Workspace(::Type{T}, M::Integer, Nt::Integer;
-                          stages::Bool = true) where {T}
+                          stages::Bool = true,
+                          integrator::Symbol = :tsit5) where {T}
+    nreg = stages ? _cpu_stage_count(integrator) : 0
     n = state_length_2nd_order(M)
-    alloc() = stages ? zeros(Complex{T}, n) : Vector{Complex{T}}(undef, 0)
-    u = alloc()
+    full() = zeros(Complex{T}, n)
+    emptyv() = Vector{Complex{T}}(undef, 0)
+    stage(i) = (stages && i <= nreg) ? full() : emptyv()
+    u = stage(1)
     rhs = _rhs2_workspace(Vector{Complex{T}}(undef, 0), M)
-    tab = Tsit5Tableau(T)
+    tab = build_tableau(integrator, T)
     return Solver2Workspace{T,typeof(u),typeof(rhs.gconjSp),typeof(tab)}(
-        Int(M), Int(Nt),
-        u, alloc(), alloc(), alloc(), alloc(), alloc(), alloc(), alloc(), alloc(),
+        Int(M), Int(Nt), integrator,
+        u, stage(2), stage(3), stage(4), stage(5), stage(6), stage(7), stage(8), stage(9),
         rhs,
         Vector{Complex{T}}(undef, _save2_prefix_length(M)),
         Vector{ComplexF64}(undef, Nt),
@@ -59,6 +85,7 @@ function Solver2Workspace(::Type{T}, M::Integer, Nt::Integer;
         PIController(T, alg_order(tab)),
         Ref(0),
         Ref(0),
+        Solve2Stats(),
     )
 end
 
@@ -69,6 +96,12 @@ function attach_u0!(ws::Solver2Workspace, u0)
     ws.saved[] = 0
     ws.nrhs[] = 0
     ws.ctrl.qold = ws.ctrl.qoldinit
+    st = ws.stats
+    st.nsteps = 0
+    st.naccept = 0
+    st.nreject = 0
+    st.nrhs = 0
+    st.elapsed = 0.0
     return ws
 end
 
@@ -215,13 +248,101 @@ function tsit5_cpu_step!(ws::Solver2Workspace{T}, p, t::T, dt::T,
                        dt, atol, rtol)
 end
 
-# Adaptive Tsit5 on the persistent workspace. Hits tsave exactly (:tstops).
+# CK45 / Carpenter–Kennedy 5-stage 4th-order (MGPU lowstorage_kernel!).
+# Registers: u=UPREV, tmp=STAGE, k1=ACC, k2=K, k3=ERR.
+@inline function _ck45_lowstorage!(stage, accum, err, k, base, dt, cA, cB, cE,
+                                   ::Val{write_stage}, ::Val{first}) where {write_stage, first}
+    dA = dt * cA
+    dB = dt * cB
+    dE = dt * cE
+    @inbounds for i in eachindex(base)
+        ki = k[i]
+        ai = base[i]
+        write_stage && (stage[i] = muladd(dA, ki, ai))
+        accum[i] = muladd(dB, ki, ai)
+        err[i] = first ? (dE * ki) : muladd(dE, ki, err[i])
+    end
+    return nothing
+end
+
+@inline function _ck45_eest(uprev, uacc, err, atol, rtol)
+    acc = zero(real(eltype(uprev)))
+    n = length(uprev)
+    @inbounds for i in 1:n
+        sc = atol + rtol * max(abs(uprev[i]), abs(uacc[i]))
+        acc += abs2(err[i] / sc)
+    end
+    return sqrt(acc / n)
+end
+
+function ck45_cpu_step!(ws::Solver2Workspace{T}, p, t::T, dt::T,
+                        atol::T, rtol::T) where {T}
+    tab = ws.tab
+    uprev = ws.u
+    stage = ws.tmp
+    accum = ws.k1
+    k = ws.k2
+    err = ws.k3
+
+    # Stage 1: k already f(uprev, t).
+    _ck45_lowstorage!(stage, accum, err, k, uprev, dt, tab.A[1], tab.b[1], tab.bt[1],
+                      Val(true), Val(true))
+    _cpu_rhs!(ws, k, stage, p, t + tab.c[2] * dt)
+    _ck45_lowstorage!(stage, accum, err, k, accum, dt, tab.A[2], tab.b[2], tab.bt[2],
+                      Val(true), Val(false))
+    _cpu_rhs!(ws, k, stage, p, t + tab.c[3] * dt)
+    _ck45_lowstorage!(stage, accum, err, k, accum, dt, tab.A[3], tab.b[3], tab.bt[3],
+                      Val(true), Val(false))
+    _cpu_rhs!(ws, k, stage, p, t + tab.c[4] * dt)
+    _ck45_lowstorage!(stage, accum, err, k, accum, dt, tab.A[4], tab.b[4], tab.bt[4],
+                      Val(true), Val(false))
+    _cpu_rhs!(ws, k, stage, p, t + tab.c[5] * dt)
+    _ck45_lowstorage!(stage, accum, err, k, accum, dt, zero(T), tab.b[5], tab.bt[5],
+                      Val(false), Val(false))
+
+    EEst = _ck45_eest(uprev, accum, err, atol, rtol)
+    # Restore / refresh K so the next attempt starts with f(current u).
+    # Accept path: f(ACC); reject path: f(UPREV). Matches MGPU ck45_step!.
+    if EEst <= one(T)
+        _cpu_rhs!(ws, k, accum, p, t + dt)
+    else
+        _cpu_rhs!(ws, k, uprev, p, t)
+    end
+    return EEst
+end
+
+@inline _cpu_step!(ws::Solver2Workspace{T,U,V,<:Tsit5Tableau}, p, t::T, dt::T, atol::T, rtol::T) where {T,U,V} =
+    tsit5_cpu_step!(ws, p, t, dt, atol, rtol)
+@inline _cpu_step!(ws::Solver2Workspace{T,U,V,<:CK45Tableau}, p, t::T, dt::T, atol::T, rtol::T) where {T,U,V} =
+    ck45_cpu_step!(ws, p, t, dt, atol, rtol)
+
+@inline _k0(ws::Solver2Workspace{T,U,V,<:Tsit5Tableau}) where {T,U,V} = ws.k1
+@inline _k0(ws::Solver2Workspace{T,U,V,<:CK45Tableau}) where {T,U,V} = ws.k2
+
+@inline function _accept_advance!(ws::Solver2Workspace{T,U,V,<:Tsit5Tableau}) where {T,U,V}
+    ws.u, ws.tmp = ws.tmp, ws.u
+    ws.k1, ws.k7 = ws.k7, ws.k1
+    return nothing
+end
+
+@inline function _accept_advance!(ws::Solver2Workspace{T,U,V,<:CK45Tableau}) where {T,U,V}
+    ws.u, ws.k1 = ws.k1, ws.u
+    return nothing
+end
+
+# Adaptive RK on the persistent workspace. Hits tsave exactly (:tstops).
 # Physics is rhs_2nd_order! → rhs_cpu! (serial warm path already no-alloc).
+# Writes Solve2Stats in-place (no NamedTuple) so a warm solve can be 0-alloc.
 function solve_cpu_2nd!(ws::Solver2Workspace{T}, p, t0::Real, tend::Real,
                         tsave::AbstractVector;
+                        integrator::Union{Nothing,Symbol} = nothing,
                         reltol::Real = 1e-8, abstol::Real = 1e-8,
                         dtmax::Real = Inf, dt0::Real = 0,
                         maxiters::Int = 10_000_000) where {T}
+    if integrator !== nothing && integrator !== ws.integrator
+        error("solve_cpu_2nd! integrator=$(integrator) but workspace is $(ws.integrator); " *
+              "construct Solver2Workspace(; integrator=$(integrator)).")
+    end
     atol = T(abstol)
     rtol = T(reltol)
     t = T(t0)
@@ -241,13 +362,13 @@ function solve_cpu_2nd!(ws::Solver2Workspace{T}, p, t0::Real, tend::Real,
         isave = 2
     end
 
-    _cpu_rhs!(ws, ws.k1, ws.u, p, t)
+    _cpu_rhs!(ws, _k0(ws), ws.u, p, t)
     span = abs(tfinal - t)
     if dt0 > 0
         dt_free = T(dt0)
     else
         d0 = _scaled_norm_vs_zero(ws.u, ws.u, atol, rtol)
-        d1 = _scaled_norm_vs_zero(ws.k1, ws.u, atol, rtol)
+        d1 = _scaled_norm_vs_zero(_k0(ws), ws.u, atol, rtol)
         dt_free = (d0 < T(1e-5) || d1 < T(1e-5)) ? T(1e-6) * span : T(0.01) * (d0 / d1)
         dt_free = min(dt_free, span, dtmaxT)
         dt_free = max(dt_free, T(1e-12) * span)
@@ -269,13 +390,12 @@ function solve_cpu_2nd!(ws::Solver2Workspace{T}, p, t0::Real, tend::Real,
         dt <= 0 && break
         nsteps += 1
 
-        EEst = tsit5_cpu_step!(ws, p, t, dt, atol, rtol)
+        EEst = _cpu_step!(ws, p, t, dt, atol, rtol)
 
         if EEst <= one(T)
             naccept += 1
             t = forced ? t_target : t + dt
-            ws.u, ws.tmp = ws.tmp, ws.u
-            ws.k1, ws.k7 = ws.k7, ws.k1
+            _accept_advance!(ws)
             if forced && isave <= nsave && T(tsave[isave]) == t_target
                 record_save2!(ws, ws.u, isave)
                 isave += 1
@@ -298,11 +418,11 @@ function solve_cpu_2nd!(ws::Solver2Workspace{T}, p, t0::Real, tend::Real,
     if nsteps >= maxiters
         @warn "Reached maxiters before the end of the time span." t tfinal nsteps
     end
-    return (
-        nsteps = nsteps,
-        naccept = naccept,
-        nreject = nreject,
-        nrhs = ws.nrhs[],
-        elapsed = elapsed,
-    )
+    st = ws.stats
+    st.nsteps = nsteps
+    st.naccept = naccept
+    st.nreject = nreject
+    st.nrhs = ws.nrhs[]
+    st.elapsed = elapsed
+    return st
 end

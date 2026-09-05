@@ -77,7 +77,8 @@ export run_sim_2nd_order
 export build_u0_cpu_2nd_order
 export rhs_2nd_order!
 export rhs_cpu!
-export Solver2Workspace, solve_cpu_2nd!, record_save2!, tsit5_cpu_step!, attach_u0!
+export Solver2Workspace, Solve2Stats, solve_cpu_2nd!, record_save2!,
+       tsit5_cpu_step!, ck45_cpu_step!, attach_u0!
 
 export mgpu_run
 export mgpu_run_simulation

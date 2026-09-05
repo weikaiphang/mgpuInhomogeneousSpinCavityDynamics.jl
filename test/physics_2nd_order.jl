@@ -436,3 +436,79 @@ end
     @test ws.u == ws_b.u
 end
 
+@testset "CK45 persistent workspace; tol-aware vs Tsit5" begin
+    M = 8
+    Nt = 11
+    Nj = fill(12.0, M)
+    u0 = build_u0_cpu_2nd_order(M, Nj, :ground)
+    tsave = collect(range(0.0, 0.05; length = Nt))
+    delta_b = Float64[0.05 * (j - 4) for j in 1:M]
+    g_b = fill(0.4, M)
+
+    ws5 = Solver2Workspace(Float64, M, Nt; integrator = :ck45)
+    @test ws5.integrator === :ck45
+    @test ws5.tab isa CK45Tableau
+    @test length(ws5.u) == state_length_2nd_order(M)
+    @test length(ws5.k3) == length(ws5.u)
+    @test isempty(ws5.k4) && isempty(ws5.k7)
+    @test _cpu_stage_count(:ck45) == 5
+    @test _cpu_stage_count(:tsit5) == 9
+
+    p5 = (0.0, 1.5, 0.25, delta_b, g_b, M, nothing, Returns(0.0im), ws5.rhs)
+    attach_u0!(ws5, u0)
+    @test_throws ErrorException solve_cpu_2nd!(ws5, p5, 0.0, 0.05, tsave; integrator = :tsit5)
+
+    atol = 1e-8
+    rtol = 1e-8
+    _cpu_rhs!(ws5, ws5.k2, ws5.u, p5, 0.0)
+    ck45_cpu_step!(ws5, p5, 0.0, 1e-4, atol, rtol)
+    _cpu_rhs!(ws5, ws5.k2, ws5.u, p5, 0.0)
+    alloc_ck = @allocated ck45_cpu_step!(ws5, p5, 0.0, 1e-4, atol, rtol)
+    @test alloc_ck == 0
+
+    attach_u0!(ws5, u0)
+    stats5 = solve_cpu_2nd!(ws5, p5, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    @test ws5.saved[] == Nt
+    @test stats5.naccept >= Nt - 1
+    @test maximum(abs, ws5.a) < 1e-12
+    @test maximum(abs, ws5.n) < 1e-12
+    for k in 1:Nt
+        @test real.(ws5.Sz[:, k]) ≈ -Nj ./ 2 atol = 1e-12
+    end
+
+    ws5b = Solver2Workspace(Float64, M, Nt; integrator = :ck45)
+    attach_u0!(ws5b, u0)
+    p5b = (0.0, 1.5, 0.25, delta_b, g_b, M, nothing, Returns(0.0im), ws5b.rhs)
+    solve_cpu_2nd!(ws5b, p5b, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    @test ws5.a == ws5b.a
+    @test ws5.u == ws5b.u
+
+    # Driven: same RHS, orders 5 vs 4 — tol-aware, not bit-identical.
+    Et = 0.15 + 0.05im
+    ws_t = Solver2Workspace(Float64, M, Nt; integrator = :tsit5)
+    ws_c = Solver2Workspace(Float64, M, Nt; integrator = :ck45)
+    attach_u0!(ws_t, u0)
+    attach_u0!(ws_c, u0)
+    pt = (0.1, 1.5, 0.25, delta_b, g_b, M, nothing, Returns(Et), ws_t.rhs)
+    pc = (0.1, 1.5, 0.25, delta_b, g_b, M, nothing, Returns(Et), ws_c.rhs)
+    solve_cpu_2nd!(ws_t, pt, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    solve_cpu_2nd!(ws_c, pc, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    @test ws_t.a ≈ ws_c.a atol = 1e-6 rtol = 1e-5
+    @test ws_t.n ≈ ws_c.n atol = 1e-6 rtol = 1e-5
+    @test ws_t.Sz ≈ ws_c.Sz atol = 1e-6 rtol = 1e-5
+    @test ws_t.Sp ≈ ws_c.Sp atol = 1e-6 rtol = 1e-5
+
+    # End-to-end warm solve: no per-step allocator traffic.
+    attach_u0!(ws_c, u0)
+    solve_cpu_2nd!(ws_c, pc, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    attach_u0!(ws_c, u0)
+    alloc_e2e = @allocated solve_cpu_2nd!(ws_c, pc, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    @test alloc_e2e == 0
+    attach_u0!(ws_t, u0)
+    solve_cpu_2nd!(ws_t, pt, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    attach_u0!(ws_t, u0)
+    alloc_e2e5 = @allocated solve_cpu_2nd!(ws_t, pt, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    @test alloc_e2e5 == 0
+end
+
+
