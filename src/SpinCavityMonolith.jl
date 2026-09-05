@@ -868,12 +868,14 @@ end
 # §6  First-order RHS  (eqs. 1–3)
 # =============================================================================
 
-@inline function _rhs1_spin!(dSp, dSz, Sp, Sz, delta_b, g_b, a, ca, j)
+@inline function _rhs1_spin_u!(du, u, delta_b, g_b, a, ca, j, M)
     @inbounds begin
         gj = g_b[j]
-        sp = Sp[j]; sz = Sz[j]
-        dSp[j] = 1im * delta_b[j] * sp - 2im * gj * ca * sz
-        dSz[j] = -1im * gj * a * sp + 1im * gj * ca * conj(sp)
+        isp = IDX1_Sp_start + j - 1
+        isz = idx1_Sz_start(M) + j - 1
+        sp = u[isp]; sz = u[isz]
+        du[isp] = 1im * delta_b[j] * sp - 2im * gj * ca * sz
+        du[isz] = -1im * gj * a * sp + 1im * gj * ca * conj(sp)
     end
     return nothing
 end
@@ -882,26 +884,23 @@ function rhs1!(du, u, p, t)
     delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t = p
     a = u[IDX1_a]
     ca = conj(a)
-    Sp = @view u[IDX1_Sp_start:IDX1_Sp_start+M-1]
-    Sz = @view u[idx1_Sz_start(M):idx1_Sz_start(M)+M-1]
-    dSp = @view du[IDX1_Sp_start:IDX1_Sp_start+M-1]
-    dSz = @view du[idx1_Sz_start(M):idx1_Sz_start(M)+M-1]
     κt = kappa_e + kappa_i
     Et = E_of_t(t)
     # (1) ȧ = √κₑ E − iδ₀ a − i Σ gⱼ Sⱼ⁻ − (κₜ/2) a     with S⁻ = (S⁺)*
+    # Direct indexing — no @view (4 SubArrays were 432 B/call and failed Ass stage benches).
     s = zero(a)
     @inbounds for j in 1:M
-        s += g_b[j] * conj(Sp[j])
+        s += g_b[j] * conj(u[IDX1_Sp_start + j - 1])
     end
     du[IDX1_a] = sqrt(kappa_e) * Et - 1im * delta0 * a - 1im * s - (0.5 * κt) * a
     # (2)(3) — thread over bins when the ensemble is large enough
     if _cpu_should_thread(M)
         @threads :static for j in 1:M
-            _rhs1_spin!(dSp, dSz, Sp, Sz, delta_b, g_b, a, ca, j)
+            _rhs1_spin_u!(du, u, delta_b, g_b, a, ca, j, M)
         end
     else
         @inbounds for j in 1:M
-            _rhs1_spin!(dSp, dSz, Sp, Sz, delta_b, g_b, a, ca, j)
+            _rhs1_spin_u!(du, u, delta_b, g_b, a, ca, j, M)
         end
     end
     return nothing
@@ -1482,7 +1481,7 @@ function _errnorm(u, u1, err, atol, rtol)
     return sqrt(acc / length(err))
 end
 
-function rk6_step!(pool::StagePool, rhs!, p, t, dt, tab)
+@inline function rk6_step!(pool::StagePool{T}, rhs!, p, t, dt, tab) where {T}
     u, k, y, u1, err = pool.u, pool.k, pool.y, pool.u1, pool.err
     rhs!(k[1], u, p, t)
     @inbounds for i in eachindex(u)
@@ -1512,10 +1511,12 @@ function rk6_step!(pool::StagePool, rhs!, p, t, dt, tab)
         err[i] = dt * (tab.e[1]*k[1][i] + tab.e[2]*k[2][i] + tab.e[3]*k[3][i] +
                        tab.e[4]*k[4][i] + tab.e[5]*k[5][i] + tab.e[6]*k[6][i])
     end
-    return u1, err
+    return nothing
 end
-tsit5_step!(pool::StagePool, rhs!, p, t, dt, tab::Tsit5Tab) = rk6_step!(pool, rhs!, p, t, dt, tab)
-ck45_step!(pool::StagePool, rhs!, p, t, dt, tab::CK45Tab) = rk6_step!(pool, rhs!, p, t, dt, tab)
+@inline tsit5_step!(pool::StagePool{U}, rhs!, p, t, dt, tab::Tsit5Tab{S}) where {U,S} =
+    rk6_step!(pool, rhs!, p, t, dt, tab)
+@inline ck45_step!(pool::StagePool{U}, rhs!, p, t, dt, tab::CK45Tab{S}) where {U,S} =
+    rk6_step!(pool, rhs!, p, t, dt, tab)
 
 mutable struct PICtrl{T}
     qold::T
@@ -1572,13 +1573,13 @@ function integrate!(rhs!, u0, p, tspan; integrator=:tsit5,
         dt <= 0 && break
         nsteps += 1
         if integ === :ck45
-            u1, err = ck45_step!(pool, rhs!, p, t, dt, tabck)
+            ck45_step!(pool, rhs!, p, t, dt, tabck)
         else
-            u1, err = tsit5_step!(pool, rhs!, p, t, dt, tab5)
+            tsit5_step!(pool, rhs!, p, t, dt, tab5)
         end
-        EEst = _errnorm(pool.u, u1, err, T(abstol), T(reltol))
+        EEst = _errnorm(pool.u, pool.u1, pool.err, T(abstol), T(reltol))
         if EEst <= 1
-            copyto!(pool.u, u1)
+            copyto!(pool.u, pool.u1)
             t = forced && tsave !== nothing ? T(tsave[isave]) : t + dt
             if save_states
                 maybe_save(t)
@@ -2691,8 +2692,8 @@ function _order2_rhs!(pool::Order2Pool, dS, dL, s, L, counts, offsets,
     return nothing
 end
 
-function _rk6_order2!(pool, small, larges, counts, offsets,
-                      delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, t, dt, tab)
+@inline function _rk6_order2!(pool::Order2Pool{T}, small, larges, counts, offsets,
+                             delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, t, dt, tab) where {T}
     kS, kL, yS, yL = pool.kS, pool.kL, pool.yS, pool.yL
     _order2_rhs!(pool, kS[1], kL[1], small, larges, counts, offsets,
                  delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(t))

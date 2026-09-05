@@ -413,6 +413,7 @@ _bench_Et(t) = ComplexF64(0.1, 0.05)
     ack, _, _, ick = M.solve_1st_order(d1, _bench_Et, :equator; integrator=:ck45, backend=:cpu)
     @test i5.integrator === :tsit5
     @test ick.integrator === :ck45
+    @test a5 ≈ ack rtol=1e-8 atol=1e-12
     @test i5.nsteps != ick.nsteps
     _, info5 = M.solve_2nd_order(d1, _bench_Et, :equator; integrator=:tsit5, backend=:cpu)
     _, infock = M.solve_2nd_order(d1, _bench_Et, :equator; integrator=:ck45, backend=:cpu)
@@ -422,6 +423,10 @@ _bench_Et(t) = ComplexF64(0.1, 0.05)
     pulse, d, u, Ttotal = _tiny_pulse_problem()
     @test_throws ErrorException M.pulse_cost_grad_adjoint(
         u, pulse, d; integrator=:ck45, reltol=1e2, abstol=1e2, dt0=Ttotal)
+    proj = read(joinpath(@__DIR__, "..", "Project.toml"), String)
+    @test occursin("LinearAlgebra", proj)
+    @test occursin("Random", proj)
+    @test occursin("Printf", proj)
 end
 
 @testset "0 alloc/stage with persistent pools (B1/B2/B3/B4/B5)" begin
@@ -468,6 +473,23 @@ end
     @test a2 == 0
     @test a2c == 0
     @test arhs == 0
+    # Ass harness PR #8: incremental bytes/step of integrate_order2_sharded!
+    # (was 640 B from kS[1:n] slices). Reused Order2Pool; 1-thread warm path.
+    function _ass_integrate(tspan, pool)
+        s0, L0, c0, o0 = M.build_u0_2nd_mgpu(Mbin, Nj, :equator, 1)
+        _, _, nst = M.integrate_order2_sharded!(
+            s0, L0, c0, o0, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin,
+            _bench_Et, tspan; reltol=1e-6, abstol=1e-6, dt0=1e-7, pool=pool)
+        return nst
+    end
+    _ass_integrate((0.0, 2e-7), pool2)
+    nst_s = _ass_integrate((0.0, 2e-7), pool2)
+    b_s = @allocated _ass_integrate((0.0, 2e-7), pool2)
+    nst_l = _ass_integrate((0.0, 8e-7), pool2)
+    b_l = @allocated _ass_integrate((0.0, 8e-7), pool2)
+    per = (b_l - b_s) / max(nst_l - nst_s, 1)
+    @test nst_l > nst_s
+    @test per == 0
 end
 
 println("SpinCavityMonolith tests finished.")

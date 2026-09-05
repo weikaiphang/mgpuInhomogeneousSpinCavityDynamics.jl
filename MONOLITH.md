@@ -95,6 +95,8 @@ Production path until Tuesday iron: **CPU multicore**, not fake GPUs.
 - `:ck45` is Cash–Karp 5(4) and is honored. Unknown names and GPU/adjoint
   `:ck45` **error** — they do not fall through to Tsit5. Settings may set
   `integrator` or `method`.
+- `Project.toml` lists the stdlibs this module uses (`LinearAlgebra`,
+  `Random`, `Printf`) so `Pkg.precompile()` does not false-green / fail CI.
 - Run with `julia -t auto` / `JULIA_NUM_THREADS`.
 
 ## Multi-GPU — Tuesday iron gate
