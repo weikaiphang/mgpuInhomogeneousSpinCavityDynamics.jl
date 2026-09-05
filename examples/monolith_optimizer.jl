@@ -1,5 +1,5 @@
 # Mode: optimizer — Adam on B-spline parameters only (n_params = 3k + k nA + k nf).
-# Loss = pulse_cost from src/pulse_optimizer2.jl (fidelity physics + time/tmax/power).
+# Loss = fidelity physics + time/tmax/power (discrete adjoint default).
 include(joinpath(@__DIR__, "monolith_common.jl"))
 
 MODE = :optimizer

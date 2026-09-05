@@ -1,9 +1,8 @@
 # Standalone monolith tests (no CUDA / DifferentialEquations required).
 #   julia --project=. test/monolith_mgpu.jl
 #
-# Covers: (a) vacuum⊗ground 2nd-order fixed point,
-#         (b) 1st-order RHS vs package rhs_1st_order!,
-#         (c) B-spline pack/unpack / n_params.
+# Covers: vacuum⊗ground fixed point, 1st-order κₜ, sharded RHS parity,
+#         B-spline pack/unpack, product-state ICs, adjoint vs forward.
 
 using Test
 using LinearAlgebra
@@ -40,28 +39,51 @@ const M = NudeQuadMonolith
     end
 end
 
-@testset "1st-order RHS vs package rhs_1st_order!" begin
+@testset "1st-order RHS (κₜ = κₑ+κᵢ)" begin
     Mbin = 3
     Nj = [2.0, 4.0, 6.0]
     delta_b = [0.0, 2π * 5e4, -2π * 5e4]
     g_b = [2π * 100, 2π * 90, 2π * 110]
     kappa_e = 2π * 1e6
-    kappa_i = 2π * 1e5   # internal loss must enter κₜ
+    kappa_i = 2π * 1e5
     delta0 = 1e4
     E_of_t = t -> 0.3 + 0.1im
     p = (delta0, kappa_e, kappa_i, delta_b, g_b, Mbin, E_of_t)
     u = M.build_u0_1st_order(Mbin, Nj, Float64, :weak)
     u[1] = 0.02 + 0.01im
-    du_mono = zeros(ComplexF64, M.state_length_1st_order(Mbin))
-    du_pkg = zeros(ComplexF64, M.state_length_1st_order(Mbin))
-    M.rhs1!(du_mono, u, p, 1.7e-6)
-    M.rhs_1st_order!(du_pkg, u, p, 1.7e-6)
-    @test du_mono ≈ du_pkg rtol=1e-12 atol=1e-14
-    # κᵢ present: turning it off must change ȧ
+    du = zeros(ComplexF64, M.state_length_1st_order(Mbin))
+    M.rhs1!(du, u, p, 1.7e-6)
+    a = u[1]
+    s = sum(g_b .* conj.(u[2:4]))
+    @test du[1] ≈ sqrt(kappa_e) * E_of_t(1.7e-6) - 1im * delta0 * a - 1im * s - 0.5 * (kappa_e + kappa_i) * a
     p0 = (delta0, kappa_e, 0.0, delta_b, g_b, Mbin, E_of_t)
     du0 = zeros(ComplexF64, length(u))
     M.rhs1!(du0, u, p0, 1.7e-6)
-    @test du_mono[1] != du0[1]
+    @test du[1] != du0[1]
+end
+
+@testset "sharded RHS nshards=1 vs 2 parity" begin
+    Mbin = 4
+    Nj = [3.0, 5.0, 2.0, 8.0]
+    delta_b = [0.0, 1e5, -2e5, 3e4]
+    g_b = [2π * 80, 2π * 100, 2π * 90, 2π * 110]
+    kappa_e = 2π * 1e6
+    kappa_i = 2π * 2e5
+    E0 = t -> 0.1 + 0.05im
+    u = M.build_u0_2nd_order(Mbin, Nj, Float64, :equator)
+    u[1] = 0.01 + 0.002im
+    s1, L1, c1, o1 = M.dense_to_shards(u, Mbin, 1)
+    s2, L2, c2, o2 = M.dense_to_shards(u, Mbin, 2)
+    ds1 = zero(s1); dL1 = [zero(L) for L in L1]
+    ds2 = zero(s2); dL2 = [zero(L) for L in L2]
+    M.rhs2_sharded!(ds1, dL1, s1, L1, c1, o1, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, E0(0.0))
+    M.rhs2_sharded!(ds2, dL2, s2, L2, c2, o2, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, E0(0.0))
+    @test ds1 ≈ ds2 rtol=1e-12 atol=1e-14
+    du1 = zeros(ComplexF64, M.state_length_2nd_order(Mbin))
+    du2 = zeros(ComplexF64, length(du1))
+    M.shards_to_dense!(du1, ds1, dL1, c1, o1, Mbin)
+    M.shards_to_dense!(du2, ds2, dL2, c2, o2, Mbin)
+    @test du1 ≈ du2 rtol=1e-12 atol=1e-14
 end
 
 @testset "vacuum+ground 2nd-order fixed point" begin
