@@ -5,6 +5,10 @@ using CUDA
 using Distributions
 using FastGaussQuadrature
 
+if !@isdefined(_gauss_legendre_pts_golub_welsch)
+    include(joinpath(@__DIR__, "oracles", "golub_welsch.jl"))
+end
+
 if !@isdefined(state_length_2nd_order)
     include(joinpath(@__DIR__, "..", "src", "state_layout_2nd_order.jl"))
 end

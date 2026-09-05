@@ -4,23 +4,32 @@ Julia / multi-GPU simulation of a driven lossy cavity coupled to an
 inhomogeneous spin-½ ensemble (Tavis–Cummings / Dicke-type), closed at
 first- and second-order cumulants.
 
-This `chimera` branch matches the scientific scope of `nude-quad` and
-integrates research-grade packages (OrdinaryDiffEq, CUDA.jl, NCCL.jl,
-FastGaussQuadrature.jl, QuadGK.jl). See [docs/CHIMERA.md](docs/CHIMERA.md)
-for citations, rejected alternatives, physics fixes, and the multi-GPU
-design.
+**This `chimera` tree is a package-first rebuild**, not a polished
+nude-quad monolith. Production code lives in `src/chimera/`. Established
+packages own each layer:
 
-A CUDA-compatible GPU is required for the production solvers. Physics
-correctness tests in `test/physics_correctness.jl` run on CPU.
+| Layer | Owner |
+| --- | --- |
+| Quadrature / inhomogeneity | FastGaussQuadrature.jl + QuadGK.jl |
+| Cumulant EOMs | QuantumCumulants.jl + SecondQuantizedAlgebra |
+| Time integration | DifferentialEquations / OrdinaryDiffEq (SciML) |
+| Multi-GPU | CUDA.jl + NCCL.jl (Allreduce is the design center) |
+| Small-N oracle | QuantumToolbox.jl |
+| Trajectories | JLD2 |
+
+See [docs/CHIMERA.md](docs/CHIMERA.md) for the architecture diagram,
+deleted NIH modules, and the physics contract.
+
+There is **no Volkov–Zon** solver.
 
 ## Features
 
 * 1st-order means \(\langle a\rangle\), \(\langle S^+_j\rangle\), \(\langle S^z_j\rangle\)
 * 2nd-order cumulants, including same-bin and cross-bin correlators
-* Frequency and coupling inhomogeneity: Lorentzian / Gaussian / power-law \(g\), histogram or quadrature (tan–GL, GL+pdf, log-GL)
-* Pulses, saved trajectories (`.jld2`), QRT noise and correlation postprocessing
-* DiffEq GPU path and sharded multi-GPU path (NCCL Allreduce for O(M) row-sums)
-* PINN first-order datagen catalog (`src/datagen/`; see [src/datagen/README.md](src/datagen/README.md))
+* Frequency and coupling inhomogeneity: Lorentzian / Gaussian / power-law \(g\), histogram or quadrature (tan–GL, GL+pdf, log-GL via FastGaussQuadrature)
+* Pulses, saved trajectories (`.jld2`), QRT noise from the factorized 1st-order Jacobian
+* SciML single-device path; sharded multi-GPU path (NCCL Allreduce for O(M) row-sums)
+* PINN first-order datagen catalog (`src/datagen/`)
 
 ## Conventions
 
@@ -28,9 +37,9 @@ correctness tests in `test/physics_correctness.jl` run on CPU.
 * Cavity damping \(-(\kappa_e+\kappa_i)/2\); drive \(+\sqrt{\kappa_e} E(t)\)
 * \(a_\mathrm{out} = E - \sqrt{\kappa_e}\langle a\rangle\)
 * Lorentzian \(N = C_\mathrm{ens}\,\kappa\,\mathrm{FWHM}/(4\langle g^2\rangle)\); Gaussian peak-matched with \(\sqrt{\pi\ln 2}\)
-* `renormalize` defaults to `false` on frequency bins (truncated mass kept). Truncated Lorentzian runs print \(\sum p_\delta\) and \(C_\mathrm{eff}\) vs claimed \(C_\mathrm{ens}\).
-* QRT noise uses a **factorized 1st-order Jacobian** (`QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian`), not a linearization of the full 2nd-order RHS.
-* Production multi-GPU is the package `MGPU*` path. `src/sim_2nd_multi_gpu_opt.jl` is a standalone script (drops \(\kappa_i\); inverted IC) and is not the reference API.
+* `renormalize` defaults to `false` on frequency bins
+* `QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian` (same EOMs as QuantumCumulants order-1, not the 2nd-order Jacobian)
+* Production multi-GPU is `src/chimera/mgpu`. `src/legacy/sim_2nd_multi_gpu_opt.jl` is quarantined
 
 ## Installation
 
@@ -62,19 +71,16 @@ run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG)
 
 Times are in seconds; angular frequencies are in rad/s unless stated.
 
-Order 1 and order 2 default to `ensemble_method = :auto` (quadrature when
-the configured distributions have a rule; otherwise histogram).
+Order 1 and order 2 default to `ensemble_method = :auto`.
 
 ## Tests
 
 ```bash
 julia --project=. test/physics_correctness.jl
+julia --project=. test/package_first.jl
+julia --project=. test/quantum_cumulants.jl
 julia --project=. -e 'using Pkg; Pkg.test()'
-julia --project=. scripts/bench_rowsum_exchange.jl
 ```
-
-Physics tests check vacuum+ground as a 2nd-order fixed point, product-state
-same-bin moments, quadrature mass, and \(C_\mathrm{ens}\) consistency.
 
 ## License
 

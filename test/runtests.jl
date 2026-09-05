@@ -1274,3 +1274,6 @@ end
 
 include(joinpath(@__DIR__, "jld2_pulse_pipeline.jl"))
 include(joinpath(@__DIR__, "physics_correctness.jl"))
+include(joinpath(@__DIR__, "package_first.jl"))
+include(joinpath(@__DIR__, "quantum_cumulants.jl"))
+include(joinpath(@__DIR__, "oracle_quantumtoolbox.jl"))
