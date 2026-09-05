@@ -4,9 +4,11 @@ using CUDA
 using DiffEqCallbacks
 using DifferentialEquations
 using Distributions
+using FastGaussQuadrature
 using ForwardDiff
 using JLD2
 using LinearAlgebra
+using NCCL
 using Plots
 using Printf
 using QuadGK
@@ -64,6 +66,8 @@ include("MGPUsolver.jl")
 export run_simulation
 export run_sim_1st_order
 export run_sim_2nd_order
+export product_SmSp_same, product_SzSz_same, product_SpSp_same, product_SzSp_same
+export product_state_samebin, build_u0_2nd_order
 
 export mgpu_run_simulation
 export mgpu_run_sim_2nd_order

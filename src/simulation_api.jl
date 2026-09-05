@@ -1,6 +1,5 @@
 function _with_default_ensemble_method(SIM_SETTING, order)
     hasproperty(SIM_SETTING, :ensemble_method) && return SIM_SETTING
-    order in (:first_order, :order1, :first, 1) || return SIM_SETTING
     return merge(SIM_SETTING, (ensemble_method = :auto,))
 end
 

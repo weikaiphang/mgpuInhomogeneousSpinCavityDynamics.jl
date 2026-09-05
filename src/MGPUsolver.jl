@@ -54,11 +54,41 @@ function assemble_problem(M::Integer,
         rethrow()
     end
 
+    comms, exchange = _setup_rowsum_exchange(devs, ns, verbose)
+
     return MGPUProblem{T,typeof(E_of_t)}(
         Int(M), part, shards, exec, nreg,
         T(delta0), T(kappa_e), T(kappa_e + kappa_i), T(sqrt(kappa_e)),
         E_of_t, T(atol), T(rtol), Ref(0), Ref(0), hostbuf,
+        comms, exchange,
     )
+end
+
+function _setup_rowsum_exchange(devs, ns::Int, verbose::Bool)
+    ns <= 1 && return nothing, :none
+
+    if length(unique(devs)) == ns
+        try
+            comms = NCCL.Communicators(devs)
+            verbose && println("Row-sum exchange: NCCL Allreduce (device-side, no host staging).")
+            return comms, :nccl
+        catch err
+            verbose && @warn "NCCL communicator setup failed; trying P2P." err
+        end
+    end
+
+    if try
+            pfrac = enable_peer_access!(devs)
+            pfrac >= 1
+        catch
+            false
+        end
+        verbose && println("Row-sum exchange: CUDA peer copies (no host staging).")
+        return nothing, :p2p
+    end
+
+    verbose && @warn "Row-sum exchange falling back to host staging."
+    return nothing, :host
 end
 
 
@@ -139,18 +169,23 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
                             (k, t, ireg) -> record!(store, prob, ireg, k, t),
                             opts)
 
+        nsave = store.saved[]
         verbose && begin
-            println("Callback saved $(store.saved[]) / $Nt requested time points")
-            store.saved[] != Nt && @warn "Did not save all requested time points" saved=store.saved[] expected=Nt
+            println("Callback saved $nsave / $Nt requested time points")
             println("Time taken: $(stats.elapsed) seconds")
             println("  accepted steps : $(stats.naccept)")
             println("  rejected steps : $(stats.nreject)")
             println("  RHS evaluations: $(stats.nrhs)")
             println("  dt range       : $(stats.dtmin_used) … $(stats.dtmax_used)")
         end
+        nsave > 0 || error("Order-2 MGPU callback saved 0 of $Nt requested time points.")
+        if nsave != Nt
+            @warn "Order-2 MGPU callback saved $nsave / $Nt points; truncating uninitialized tail before write." saved=nsave expected=Nt
+        end
 
-        t_saved = d.t_save
+        t_saved = d.t_save[1:nsave]
         E_of_t_arr = [E_of_t(t) for t in t_saved]
+        spintrim(A) = isempty(A) ? A : A[:, 1:nsave]
 
         (
             SIM_SETTING = SIM_SETTING,
@@ -158,14 +193,14 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
             PULSE_CONFIG = PULSE_CONFIG,
 
             t_saved = t_saved,
-            a_sol = store.a,
-            n_sol = store.n,
-            adad_sol = store.adad,
-            Sp_sol = store.Sp,
-            Sz_sol = store.Sz,
-            adSp_sol = store.adSp,
-            adSm_sol = store.adSm,
-            adSz_sol = store.adSz,
+            a_sol = store.a[1:nsave],
+            n_sol = store.n[1:nsave],
+            adad_sol = store.adad[1:nsave],
+            Sp_sol = spintrim(store.Sp),
+            Sz_sol = spintrim(store.Sz),
+            adSp_sol = spintrim(store.adSp),
+            adSm_sol = spintrim(store.adSm),
+            adSz_sol = spintrim(store.adSz),
             E_of_t_arr = E_of_t_arr,
 
             delta_b_1d = d.delta_b_1d,
@@ -176,6 +211,9 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
             solver_stats = stats,
             nshards = length(prob.shards),
             partition = prob.part,
+            n_saved = nsave,
+            n_requested = Nt,
+            rowsum_exchange = prob.exchange,
         )
     finally
         if clean_gpu
@@ -196,6 +234,7 @@ end
 
 function mgpu_run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...)
     order = get_simulation_order(SIM_SETTING)
+    SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, order)
     if order in (:first_order, :order1, :first, 1)
         println("Start running 1st-order cumulant spin-cavity simulation...")
 

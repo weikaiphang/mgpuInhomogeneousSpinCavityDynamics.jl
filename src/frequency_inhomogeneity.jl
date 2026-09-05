@@ -98,6 +98,10 @@ end
 
 
 
+# Default renormalize=false: keep the truncated histogram/quadrature mass.
+# C_ens → N still uses the analytic FWHM formula (not the truncated mass),
+# so N_total = N * sum(p) when renormalize is left off. Set renormalize=true
+# to force sum(p)=1 and N_total=N.
 function renormalize_frequency_probs_enabled(freq_inhomogeneity)
     if hasproperty(freq_inhomogeneity, :renormalize)
         return freq_inhomogeneity.renormalize

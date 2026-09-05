@@ -110,11 +110,45 @@ function _pow_integral(lo::Float64, hi::Float64, q::Float64)
     return (hi^(q + 1) - lo^(q + 1)) / (q + 1)
 end
 
+function _erf_abs(x)
+    t = 1 / (1 + 0.3275911 * abs(x))
+    y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t -
+              0.284496736) * t + 0.254829592) * t * exp(-x * x)
+    return copysign(y, x)
+end
+
+function _normcdf(x)
+    return 0.5 * (1 + _erf_abs(x / sqrt(2)))
+end
+
+function _normpdf(x)
+    return exp(-x * x / 2) / sqrt(2π)
+end
+
+function _truncated_normal_second_moment(μ, σ, lo, hi)
+    σ <= 0 && return μ^2
+    α = (lo - μ) / σ
+    β = (hi - μ) / σ
+    if α < -12 && β > 12
+        return μ^2 + σ^2
+    end
+    Z = _normcdf(β) - _normcdf(α)
+    Z <= 0 && return μ^2 + σ^2
+    λ = (_normpdf(α) - _normpdf(β)) / Z
+    ω = (α * _normpdf(α) - β * _normpdf(β)) / Z
+    mean = μ + σ * λ
+    var = σ^2 * (1 + ω - λ^2)
+    var < 0 && (var = 0.0)
+    return var + mean^2
+end
+
 function g2_avg(sys::System)
     if sys.g_kind === :constant
         return abs2(sys.g_value)
     elseif sys.g_kind === :gaussian
-        return sys.g_mean^2 + sys.g_std^2
+        lo = max(0.0, sys.g_mean - sys.g_span * sys.g_std)
+        hi = sys.g_mean + sys.g_span * sys.g_std
+        return _truncated_normal_second_moment(sys.g_mean, sys.g_std, lo, hi)
     elseif sys.g_kind === :lorentzian
         z = sys.g_span
         return sys.g_mean^2 + sys.g_hwhm^2 * (z - atan(z)) / atan(z)

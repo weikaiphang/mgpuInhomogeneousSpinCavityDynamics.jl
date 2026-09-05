@@ -1,7 +1,7 @@
 
 
 
-function _gauss_legendre_pts(n::Integer)
+function _gauss_legendre_pts_golub_welsch(n::Integer)
     n >= 1 || error("_gauss_legendre_pts: n must be >= 1")
     n == 1 && return ([0.0], [2.0])
     k = collect(1.0:(n - 1))
@@ -11,6 +11,15 @@ function _gauss_legendre_pts(n::Integer)
     w = 2.0 .* (E.vectors[1, :] .^ 2)
     p = sortperm(x)
     return x[p], w[p]
+end
+
+function _gauss_legendre_pts(n::Integer)
+    n >= 1 || error("_gauss_legendre_pts: n must be >= 1")
+    if isdefined(@__MODULE__, :gausslegendre)
+        x, w = gausslegendre(Int(n))
+        return collect(Float64.(x)), collect(Float64.(w))
+    end
+    return _gauss_legendre_pts_golub_welsch(n)
 end
 
 

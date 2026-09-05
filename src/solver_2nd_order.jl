@@ -96,18 +96,24 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
     elapsed_seconds = (time_ns() - t0) / 1e9
 
-    println("Callback saved $(kref[]) / $Nt requested time points")
-    if kref[] != Nt
-        @warn "Callback did not save all requested time points" saved=kref[] expected=Nt
+    nsave = kref[]
+    println("Callback saved $nsave / $Nt requested time points")
+    nsave > 0 || error("Order-2 callback saved 0 of $Nt requested time points.")
+    if nsave != Nt
+        @warn "Order-2 callback saved $nsave / $Nt points; truncating uninitialized tail before write." saved=nsave expected=Nt
+        a_save    = a_save[1:nsave]
+        adad_save = adad_save[1:nsave]
+        n_save    = n_save[1:nsave]
+        Sp_save   = Sp_save[:, 1:nsave]
+        Sz_save   = Sz_save[:, 1:nsave]
+        adSp_save = adSp_save[:, 1:nsave]
+        adSm_save = adSm_save[:, 1:nsave]
+        adSz_save = adSz_save[:, 1:nsave]
     end
 
     println("Time taken: $elapsed_seconds seconds")
 
-
-
-
-
-    t_saved = d.t_save
+    t_saved = d.t_save[1:nsave]
 
     E_of_t_arr = [E_of_t(t) for t in t_saved]
 
@@ -137,6 +143,8 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
         N_total = d.N_total,
         elapsed_seconds = elapsed_seconds,
+        n_saved = nsave,
+        n_requested = Nt,
     )
 
     filename = CONFIG.saved_file_name

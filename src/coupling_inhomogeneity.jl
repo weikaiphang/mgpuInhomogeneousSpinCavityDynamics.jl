@@ -1,6 +1,8 @@
 
 
 
+# Default renormalize=false except when a user file loader passes renormalize=true.
+# Same convention as frequency bins: truncated mass is kept unless requested.
 function coupling_renormalize_enabled(g_inhomogeneity)
     if hasproperty(g_inhomogeneity, :renormalize)
         return g_inhomogeneity.renormalize

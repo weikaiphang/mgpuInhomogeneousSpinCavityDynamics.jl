@@ -15,6 +15,8 @@ const F_SmSp_s = 8
 const F_SzSz_s = 9
 const NSMALLFIELD = 9
 
+# Large blocks are local columns only. B_SzSpT is an explicit transpose
+# copy of SzSp for coalesced reads; it is not an extra physical DOF.
 const B_SpSp  = 1
 const B_SzSp  = 2
 const B_SzSpT = 3
@@ -26,6 +28,9 @@ const NBLOCK  = 5
 @inline small_range(M::Integer, f::Integer) =
     (small_offset(M, f) + 1):(small_offset(M, f) + M)
 
+# shard_length = small_length + large_length
+# small_length = 3 + 9M  (full small state, replicated on every GPU)
+# large_length = 5 * M * mloc  (local columns of the four cross blocks + SzSpT)
 small_length(M::Integer) = NSCALAR + NSMALLFIELD * M
 large_length(M::Integer, mloc::Integer) = NBLOCK * M * mloc
 shard_length(M::Integer, mloc::Integer) = small_length(M) + large_length(M, mloc)
@@ -33,6 +38,7 @@ shard_length(M::Integer, mloc::Integer) = small_length(M) + large_length(M, mloc
 
 save_prefix_length(M::Integer) = NSCALAR + 5 * M
 
+# Logical global state still 3 + 9M + 4M²; do not count SzSpT.
 global_state_length(M::Integer) = NSCALAR + NSMALLFIELD * M + 4 * M * M
 
 

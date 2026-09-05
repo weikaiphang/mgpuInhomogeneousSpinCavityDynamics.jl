@@ -1,4 +1,7 @@
 
+# CPU reference packing: after the replicated small block (3+9M), four M×M
+# cross blocks only (SpSp, SzSp, SmSp, SzSz). No SzSpT — that copy exists
+# only in the sharded GPU layout for coalescing.
 function rhs_cpu!(du::AbstractVector{Complex{T}}, u::AbstractVector{Complex{T}},
                   delta0::T, kappa_e::T, kappa_i::T,
                   delta_b::AbstractVector{T}, g_b::AbstractVector{T},

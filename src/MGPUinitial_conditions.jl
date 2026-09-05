@@ -1,43 +1,24 @@
-
-
 function small_block_initial(M::Int, Nj::AbstractVector, kind::Symbol, ::Type{T}) where {T}
     u = zeros(Complex{T}, small_length(M))
+    kind === :custom && return u
 
-    if kind === :ground
-        Sz0 = -Nj ./ 2
-        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
-        u[small_range(M, F_SzSz_s)] .= Complex{T}.((Nj .^ 2) ./ 4)
-    elseif kind === :inverted
-        Sz0 = Nj ./ 2
-        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
-        u[small_range(M, F_SzSz_s)] .= Complex{T}.((Nj .^ 2) ./ 4)
-    elseif kind === :custom
+    Sp0, Sz0 = _spin_means_2nd_order(Nj, kind)
+    u[small_range(M, F_Sp)] .= Complex{T}.(Sp0)
+    u[small_range(M, F_Sz)] .= Complex{T}.(Sz0)
 
-    elseif kind === :equator || kind === :weak || kind === :weak_inverted
-        Sp0, Sz0 = _mgpu_spin_means(Nj, kind)
-        u[small_range(M, F_Sp)]     .= Complex{T}.(Sp0)
-        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
-        u[small_range(M, F_SpSp_s)] .= Complex{T}.(Sp0 .* Sp0)
-        u[small_range(M, F_SzSp_s)] .= Complex{T}.(Sz0 .* Sp0)
-        u[small_range(M, F_SmSp_s)] .= Complex{T}.(abs2.(Sp0))
-        u[small_range(M, F_SzSz_s)] .= Complex{T}.(Sz0 .* Sz0)
-    else
-        _unknown_initial_condition(kind)
+    @inbounds for j in 1:M
+        spsp, szsp, smsp, szsz = product_state_samebin(Nj[j], Sp0[j], Sz0[j])
+        u[small_offset(M, F_SpSp_s) + j] = Complex{T}(spsp)
+        u[small_offset(M, F_SzSp_s) + j] = Complex{T}(szsp)
+        u[small_offset(M, F_SmSp_s) + j] = Complex{T}(smsp)
+        u[small_offset(M, F_SzSz_s) + j] = Complex{T}(szsz)
     end
 
     return u
 end
 
 function _mgpu_spin_means(Nj, kind::Symbol)
-    if kind === :equator
-        return Nj ./ 2, zero.(Nj)
-    elseif kind === :weak
-        return _WEAK_SEED .* Nj ./ 2, -Nj ./ 2
-    elseif kind === :weak_inverted
-        return _WEAK_SEED .* Nj ./ 2, Nj ./ 2
-    else
-        _unknown_initial_condition(kind)
-    end
+    return _spin_means_2nd_order(Nj, kind)
 end
 
 
@@ -51,10 +32,6 @@ function set_initial_condition!(prob::MGPUProblem{T}, Nj::AbstractVector,
 
     each_shard(prob.shards, prob.exec) do s
         u = s.regs[1]
-
-
-
-
 
         CUDA.stream!(s.stream) do
             CUDA.fill!(u, zero(Complex{T}))

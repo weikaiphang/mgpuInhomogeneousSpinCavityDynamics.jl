@@ -300,6 +300,15 @@ function _noise_make_mode_window(
 end
 
 
+# Linearized quantum regression theorem (QRT).
+#
+# Seeds are connected 2nd-order moments from the saved trajectory
+# (n-|⟨a⟩|², ⟨a†S⁺⟩-⟨a†⟩⟨S⁺⟩, …). Their two-time drift is the Jacobian of
+# the 1st-order Tavis–Cummings mean-field equations evaluated on that
+# trajectory — the standard linearized QRT / quantum regression
+# approximation (Gardiner & Zoller; Plankensteiner et al., QuantumCumulants).
+# A Jacobian of the full 2nd-order cumulant RHS would be a different,
+# much larger postprocessor and is intentionally not used here.
 function _noise_qrt_rhs_gpu!(
     da,
     dadag,

@@ -10,6 +10,12 @@ idx2_adSp_start(M) = idx2_Sz_start(M) + M
 idx2_adSm_start(M) = idx2_adSp_start(M) + M
 idx2_adSz_start(M) = idx2_adSm_start(M) + M
 
+# Monolith 2nd-order state, length 3 + 9M + 4M²:
+#   [a, ad_ad, ad_a]
+#   then length-M: Sp, Sz, adSp, adSm, adSz, SpSp_same, SzSp_same, SmSp_same, SzSz_same
+#   then column-major M×M: SpSp_cross, SzSp_cross, SmSp_cross, SzSz_cross
+# Same-bin moments live in *_same, not on the matrix diagonal.
+# Cross diagonal is unused (diag_mask = .!I).
 state_length_2nd_order(M) =
     3 +
     2M +

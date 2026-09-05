@@ -1,5 +1,4 @@
 
-
 mutable struct Shard{T}
     id::Int
     dev::CuDevice
@@ -51,15 +50,9 @@ struct MGPUProblem{T,F}
 
     rowparity::Base.RefValue{Int}
     nrhs::Base.RefValue{Int}
-
-
-
-
-
-
-
-
     hostbuf::Vector{Complex{T}}
+    comms::Any
+    exchange::Symbol
 end
 
 nshards(prob::MGPUProblem) = length(prob.shards)
@@ -74,8 +67,6 @@ function launch_config(dev::CuDevice, M::Int, mloc::Int, n::Int)
     if M < nthreads
         nthreads = max(32, 32 * cld(M, 32))
     end
-
-
 
     want = 8 * nsm
     nchunk = clamp(cld(want, max(mloc, 1)), 1, max(1, cld(M, nthreads)))
@@ -167,6 +158,8 @@ function rhs!(prob::MGPUProblem{T}, iu::Int, idu::Int, t::Real) where {T}
             du, u, s.part, s.delta_b, s.g_b,
             M, s.mloc, s.joff, s.lo, s.chunk_len, s.nchunk)
 
+        @cuda threads=256 blocks=s.nblocks_vec stream=st fill_kernel!(
+            rb(s), zero(eltype(rb(s))), length(rb(s)))
         @cuda threads=256 blocks=cld(s.mloc, 256) stream=st rowsum_finalize_kernel!(
             rb(s), s.part, s.mloc, s.nchunk, s.joff)
     end
@@ -184,6 +177,48 @@ end
 
 
 function exchange_rowsums!(prob::MGPUProblem{T}, rb) where {T}
+    mode = prob.exchange
+    if mode === :nccl
+        exchange_rowsums_nccl!(prob, rb)
+    elseif mode === :p2p
+        exchange_rowsums_p2p!(prob, rb)
+    else
+        exchange_rowsums_host!(prob, rb)
+    end
+    return nothing
+end
+
+function exchange_rowsums_nccl!(prob::MGPUProblem{T}, rb) where {T}
+    shards = prob.shards
+    comms = prob.comms
+    NCCL.group() do
+        for (s, comm) in zip(shards, comms)
+            CUDA.device!(s.dev)
+            buf = reinterpret(real(eltype(rb(s))), rb(s))
+            NCCL.Allreduce!(buf, +, comm; stream = s.stream)
+        end
+    end
+    return nothing
+end
+
+function exchange_rowsums_p2p!(prob::MGPUProblem{T}, rb) where {T}
+    shards = prob.shards
+    for s in shards
+        CUDA.device!(s.dev)
+        CUDA.synchronize(s.stream)
+    end
+    for dst in shards
+        CUDA.device!(dst.dev)
+        for src in shards
+            src.id == dst.id && continue
+            off = 3 * src.joff
+            copyto!(rb(dst), off + 1, rb(src), off + 1, 3 * src.mloc)
+        end
+    end
+    return nothing
+end
+
+function exchange_rowsums_host!(prob::MGPUProblem{T}, rb) where {T}
     shards = prob.shards
     M = prob.M
     host = prob.hostbuf
@@ -297,6 +332,9 @@ function szspt_range(s::Shard)
 end
 
 function gather_norm(prob::MGPUProblem{T}) where {T}
+    if prob.exchange === :nccl && prob.comms !== nothing && length(prob.shards) > 1
+        return gather_norm_nccl(prob)
+    end
     total = zero(T)
     for s in prob.shards
         CUDA.device!(s.dev)
@@ -304,4 +342,17 @@ function gather_norm(prob::MGPUProblem{T}) where {T}
         total += Array(s.normout)[1]
     end
     return sqrt(total / global_state_length(prob.M))
+end
+
+function gather_norm_nccl(prob::MGPUProblem{T}) where {T}
+    NCCL.group() do
+        for (s, comm) in zip(prob.shards, prob.comms)
+            CUDA.device!(s.dev)
+            NCCL.Allreduce!(s.normout, +, comm; stream = s.stream)
+        end
+    end
+    s1 = prob.shards[1]
+    CUDA.device!(s1.dev)
+    CUDA.synchronize(s1.stream)
+    return sqrt(Array(s1.normout)[1] / global_state_length(prob.M))
 end
