@@ -347,6 +347,8 @@ end
     prep = M.prepare(settings; ensemble_method=:auto)
     @test prep.d.ensemble_method === :quadrature
     @test prep.d.kappa_t == prep.d.kappa_e + prep.d.kappa_i
+    @test prep.d.C_eff ≈ prep.d.C_ens * prep.d.p_mass
+    @test prep.d.C_eff < prep.d.C_ens   # example Lorentzian renormalize=false
 end
 
 function _tiny_pulse_problem(; Ttotal=4e-8)
