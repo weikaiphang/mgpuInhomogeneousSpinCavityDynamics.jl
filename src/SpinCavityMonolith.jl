@@ -137,6 +137,53 @@ function bspline_eval(t, c::AbstractVector, knots::AbstractVector, degree::Integ
     return s
 end
 
+# Warm-path drive eval (B3): Cox–de Boor into preallocated buffers, no zeros/views.
+mutable struct BSplineScratch{T}
+    a::Vector{T}
+    b::Vector{T}
+end
+BSplineScratch(::Type{T}, nbuf::Integer) where {T} =
+    BSplineScratch{T}(zeros(T, nbuf), zeros(T, nbuf))
+
+@inline _cget(c::AbstractVector, i, ::Int) = @inbounds c[i]
+@inline _cget(c::AbstractMatrix, i, col::Int) = @inbounds c[i, col]
+
+function bspline_dot!(sc::BSplineScratch{S}, t, coeffs, col::Int, knots, degree) where {S}
+    n0 = length(knots) - 1
+    n = length(knots) - degree - 1
+    a = sc.a; b = sc.b
+    z = zero(S)
+    @inbounds for i in 1:n0
+        a[i] = z
+    end
+    tv = _value(t)
+    @inbounds for i in 1:n0
+        lo, hi = knots[i], knots[i+1]
+        lov, hiv = _value(lo), _value(hi)
+        if lov <= tv < hiv || (tv == _value(knots[end]) && hiv == _value(knots[end]) && lov < hiv)
+            a[i] = one(S)
+        end
+    end
+    Bcur = a
+    for p in 1:degree
+        Bnew = isodd(p) ? b : a
+        nn = length(knots) - p - 1
+        @inbounds for i in 1:nn
+            τi, τip = knots[i], knots[i+p]
+            τi1, τip1 = knots[i+1], knots[i+p+1]
+            left = τip > τi ? (t - τi) / (τip - τi) * Bcur[i] : z
+            right = τip1 > τi1 ? (τip1 - t) / (τip1 - τi1) * Bcur[i+1] : z
+            Bnew[i] = left + right
+        end
+        Bcur = Bnew
+    end
+    s = z
+    @inbounds for i in 1:n
+        s += Bcur[i] * _cget(coeffs, i, col)
+    end
+    return s
+end
+
 function bspline_area(c::AbstractVector, knots::AbstractVector, degree::Integer=3)
     n = length(c)
     area = zero(promote_type(eltype(c), eltype(knots)))
@@ -262,6 +309,57 @@ function _subpulse_knots(pulse::CompositePulse, t_start, t_end)
     return kA, kf
 end
 
+# Callable drive. Primal scratch is allocated once; Dual scratch is lazy (B3).
+struct PulseDrive{T}
+    k::Int
+    deg::Int
+    tf::Float64
+    t_start::Vector{T}
+    t_end::Vector{T}
+    cA::Matrix{T}
+    kA::Vector{Vector{T}}
+    kfp::Vector{Vector{T}}
+    df::Vector{Vector{T}}
+    poff::Vector{T}
+    scratch::BSplineScratch{T}
+    alt::Ref{Any}
+end
+
+function _bspline_nbuf(pulse::CompositePulse)
+    return max(pulse.n_coeff_A + pulse.degree, pulse.n_coeff_f + pulse.degree + 2)
+end
+
+@inline function _scratch_for(E::PulseDrive{T}, ::Type{S}) where {T,S}
+    S === T && return E.scratch
+    sc = E.alt[]
+    if sc isa BSplineScratch{S}
+        return sc::BSplineScratch{S}
+    end
+    news = BSplineScratch(S, length(E.scratch.a))
+    E.alt[] = news
+    return news
+end
+
+@inline function _eval_drive(E::PulseDrive{T}, t, sc::BSplineScratch{S}) where {T,S}
+    tv = _value(t)
+    @inbounds for i in 1:E.k
+        if tv >= _value(E.t_start[i]) && tv <= _value(E.t_end[i])
+            A = bspline_dot!(sc, t, E.cA, i, E.kA[i], E.deg) *
+                _taper_window(t, E.t_start[i], E.t_end[i], E.tf)
+            ϕ = bspline_dot!(sc, t, E.df[i], 0, E.kfp[i], E.deg + 1) + E.poff[i]
+            return A * exp(im * ϕ)
+        end
+    end
+    return zero(Complex{S})
+end
+
+# Concrete primal — Ass benches this (0 alloc). Dual / mixed types use scratch_for.
+@inline (E::PulseDrive{Float64})(t::Float64) = _eval_drive(E, t, E.scratch)
+function (E::PulseDrive{T})(t) where {T}
+    S = promote_type(typeof(t), T)
+    return _eval_drive(E, t, _scratch_for(E, S))
+end
+
 function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
     t_start, t_end, phi0, cA, cf = decode(pulse, u)
     k = pulse.k
@@ -279,17 +377,8 @@ function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
         poff[i] = running + phi0[i]
         running = poff[i] + d[end]
     end
-    tf = pulse.taper_frac
-    return function E_of_t(t)
-        @inbounds for i in 1:k
-            if t >= t_start[i] && t <= t_end[i]
-                A = bspline_eval(t, view(cA, :, i), kA[i], deg) * _taper_window(t, t_start[i], t_end[i], tf)
-                ϕ = bspline_eval(t, df[i], kfp[i], deg + 1) + poff[i]
-                return A * cis(ϕ)
-            end
-        end
-        return zero(Complex{T})
-    end
+    return PulseDrive{T}(k, deg, pulse.taper_frac, t_start, t_end, cA, kA, kfp, df, poff,
+                         BSplineScratch(T, _bspline_nbuf(pulse)), Ref{Any}(nothing))
 end
 
 pulse_duration(pulse::CompositePulse, u::AbstractVector) = decode(pulse, u)[2][end]
@@ -358,7 +447,10 @@ end
 
 make_diag_mask_host(M) = ComplexF64.(.!Matrix(I, M, M))
 
-# Multi-GPU layout: small = 3+9M; large = 5×M×mloc (SpSp, SzSp, SzSpT, SmSp, SzSz)
+# Multi-GPU layout: small = 3+9M.
+# Large (B5): pair-interleaved SoA — 5 correlators for (j, k=lo+jl) are adjacent
+# so the RHS column walk hits one cache line instead of stride bs=M*mloc.
+# f=1 SpSp, 2 SzSp, 3 SzSpT, 4 SmSp, 5 SzSz. Length still 5×M×mloc.
 const MG_NSCALAR = 3
 const MG_NSMALLFIELD = 9
 const MG_B_SpSp, MG_B_SzSp, MG_B_SzSpT, MG_B_SmSp, MG_B_SzSz = 1, 2, 3, 4, 5
@@ -366,6 +458,7 @@ const MG_NBLOCK = 5
 mg_small_length(M) = MG_NSCALAR + MG_NSMALLFIELD * M
 mg_large_length(M, mloc) = MG_NBLOCK * M * mloc
 @inline mg_off(M, f) = MG_NSCALAR + (f - 1) * M
+@inline mg_pair(M, jl, j, f) = 5 * ((jl - 1) * M + (j - 1)) + f
 
 function mg_column_partition(M::Integer, nshards::Integer)
     nshards = clamp(Int(nshards), 1, M)
@@ -570,8 +663,15 @@ function _hist_frequency_nodes(freq_cfg, M_delta::Integer)
         span = Float64(_get(freq_cfg, :span_sigma, 3.0))
         edges = range(-span * σ, span * σ; length=M_delta + 1)
         Fcdf = x -> 0.5 * (1 + _as_erf(x / (σ * sqrt(2))))
+    elseif kind === :uniform
+        span = Float64(_get(freq_cfg, :span_gamma, _get(freq_cfg, :span, 1.0)))
+        half = span * FWHM / 2
+        half > 0 || error("uniform freq span must be > 0")
+        edges = range(-half, half; length=M_delta + 1)
+        width = 2 * half
+        Fcdf = x -> (x + half) / width
     else
-        error("unknown freq kind $kind")
+        error("unknown freq kind $kind (histogram supports :lorentzian, :gaussian, :uniform)")
     end
     means = zeros(M_delta)
     probs = zeros(M_delta)
@@ -645,8 +745,10 @@ function total_spin_number_from_cooperativity(C_ens, kappa_t, g2_avg, freq_cfg)
         return C_ens * kappa_t * FWHM / (4 * g2_avg)
     elseif kind === :gaussian
         return C_ens * kappa_t * FWHM / (4 * sqrt(π * log(2)) * g2_avg)
+    elseif kind === :uniform
+        return C_ens * kappa_t * FWHM / (4 * g2_avg)
     else
-        error("unknown freq kind $kind")
+        error("unknown freq kind $kind (cooperativity needs :lorentzian, :gaussian, or :uniform)")
     end
 end
 
@@ -684,6 +786,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol=:config)
     if use_quad
         delta_1d, p_delta = _quad_frequency_nodes(freq, M_delta)
     else
+        fk = _sym(freq.kind)
+        (fk === :lorentzian || fk === :gaussian || fk === :uniform) ||
+            error("$(plan.reason); histogram also has no rule for freq kind :$fk (supported: lorentzian, gaussian, uniform)")
         delta_1d, p_delta = _hist_frequency_nodes(freq, M_delta)
     end
     _maybe_renorm!(p_delta, Bool(_get(freq, :renormalize, false)))
@@ -692,7 +797,7 @@ function prepare_derived(CONFIG; ensemble_method::Symbol=:config)
         g_1d, p_g, g_mean, g_std, g2_avg = _quad_coupling_bins(gcfg, M_g)
     else
         gk = _sym(gcfg.kind)
-        gk === :constant || error("histogram path in monolith supports :constant g or quad-friendly kinds")
+        gk === :constant || error("histogram supports only :constant g; got kind=$(gk). Use :quadrature or :auto for quad-friendly g")
         g_1d, p_g, g_mean, g_std, g2_avg = _quad_coupling_bins(gcfg, 1)
     end
     M_g = length(g_1d)
@@ -967,14 +1072,12 @@ end
 @inline function _rowsum_column!(sumP, sumM, sumZ, large, g, M, mloc, lo, jl)
     k = lo + jl
     gk = g[k]
-    col = (jl - 1) * M
-    bs = M * mloc
     @inbounds for j in 1:M
         j == k && continue
-        i = col + j
-        sumP[j] += large[i] * gk
-        sumZ[j] += large[i + bs] * gk
-        sumM[j] += large[i + 3bs] * gk
+        i0 = mg_pair(M, jl, j, 1)
+        sumP[j] += large[i0] * gk
+        sumZ[j] += large[i0 + 1] * gk
+        sumM[j] += large[i0 + 3] * gk
     end
     return nothing
 end
@@ -1129,7 +1232,6 @@ function rhs2_small!(dsmall, small, sumP, sumM, sumZ, delta0, kappa_e, kappa_i,
 end
 
 function _large_column!(dlarge, large, small, delta_b, g_b, M, mloc, lo, jl)
-    bs = M * mloc
     oSp = mg_off(M, 1); oSz = mg_off(M, 2)
     oadSp = mg_off(M, 3); oadSm = mg_off(M, 4); oadSz = mg_off(M, 5)
     a = small[1]
@@ -1140,35 +1242,34 @@ function _large_column!(dlarge, large, small, delta_b, g_b, M, mloc, lo, jl)
         Spk = small[oSp + k]; Szk = small[oSz + k]
         adSpk = small[oadSp + k]; adSmk = small[oadSm + k]; adSzk = small[oadSz + k]
         cSpk = conj(Spk); cadSmk = conj(adSmk); cadSzk = conj(adSzk)
-        col = (jl - 1) * M
         for j in 1:M
-            i = col + j
+            i0 = mg_pair(M, jl, j, 1)
             if j == k
-                dlarge[i] = 0; dlarge[i+bs] = 0; dlarge[i+2bs] = 0
-                dlarge[i+3bs] = 0; dlarge[i+4bs] = 0
+                dlarge[i0] = 0; dlarge[i0+1] = 0; dlarge[i0+2] = 0
+                dlarge[i0+3] = 0; dlarge[i0+4] = 0
                 continue
             end
             gj = g_b[j]; dj = delta_b[j]
             Spj = small[oSp + j]; Szj = small[oSz + j]
             adSpj = small[oadSp + j]; adSmj = small[oadSm + j]; adSzj = small[oadSz + j]
             cSpj = conj(Spj); cadSmj = conj(adSmj); cadSzj = conj(adSzj)
-            P = large[i]; Z = large[i+bs]; ZT = large[i+2bs]
-            Mm = large[i+3bs]; ZZ = large[i+4bs]
+            P = large[i0]; Z = large[i0+1]; ZT = large[i0+2]
+            Mm = large[i0+3]; ZZ = large[i0+4]
             W  = Spk * adSzj + ca * Z  + adSpk * Szj - 2 * Spk * ca * Szj
             Ws = Spj * adSzk + ca * ZT + adSpj * Szk - 2 * Spj * ca * Szk
-            dlarge[i] = _muli((dj + dk) * P - 2 * gj * W - 2 * gk * Ws)
+            dlarge[i0] = _muli((dj + dk) * P - 2 * gj * W - 2 * gk * Ws)
             U1  = Spk * cadSmj + Spj * cadSmk + a * P - 2 * Spk * Spj * a
             U2  = Spk * adSmj + ca * Mm + adSpk * cSpj - 2 * Spk * ca * cSpj
             U2s = Spj * adSmk + ca * conj(Mm) + adSpj * cSpk - 2 * Spj * ca * cSpk
             U3  = ZZ * ca + Szk * adSzj + Szj * adSzk - 2 * ca * Szk * Szj
-            dlarge[i+bs]  = _muli(dk * Z  - gj * U1 + gj * U2  - 2 * gk * U3)
-            dlarge[i+2bs] = _muli(dj * ZT - gk * U1 + gk * U2s - 2 * gj * U3)
+            dlarge[i0+1] = _muli(dk * Z  - gj * U1 + gj * U2  - 2 * gk * U3)
+            dlarge[i0+2] = _muli(dj * ZT - gk * U1 + gk * U2s - 2 * gj * U3)
             Y1  = cadSzj * Spk + cadSmk * Szj + a * Z  - 2 * Spk * a * Szj
             Y1s = cadSzk * Spj + cadSmj * Szk + a * ZT - 2 * Spj * a * Szk
             Y2  = ca * conj(ZT) + Szk * adSmj + cSpj * adSzk - 2 * ca * Szk * cSpj
             Y2s = ca * conj(Z)  + Szj * adSmk + cSpk * adSzj - 2 * ca * Szj * cSpk
-            dlarge[i+3bs] = _muli((dk - dj) * Mm + 2 * gj * Y1 - 2 * gk * Y2)
-            dlarge[i+4bs] = _muli(gj * (Y2 - Y1s) + gk * (Y2s - Y1))
+            dlarge[i0+3] = _muli((dk - dj) * Mm + 2 * gj * Y1 - 2 * gk * Y2)
+            dlarge[i0+4] = _muli(gj * (Y2 - Y1s) + gk * (Y2s - Y1))
         end
     end
     return nothing
@@ -1187,9 +1288,8 @@ function rhs2_large!(dlarge, large, small, delta_b, g_b, M, mloc, lo)
     return nothing
 end
 
-# Large layout is 5 × M × mloc, field-major, column-contiguous (B5).
-# Same block-major packing the GPU kernels use. CPU default is one shard
-# (mloc = M), not nshards = gpu_count().
+# Large layout is pair-interleaved 5-tuples (B5). CPU default is one shard
+# (mloc = M), not nshards = gpu_count(). Same packing as the GPU kernels.
 """Production 2nd-order RHS: one small eval + sharded large. No hot-path allocs."""
 function rhs2_sharded!(dsmall, dlarges, small, larges, counts, offsets,
                        delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
@@ -1239,16 +1339,15 @@ function dense_to_shards(u, M, nshards::Integer=1)
     @inbounds for p in eachindex(counts)
         mloc = counts[p]; lo = offsets[p]
         L = zeros(eltype(u), mg_large_length(M, mloc))
-        bs = M * mloc
         for jl in 1:mloc
             k = lo + jl
             for j in 1:M
-                i = (jl - 1) * M + j
-                L[i] = u[base + (k - 1) * M + j]                          # SpSp
-                L[i + bs] = u[base + M * M + (k - 1) * M + j]            # SzSp
-                L[i + 2bs] = u[base + M * M + (j - 1) * M + k]           # SzSpT = SzSp[k,j]
-                L[i + 3bs] = u[base + 2M * M + (k - 1) * M + j]          # SmSp
-                L[i + 4bs] = u[base + 3M * M + (k - 1) * M + j]          # SzSz
+                i0 = mg_pair(M, jl, j, 1)
+                L[i0]     = u[base + (k - 1) * M + j]                    # SpSp
+                L[i0 + 1] = u[base + M * M + (k - 1) * M + j]            # SzSp
+                L[i0 + 2] = u[base + M * M + (j - 1) * M + k]           # SzSpT = SzSp[k,j]
+                L[i0 + 3] = u[base + 2M * M + (k - 1) * M + j]          # SmSp
+                L[i0 + 4] = u[base + 3M * M + (k - 1) * M + j]          # SzSz
             end
         end
         larges[p] = L
@@ -1264,15 +1363,15 @@ function shards_to_dense!(du, dsmall, dlarges, counts, offsets, M)
     end
     base = 3 + 9M
     @inbounds for p in eachindex(counts)
-        mloc = counts[p]; lo = offsets[p]; L = dlarges[p]; bs = M * mloc
+        mloc = counts[p]; lo = offsets[p]; L = dlarges[p]
         for jl in 1:mloc
             k = lo + jl
             for j in 1:M
-                i = (jl - 1) * M + j
-                du[base + (k - 1) * M + j] = L[i]
-                du[base + M * M + (k - 1) * M + j] = L[i + bs]
-                du[base + 2M * M + (k - 1) * M + j] = L[i + 3bs]
-                du[base + 3M * M + (k - 1) * M + j] = L[i + 4bs]
+                i0 = mg_pair(M, jl, j, 1)
+                du[base + (k - 1) * M + j] = L[i0]
+                du[base + M * M + (k - 1) * M + j] = L[i0 + 1]
+                du[base + 2M * M + (k - 1) * M + j] = L[i0 + 3]
+                du[base + 3M * M + (k - 1) * M + j] = L[i0 + 4]
             end
         end
     end
@@ -1311,12 +1410,12 @@ function build_u0_2nd_mgpu(M, Nj, kind::Symbol, nshards::Integer=1)
             k = lo + jl
             for j in 1:M
                 j == k && continue
-                i = (jl - 1) * M + j
-                L[0 * M * mloc + i] = Sp0[j] * Sp0[k]
-                L[1 * M * mloc + i] = Sz0[j] * Sp0[k]
-                L[2 * M * mloc + i] = Sz0[k] * Sp0[j]
-                L[3 * M * mloc + i] = conj(Sp0[j]) * Sp0[k]
-                L[4 * M * mloc + i] = Sz0[j] * Sz0[k]
+                i0 = mg_pair(M, jl, j, 1)
+                L[i0]     = Sp0[j] * Sp0[k]
+                L[i0 + 1] = Sz0[j] * Sp0[k]
+                L[i0 + 2] = Sz0[k] * Sp0[j]
+                L[i0 + 3] = conj(Sp0[j]) * Sp0[k]
+                L[i0 + 4] = Sz0[j] * Sz0[k]
             end
         end
         larges[p] = L
@@ -1999,16 +2098,15 @@ end
 function _rowsum_kernel!(sumP, sumM, sumZ, large, g, M::Int, mloc::Int, lo::Int)
     j = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     j > M && return
-    bs = M * mloc
     accP = accM = accZ = zero(eltype(large))
     @inbounds for jl in 1:mloc
         k = lo + jl
         j == k && continue
-        i = (jl - 1) * M + j
+        i0 = mg_pair(M, jl, j, 1)
         gk = g[k]
-        accP += large[i] * gk
-        accZ += large[i + bs] * gk
-        accM += large[i + 3bs] * gk
+        accP += large[i0] * gk
+        accZ += large[i0 + 1] * gk
+        accM += large[i0 + 3] * gk
     end
     @inbounds begin
         sumP[j] = accP
@@ -2039,13 +2137,12 @@ function _large_kernel!(dlarge, large, small, delta_b, g_b, M::Int, mloc::Int, l
     jl = (blockIdx().y - 1) * blockDim().y + threadIdx().y
     (1 <= j <= M && 1 <= jl <= mloc) || return
     k = lo + jl
-    i = (jl - 1) * M + j
-    bs = M * mloc
+    i0 = mg_pair(M, jl, j, 1)
     if j == k
         z = zero(eltype(large))
         @inbounds begin
-            dlarge[i] = z; dlarge[i+bs] = z; dlarge[i+2bs] = z
-            dlarge[i+3bs] = z; dlarge[i+4bs] = z
+            dlarge[i0] = z; dlarge[i0+1] = z; dlarge[i0+2] = z
+            dlarge[i0+3] = z; dlarge[i0+4] = z
         end
         return
     end
@@ -2058,7 +2155,7 @@ function _large_kernel!(dlarge, large, small, delta_b, g_b, M::Int, mloc::Int, l
         adSpj = small[oadSp + j]; adSpk = small[oadSp + k]
         adSmj = small[oadSm + j]; adSmk = small[oadSm + k]
         adSzj = small[oadSz + j]; adSzk = small[oadSz + k]
-        P = large[i]; Z = large[i+bs]; ZT = large[i+2bs]; Mm = large[i+3bs]; ZZ = large[i+4bs]
+        P = large[i0]; Z = large[i0+1]; ZT = large[i0+2]; Mm = large[i0+3]; ZZ = large[i0+4]
     end
     cSpj = conj(Spj); cSpk = conj(Spk)
     cadSmj = conj(adSmj); cadSmk = conj(adSmk)
@@ -2074,11 +2171,11 @@ function _large_kernel!(dlarge, large, small, delta_b, g_b, M::Int, mloc::Int, l
     Y2  = ca * conj(ZT) + Szk * adSmj + cSpj * adSzk - 2 * ca * Szk * cSpj
     Y2s = ca * conj(Z)  + Szj * adSmk + cSpk * adSzj - 2 * ca * Szj * cSpk
     @inbounds begin
-        dlarge[i]     = _muli((dj + dk) * P - 2 * gj * W - 2 * gk * Ws)
-        dlarge[i+bs]  = _muli(dk * Z  - gj * U1 + gj * U2  - 2 * gk * U3)
-        dlarge[i+2bs] = _muli(dj * ZT - gk * U1 + gk * U2s - 2 * gj * U3)
-        dlarge[i+3bs] = _muli((dk - dj) * Mm + 2 * gj * Y1 - 2 * gk * Y2)
-        dlarge[i+4bs] = _muli(gj * (Y2 - Y1s) + gk * (Y2s - Y1))
+        dlarge[i0]     = _muli((dj + dk) * P - 2 * gj * W - 2 * gk * Ws)
+        dlarge[i0+1]   = _muli(dk * Z  - gj * U1 + gj * U2  - 2 * gk * U3)
+        dlarge[i0+2]   = _muli(dj * ZT - gk * U1 + gk * U2s - 2 * gj * U3)
+        dlarge[i0+3]   = _muli((dk - dj) * Mm + 2 * gj * Y1 - 2 * gk * Y2)
+        dlarge[i0+4]   = _muli(gj * (Y2 - Y1s) + gk * (Y2s - Y1))
     end
     return
 end

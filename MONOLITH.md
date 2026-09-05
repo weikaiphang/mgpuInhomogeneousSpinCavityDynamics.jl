@@ -83,8 +83,9 @@ cross j≠k = mean products
 Production path until Tuesday iron: **CPU multicore**, not fake GPUs.
 
 - `nshards` on CPU is a cache partition (`resolve_cpu_nshards`, default **1**
-  contiguous large buffer). It is **not** `gpu_count()`. Large remains
-  `5×M×mloc` block-major (same packing as the GPU kernels).
+  contiguous large buffer). It is **not** `gpu_count()`. Large is
+  pair-interleaved 5-tuples (`mg_pair`) so an RHS column is one cache line,
+  not stride `M*mloc`.
 - `@threads` only when the **loop trip count** is ≥ 64. A flop estimate
   (`nwork*M`) used to fork on M=8 and allocate under `JULIA_NUM_THREADS>1`.
 - Persistent workspaces: `RHS2Work` (owned by `Order2Pool` on the hot path;
@@ -97,7 +98,9 @@ Production path until Tuesday iron: **CPU multicore**, not fake GPUs.
   `integrator` or `method`.
 - `Project.toml` lists the stdlibs this module uses (`LinearAlgebra`,
   `Random`, `Printf`) so `Pkg.precompile()` does not false-green / fail CI.
-- Run with `julia -t auto` / `JULIA_NUM_THREADS`.
+- B-spline `E(t)` (`PulseDrive`) reuses Cox–de Boor scratch; warm primal
+  eval is 0 alloc. Dual-through-`u` uses a lazy Dual scratch.
+- Run with `julia -t auto` / `JULIA_NUM_THREADS`. Tests: `julia --project=. --startup-file=no test/spin_cavity_monolith.jl`.
 
 ## Multi-GPU — Tuesday iron gate
 
@@ -112,5 +115,5 @@ Wired (unproven here): on-device small RHS + row-sums, NCCL Allreduce
 julia --project=. scripts/run_monolith.jl -s examples/monolith_forward.jl
 julia --project=. scripts/run_monolith.jl -s examples/monolith_order2.jl
 julia --project=. scripts/run_monolith.jl -s examples/monolith_optimizer.jl --grad adjoint
-julia --startup-file=no test/spin_cavity_monolith.jl
+julia --project=. --startup-file=no test/spin_cavity_monolith.jl
 ```

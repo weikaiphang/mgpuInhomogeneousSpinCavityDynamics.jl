@@ -1,4 +1,4 @@
-#   julia --startup-file=no test/spin_cavity_monolith.jl
+#   julia --project=. --startup-file=no test/spin_cavity_monolith.jl
 #
 # Covers: vacuum⊗ground fixed point, 1st-order κₜ, sharded RHS parity,
 #         B-spline pack/unpack, product-state ICs, adjoint vs forward.
@@ -216,13 +216,13 @@ end
         for jl in 1:mloc
             k = lo + jl
             for j in 1:Mbin
-                i = (jl - 1) * Mbin + j
+                i0 = M.mg_pair(Mbin, jl, j, 1)
                 if j == k
-                    @test L[i] == 0 && L[Mbin * mloc + i] == 0
-                    @test L[3 * Mbin * mloc + i] == 0 && L[4 * Mbin * mloc + i] == 0
+                    @test L[i0] == 0 && L[i0 + 1] == 0
+                    @test L[i0 + 3] == 0 && L[i0 + 4] == 0
                 else
-                    @test real(L[4 * Mbin * mloc + i]) ≈ (Nj[j] * Nj[k]) / 4 atol=1e-12  # SzSz
-                    @test L[2 * Mbin * mloc + i] == 0  # SzSpT ground
+                    @test real(L[i0 + 4]) ≈ (Nj[j] * Nj[k]) / 4 atol=1e-12  # SzSz
+                    @test L[i0 + 2] == 0  # SzSpT ground
                 end
             end
         end
@@ -250,6 +250,43 @@ end
     @test M.resolve_ensemble_method(
         (freq_inhomogeneity=(kind=:uniform,), g_inhomogeneity=(kind=:constant,), ensemble_method=:auto),
         :auto).method === :histogram
+    # B8: :auto + uniform builds a histogram (does not die on "unknown freq kind")
+    duni = M.prepare_derived((
+        C_ens=0.6, M_delta=4, M_g=1, Ttotal=1e-5, Nt_save=3,
+        delta0=0.0, kappa_e=2π*1e6, kappa_i=0.0,
+        freq_inhomogeneity=(kind=:uniform, FWHM=2π*1e6, span_gamma=1.0, renormalize=false),
+        g_inhomogeneity=(kind=:constant, g_value=2π*100),
+        ensemble_method=:auto,
+    ); ensemble_method=:auto)
+    @test duni.ensemble_method === :histogram
+    @test duni.M == 4
+    # B7: forced hist + non-const g is an honest error
+    err7 = try
+        M.prepare_derived((
+            C_ens=0.6, M_delta=4, M_g=3, Ttotal=1e-5, Nt_save=3,
+            delta0=0.0, kappa_e=2π*1e6, kappa_i=0.0,
+            freq_inhomogeneity=(kind=:lorentzian, FWHM=2π*1e6, span_gamma=2.5, renormalize=false),
+            g_inhomogeneity=(kind=:gaussian, mean=2π*100, std=2π*10, span_sigma=3.0, renormalize=true),
+        ); ensemble_method=:histogram)
+        ""
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("only :constant g", err7)
+    @test occursin(":gaussian", err7)
+    err8 = try
+        M.prepare_derived((
+            C_ens=0.6, M_delta=3, M_g=1, Ttotal=1e-5, Nt_save=3,
+            delta0=0.0, kappa_e=2π*1e6, kappa_i=0.0,
+            freq_inhomogeneity=(kind=:notakind, FWHM=2π*1e6, span_gamma=2.5, renormalize=false),
+            g_inhomogeneity=(kind=:constant, g_value=2π*100),
+        ); ensemble_method=:auto)
+        ""
+    catch e
+        sprint(showerror, e)
+    end
+    @test occursin("no quadrature rule", err8)
+    @test occursin("notakind", err8)
 end
 
 @testset "Modes API aliases + prepare" begin
@@ -437,15 +474,8 @@ end
     kappa_e = 2π * 1e6
     kappa_i = 2π * 1e5
     @test M.mg_large_length(Mbin, Mbin) == 5 * Mbin * Mbin
-    u1 = M.build_u0_1st_order(Mbin, Nj, Float64, :equator)
-    u1[1] = 0.01 + 0.002im
-    p = (0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, _bench_Et)
-    pool1 = M.StagePool(u1, 6)
     tab5 = M.Tsit5Tab(Float64)
     tabck = M.CK45Tab(Float64)
-    copyto!(pool1.u, u1)
-    M.tsit5_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tab5)
-    M.ck45_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tabck)
     u2 = M.build_u0_2nd_order(Mbin, Nj, Float64, :equator)
     u2[1] = 0.01 + 0.002im
     s, L, c, o = M.dense_to_shards(u2, Mbin, 1)
@@ -486,6 +516,25 @@ end
     per = (b_l - b_s) / max(nst_l - nst_s, 1)
     @test nst_l > nst_s
     @test per == 0
+    # B3: Ass ~704 B/eval from zeros+views in bspline_eval. Warm path must be 0.
+    pulse, d, uu, = _tiny_pulse_problem()
+    EE = M.build_E_of_t(pulse, uu)
+    ts, te, = M.decode(pulse, uu)
+    tmid = (ts[1] + te[1]) / 2
+    E0 = EE(tmid)
+    nE = @allocated EE(tmid)
+    @test nE == 0
+    @test abs(E0) > 0
+    # Dual-through-u still matches finite differences (adjoint/optimizer path)
+    g_ad = ForwardDiff.gradient(θ -> real(M.build_E_of_t(pulse, θ)(tmid)), uu)
+    ε = 1e-6
+    g_fd = similar(uu)
+    @inbounds for i in eachindex(uu)
+        up = copy(uu); um = copy(uu)
+        up[i] += ε; um[i] -= ε
+        g_fd[i] = (real(M.build_E_of_t(pulse, up)(tmid)) - real(M.build_E_of_t(pulse, um)(tmid))) / (2ε)
+    end
+    @test g_ad ≈ g_fd rtol=1e-5 atol=1e-7
 end
 
 println("SpinCavityMonolith tests finished.")
