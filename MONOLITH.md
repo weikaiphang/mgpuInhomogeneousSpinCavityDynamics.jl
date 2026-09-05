@@ -99,7 +99,7 @@ Production path until Tuesday iron: **CPU multicore**, not fake GPUs.
 - `Project.toml` lists the stdlibs this module uses (`LinearAlgebra`,
   `Random`, `Printf`) so `Pkg.precompile()` does not false-green / fail CI.
 - B-spline `E(t)` (`PulseDrive`) reuses Cox–de Boor scratch; warm primal
-  eval is 0 alloc. Dual-through-`u` uses a lazy Dual scratch.
+  eval is 0 alloc. Dual-through-`u` owns a Dual scratch (not the primal one).
 - Run with `julia -t auto` / `JULIA_NUM_THREADS`. Tests: `julia --project=. --startup-file=no test/spin_cavity_monolith.jl`.
 
 ## Multi-GPU — Tuesday iron gate

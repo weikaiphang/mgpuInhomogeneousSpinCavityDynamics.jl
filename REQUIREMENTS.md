@@ -22,7 +22,7 @@ All implementations live in `src/SpinCavityMonolith.jl` unless noted.
 | CPU Threads (until Tuesday) | `resolve_cpu_nshards` (default 1, not `gpu_count`). Large layout `5×M×mloc`. `@threads` on trip count ≥ 64. `RHS2Work` / `Order2Pool` / `StagePool`. 0-alloc RK stage: `_rk6_order2!`, `rk6_step!`, `_lincomb_n!`. Dual does not evict the primal RHS cache. |
 | Integrator `:tsit5` / `:ck45` | `_canon_integrator`, `_integrator_from_compute` (`integrator` or `method`). Cash–Karp 5(4) tableau. Unknown names error. GPU and discrete adjoint are Tsit5-only (error, not silent Tsit5). |
 | `Pkg.precompile()` (B9) | `Project.toml` lists `ForwardDiff` plus stdlibs the module `using`s: `LinearAlgebra`, `Random`, `Printf`. |
-| B-spline `E(t)` 0 alloc (B3) | `PulseDrive` + `BSplineScratch` / `bspline_dot!`. Dual scratch is lazy. |
+| B-spline `E(t)` 0 alloc (B3) | `PulseDrive` + `BSplineScratch` / `bspline_dot!`. Dual-through-`u` owns its own scratch. |
 | Large layout (B5) | `mg_pair` pair-interleaved 5-tuples. CPU default 1 shard. |
 | Ensemble API (B7/B8) | Histogram is `:constant` g only (honest error). `:auto`+`:uniform` builds a histogram. Unknown freq kinds error with the `:auto` reason. |
 | Docs invoke (B10) | `julia --project=. --startup-file=no test/spin_cavity_monolith.jl` |

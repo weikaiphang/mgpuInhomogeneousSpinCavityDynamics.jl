@@ -148,7 +148,7 @@ BSplineScratch(::Type{T}, nbuf::Integer) where {T} =
 @inline _cget(c::AbstractVector, i, ::Int) = @inbounds c[i]
 @inline _cget(c::AbstractMatrix, i, col::Int) = @inbounds c[i, col]
 
-function bspline_dot!(sc::BSplineScratch{S}, t, coeffs, col::Int, knots, degree) where {S}
+@inline function bspline_dot!(sc::BSplineScratch{S}, t, coeffs, col::Int, knots, degree::Int) where {S}
     n0 = length(knots) - 1
     n = length(knots) - degree - 1
     a = sc.a; b = sc.b
@@ -309,7 +309,9 @@ function _subpulse_knots(pulse::CompositePulse, t_start, t_end)
     return kA, kf
 end
 
-# Callable drive. Primal scratch is allocated once; Dual scratch is lazy (B3).
+# Callable drive. Primal (`T===Float64`) and Dual (`T<:Dual`) each own a
+# concrete scratch — Dual-through-`u` never writes a Float64 buffer (B3).
+# Mixed Dual-`t` on a primal drive allocates a one-shot scratch (not Ass).
 struct PulseDrive{T}
     k::Int
     deg::Int
@@ -322,22 +324,10 @@ struct PulseDrive{T}
     df::Vector{Vector{T}}
     poff::Vector{T}
     scratch::BSplineScratch{T}
-    alt::Ref{Any}
 end
 
 function _bspline_nbuf(pulse::CompositePulse)
     return max(pulse.n_coeff_A + pulse.degree, pulse.n_coeff_f + pulse.degree + 2)
-end
-
-@inline function _scratch_for(E::PulseDrive{T}, ::Type{S}) where {T,S}
-    S === T && return E.scratch
-    sc = E.alt[]
-    if sc isa BSplineScratch{S}
-        return sc::BSplineScratch{S}
-    end
-    news = BSplineScratch(S, length(E.scratch.a))
-    E.alt[] = news
-    return news
 end
 
 @inline function _eval_drive(E::PulseDrive{T}, t, sc::BSplineScratch{S}) where {T,S}
@@ -347,17 +337,24 @@ end
             A = bspline_dot!(sc, t, E.cA, i, E.kA[i], E.deg) *
                 _taper_window(t, E.t_start[i], E.t_end[i], E.tf)
             ϕ = bspline_dot!(sc, t, E.df[i], 0, E.kfp[i], E.deg + 1) + E.poff[i]
-            return A * exp(im * ϕ)
+            return A * cis(ϕ)
         end
     end
     return zero(Complex{S})
 end
 
-# Concrete primal — Ass benches this (0 alloc). Dual / mixed types use scratch_for.
-@inline (E::PulseDrive{Float64})(t::Float64) = _eval_drive(E, t, E.scratch)
+# Ass benches this: Float64 drive at Float64 t, 0 alloc after warmup.
+@inline function (E::PulseDrive{Float64})(t::Float64)
+    return _eval_drive(E, t, E.scratch)::ComplexF64
+end
+
 function (E::PulseDrive{T})(t) where {T}
     S = promote_type(typeof(t), T)
-    return _eval_drive(E, t, _scratch_for(E, S))
+    if S === T
+        tt = t isa T ? t : convert(T, t)
+        return _eval_drive(E, tt, E.scratch)
+    end
+    return _eval_drive(E, t, BSplineScratch(S, length(E.scratch.a)))
 end
 
 function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
@@ -378,7 +375,7 @@ function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
         running = poff[i] + d[end]
     end
     return PulseDrive{T}(k, deg, pulse.taper_frac, t_start, t_end, cA, kA, kfp, df, poff,
-                         BSplineScratch(T, _bspline_nbuf(pulse)), Ref{Any}(nothing))
+                         BSplineScratch(T, _bspline_nbuf(pulse)))
 end
 
 pulse_duration(pulse::CompositePulse, u::AbstractVector) = decode(pulse, u)[2][end]

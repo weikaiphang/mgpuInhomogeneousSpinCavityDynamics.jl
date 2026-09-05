@@ -517,12 +517,18 @@ end
     @test nst_l > nst_s
     @test per == 0
     # B3: Ass ~704 B/eval from zeros+views in bspline_eval. Warm path must be 0.
-    pulse, d, uu, = _tiny_pulse_problem()
+    # Bench through a typed function (same as Ass B1/B2); @testset leaves EE as Any
+    # and @allocated then counts a boxed ComplexF64 (32 B) at the call site.
+    pulse, _, uu, = _tiny_pulse_problem()
+    function _ass_E_bytes(EE::M.PulseDrive{Float64}, t::Float64)
+        EE(t)
+        return @allocated EE(t)
+    end
     EE = M.build_E_of_t(pulse, uu)
     ts, te, = M.decode(pulse, uu)
     tmid = (ts[1] + te[1]) / 2
     E0 = EE(tmid)
-    nE = @allocated EE(tmid)
+    nE = _ass_E_bytes(EE, tmid)
     @test nE == 0
     @test abs(E0) > 0
     # Dual-through-u still matches finite differences (adjoint/optimizer path)
