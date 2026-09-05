@@ -1,4 +1,9 @@
 
+# CPU twin of the 2nd-order RHS. Conventions match rhs_2nd_order! / kernels:
+#   ∂t a  = √κ_e E − iδ₀ a − i∑ g S⁻ − (κ/2) a     (κ = κ_e + κ_i)
+#   ∂t S⁺ = iΔ S⁺ − 2i g ⟨a† Sᶻ⟩
+#   ∂t Sᶻ = −i g ⟨a S⁺⟩ + i g ⟨a† S⁻⟩
+# No spin T₁/T₂ on this RHS.
 function rhs_cpu!(du::AbstractVector{Complex{T}}, u::AbstractVector{Complex{T}},
                   delta0::T, kappa_e::T, kappa_i::T,
                   delta_b::AbstractVector{T}, g_b::AbstractVector{T},

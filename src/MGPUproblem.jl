@@ -200,6 +200,8 @@ function rhs!(prob::MGPUProblem{T}, iu::Int, idu::Int, t::Real) where {T}
 end
 
 
+# 3M packed row-sums (∑_k g_k ⟨S⁺S⁺⟩_{jk}, ⟨S⁻S⁺⟩_{jk}, ⟨SᶻS⁺⟩_{jk}).
+# Prefer this over the standalone opt script's 5-field gather.
 function exchange_rowsums!(prob::MGPUProblem{T}, rb) where {T}
     shards = prob.shards
     length(shards) <= 1 && return nothing

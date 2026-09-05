@@ -5,11 +5,12 @@ function _with_default_ensemble_method(SIM_SETTING, order)
     return merge(SIM_SETTING, (ensemble_method = :auto,))
 end
 
-# Public 2nd-order multi-GPU entry point is `mgpu_run_simulation` /
-# `mgpu_run_sim_2nd_order` (MGPU* stack). `src/sim_2nd_multi_gpu_opt.jl` is a
-# standalone driver, not part of this module.
+# One public order-2 path: the MGPU stack (`mgpu_run` / `mgpu_run_simulation`
+# / `run_simulation`). Row-sum exchange is NCCL/P2P in exchange_rowsums!.
+# `run_sim_2nd_order` remains the DiffEq single-device backend.
+# `src/sim_2nd_multi_gpu_opt.jl` is a standalone driver, not this API.
 
-function run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=true)
+function run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=true, kwargs...)
     order = get_simulation_order(SIM_SETTING)
     SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, order)
 
@@ -23,12 +24,13 @@ function run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=true
         )
 
     elseif order in (:second_order, :order2, :second, 2)
-        println("Start running 2nd-order cumulant spin-cavity simulation...")
-        return run_sim_2nd_order(
+        println("Start running 2nd-order cumulant spin-cavity simulation (MGPU)...")
+        return mgpu_run_sim_2nd_order(
             SIM_SETTING,
             SYSTEM_CONFIG,
             PULSE_CONFIG;
             clean_gpu = clean_gpu,
+            kwargs...,
         )
 
     else

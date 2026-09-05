@@ -1,5 +1,9 @@
-# Workspace kills the O(M) / O(M²) temporaries that the previous broadcast
-# form allocated on every RHS call (g .* conj(Sp), three M×M matvecs, …).
+# 2nd-order RHS conventions (do not change):
+#   ∂t a  = √κ_e E − iδ₀ a − i∑ g S⁻ − (κ/2) a     with κ = κ_e + κ_i, S⁻ = (S⁺)*
+#   ∂t S⁺ = iΔ S⁺ − 2i g ⟨a† Sᶻ⟩
+#   ∂t Sᶻ = −i g ⟨a S⁺⟩ + i g ⟨a† S⁻⟩
+#   a_out = E − √κ_e a;  Sᶻ = ±½ per spin; no spin T₁/T₂ on this RHS.
+# Workspace kills per-call O(M)/O(M²) temporaries (g .* conj(Sp), matvecs, …).
 mutable struct RHS2Workspace{V}
     gconjSp::V
     g_adSp::V

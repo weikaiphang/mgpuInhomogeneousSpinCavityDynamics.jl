@@ -122,6 +122,9 @@ end
 
 
 
+# Cooperativity inversion (do not change; Gaussian is peak-matched to Lorentzian FWHM):
+#   N_Lorentzian = C κ FWHM / (4 ⟨g²⟩)
+#   N_Gaussian   = C κ FWHM / (4 √(π ln 2) ⟨g²⟩)
 function total_spin_number_from_cooperativity(
     C_ens,
     kappa_t,

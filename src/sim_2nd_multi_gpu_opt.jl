@@ -1,7 +1,7 @@
 
 # Standalone multi-GPU driver (not part of the package module).
 # The supported public 2nd-order multi-GPU API is
-# `mgpu_run_simulation` / `mgpu_run_sim_2nd_order` in MGPUsolver.jl.
+# `mgpu_run` / `mgpu_run_simulation` / `run_simulation` (MGPUsolver.jl).
 # This file must stay in lockstep with rhs_2nd_order! / rhs_cpu! / kernels
 # (κt = κe + κi; same 2nd-order moments).
 using CUDA

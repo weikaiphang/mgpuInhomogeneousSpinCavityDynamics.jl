@@ -77,6 +77,7 @@ export build_u0_cpu_2nd_order
 export rhs_2nd_order!
 export rhs_cpu!
 
+export mgpu_run
 export mgpu_run_simulation
 export mgpu_run_sim_2nd_order
 export assemble_problem

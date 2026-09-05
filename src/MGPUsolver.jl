@@ -227,6 +227,8 @@ function mgpu_run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...
     end
 end
 
+const mgpu_run = mgpu_run_simulation
+
 mgpu_build_full_config(SIM_SETTING, SYSTEM_CONFIG) = merge(SIM_SETTING, SYSTEM_CONFIG)
 
 const UNSET = :__unset__

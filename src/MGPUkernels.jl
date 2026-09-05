@@ -260,6 +260,11 @@ end
 
 
 
+# Same conventions as rhs_2nd_order! / rhs_cpu!:
+#   ∂t a  = √κ_e E − iδ₀ a − i∑ g S⁻ − (κ/2) a     (κ = κ_e + κ_i)
+#   ∂t S⁺ = iΔ S⁺ − 2i g ⟨a† Sᶻ⟩
+#   ∂t Sᶻ = −i g ⟨a S⁺⟩ + i g ⟨a† S⁻⟩
+# No spin T₁/T₂ on this RHS. Row-sum exchange is 3M (exchange_rowsums!), not 5-field.
 function small_rhs_kernel!(du, u, rowsum, gsums, delta_b, g_b, Et::Complex{T},
                            delta0::T, kappa_t::T, sqrt_ke::T, M::Int) where {T}
     j = (blockIdx().x - 1) * blockDim().x + threadIdx().x

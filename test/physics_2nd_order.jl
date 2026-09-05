@@ -9,19 +9,60 @@ for (pred, rel) in (
     (!isdefined(@__MODULE__, :build_u0_cpu_2nd_order), "initial_conditions_2nd_order.jl"),
     (!isdefined(@__MODULE__, :_with_default_ensemble_method), "simulation_api.jl"),
     (!isdefined(@__MODULE__, :build_constant_coupling_bins), "coupling_inhomogeneity.jl"),
+    (!isdefined(@__MODULE__, :total_spin_number_from_cooperativity), "frequency_inhomogeneity.jl"),
     (!isdefined(@__MODULE__, :_quad_frequency_nodes), "ensemble_quadrature.jl"),
 )
     pred && include(joinpath(_PHYS_SRC, rel))
 end
 
+if !isdefined(@__MODULE__, :_WEAK_SEED)
+    const _WEAK_SEED = 1.0e-3
+end
+
+# Authoritative product-state same-bin algebra (all four; no +Sp/2 on SzSp).
+@inline function _spsp_product(Sp, Nj)
+    invN = Nj > 0 ? (1 - 1 / Nj) : 0.0
+    return Sp * Sp * invN
+end
+@inline function _szsp_product(Sz, Sp, Nj)
+    invN = Nj > 0 ? (1 - 1 / Nj) : 0.0
+    return Sz * Sp * invN
+end
 @inline function _smsp_product(Sp, Sz, Nj)
     invN = Nj > 0 ? (1 - 1 / Nj) : 0.0
     return abs2(Sp) * invN + Nj / 2 - Sz
 end
-
 @inline function _szsz_product(Sz, Nj)
     invN = Nj > 0 ? (1 - 1 / Nj) : 0.0
     return Sz * Sz * invN + Nj / 4
+end
+
+function _check_same_bin_algebra(st, Nj)
+    @test st.SpSp_same ≈ _spsp_product.(st.Sp, Nj)
+    @test st.SzSp_same ≈ _szsp_product.(st.Sz, st.Sp, Nj)
+    @test real.(st.SmSp_same) ≈ real.(_smsp_product.(st.Sp, st.Sz, Nj))
+    @test real.(st.SzSz_same) ≈ _szsz_product.(real.(st.Sz), Nj)
+    if !all(iszero, st.Sp)
+        old_szsp = st.Sz .* st.Sp .* (1 .- 1 ./ Nj) .+ st.Sp ./ 2
+        @test st.SzSp_same ≉ old_szsp
+    end
+end
+
+function _check_cross_mean_products(st, Nj)
+    M = length(Nj)
+    for k in 1:M, j in 1:M
+        if j == k
+            @test st.SpSp_cross[j, k] == 0
+            @test st.SzSp_cross[j, k] == 0
+            @test st.SmSp_cross[j, k] == 0
+            @test st.SzSz_cross[j, k] == 0
+        else
+            @test st.SpSp_cross[j, k] ≈ st.Sp[j] * st.Sp[k]
+            @test st.SzSp_cross[j, k] ≈ st.Sz[j] * st.Sp[k]
+            @test st.SmSp_cross[j, k] ≈ conj(st.Sp[j]) * st.Sp[k]
+            @test st.SzSz_cross[j, k] ≈ st.Sz[j] * st.Sz[k]
+        end
+    end
 end
 
 @testset "C1/H1: 2nd-order product initial conditions" begin
@@ -33,32 +74,52 @@ end
     @test all(iszero, st_g.Sp)
     @test real.(st_g.Sz) ≈ .-Nj ./ 2
     @test real.(st_g.SmSp_same) ≈ Nj
+    @test real.(st_g.SmSp_same) ≈ Nj ./ 2 .- real.(st_g.Sz)
     @test real.(st_g.SzSz_same) ≈ (Nj .^ 2) ./ 4
+    @test all(iszero, st_g.SpSp_same)
+    @test all(iszero, st_g.SzSp_same)
     @test all(iszero, st_g.a) && all(iszero, st_g.ad_a) && all(iszero, st_g.ad_ad)
+    _check_same_bin_algebra(st_g, Nj)
+    _check_cross_mean_products(st_g, Nj)
 
     u_i = build_u0_cpu_2nd_order(M, Nj, :inverted)
     st_i = unpack_state_2nd_order_u(u_i, M)
     @test real.(st_i.Sz) ≈ Nj ./ 2
     @test real.(st_i.SmSp_same) ≈ zeros(M) atol = 1e-14
     @test real.(st_i.SzSz_same) ≈ (Nj .^ 2) ./ 4
+    @test all(iszero, st_i.SpSp_same)
+    @test all(iszero, st_i.SzSp_same)
+    _check_same_bin_algebra(st_i, Nj)
+    _check_cross_mean_products(st_i, Nj)
 
     u_e = build_u0_cpu_2nd_order(M, Nj, :equator)
     st_e = unpack_state_2nd_order_u(u_e, M)
     @test real.(st_e.Sp) ≈ Nj ./ 2
     @test all(iszero, st_e.Sz)
+    @test all(iszero, st_e.SzSp_same)  # Sz=0 ⇒ Sz*Sp*(1-1/Nj)=0; old +Sp/2 would be Nj/4
+    @test real.(st_e.SpSp_same) ≈ real.(_spsp_product.(st_e.Sp, Nj))
     @test real.(st_e.SmSp_same) ≈ _smsp_product.(st_e.Sp, st_e.Sz, Nj)
     @test real.(st_e.SzSz_same) ≈ _szsz_product.(real.(st_e.Sz), Nj)
     @test maximum(abs.(real.(st_e.SmSp_same) .- abs2.(st_e.Sp))) > 0.1
+    _check_same_bin_algebra(st_e, Nj)
+    _check_cross_mean_products(st_e, Nj)
 
+    @test _WEAK_SEED == 1.0e-3
     u_w = build_u0_cpu_2nd_order(M, Nj, :weak)
     st_w = unpack_state_2nd_order_u(u_w, M)
-    @test real.(st_w.SmSp_same) ≈ _smsp_product.(st_w.Sp, st_w.Sz, Nj)
-    @test real.(st_w.SzSz_same) ≈ _szsz_product.(real.(st_w.Sz), Nj)
+    _check_same_bin_algebra(st_w, Nj)
+    _check_cross_mean_products(st_w, Nj)
+    bloch2 = (Nj ./ 2) .^ 2
+    obs2 = abs2.(st_w.Sp) .+ abs2.(real.(st_w.Sz))
+    @test all(obs2 .> bloch2)  # seed sits outside |⟨S⟩|=Nj/2 by design
 
     u_wi = build_u0_cpu_2nd_order(M, Nj, :weak_inverted)
     st_wi = unpack_state_2nd_order_u(u_wi, M)
-    @test real.(st_wi.SmSp_same) ≈ _smsp_product.(st_wi.Sp, st_wi.Sz, Nj)
-    @test real.(st_wi.SzSz_same) ≈ _szsz_product.(real.(st_wi.Sz), Nj)
+    _check_same_bin_algebra(st_wi, Nj)
+    _check_cross_mean_products(st_wi, Nj)
+    bloch2i = (Nj ./ 2) .^ 2
+    obs2i = abs2.(st_wi.Sp) .+ abs2.(real.(st_wi.Sz))
+    @test all(obs2i .> bloch2i)
 
 end
 
@@ -124,6 +185,15 @@ end
     @test out.ensemble_method === :auto
     sim2 = merge(sim, (ensemble_method = :histogram,))
     @test _with_default_ensemble_method(sim2, :second_order).ensemble_method === :histogram
+end
+
+@testset "N from cooperativity: Lorentzian / peak-matched Gaussian" begin
+    C, κ, FWHM, g2 = 0.6, 2π * 1e6, 2π * 1e6, abs2(2π * 100)
+    freq_l = (kind = :lorentzian, FWHM = FWHM, span_gamma = 2.5)
+    freq_g = (kind = :gaussian, FWHM = FWHM, span_sigma = 3.0)
+    @test total_spin_number_from_cooperativity(C, κ, g2, freq_l) ≈ C * κ * FWHM / (4 * g2)
+    @test total_spin_number_from_cooperativity(C, κ, g2, freq_g) ≈
+          C * κ * FWHM / (4 * sqrt(π * log(2)) * g2)
 end
 
 @testset "H3: κt = κe + κi in CPU / monolith 2nd-order RHS" begin

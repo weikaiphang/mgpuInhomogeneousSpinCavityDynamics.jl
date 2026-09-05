@@ -1,18 +1,18 @@
-# Uncorrelated product-state same-bin moments for a collective spin of
-# Nj spin-1/2s (each bin is a product of identical qubits):
-#   ⟨S⁺S⁺⟩ = Sp² (1 − 1/Nj)
-#   ⟨SᶻS⁺⟩ = Sz Sp (1 − 1/Nj) + Sp/2          (sz s⁺ = s⁺/2 on each qubit)
-#   ⟨S⁻S⁺⟩ = |Sp|² (1 − 1/Nj) + Nj/2 − Sz
-#   ⟨SᶻSᶻ⟩ = Sz² (1 − 1/Nj) + Nj/4
-# Cross-bin moments remain mean products (distinct bins are independent).
-# Ground (Sp=0, Sz=−Nj/2) ⇒ ⟨S⁻S⁺⟩ = Nj, so vacuum⊗ground is a 2nd-order
-# fixed point: dadSm's 2ig Sz cancels ig ⟨S⁻S⁺⟩.
+# Uncorrelated product-state same-bin moments (authoritative):
+#   SmSp_same = |Sp|²(1 − 1/Nj) + Nj/2 − Sz
+#   SzSz_same = Sz²(1 − 1/Nj) + Nj/4
+#   SpSp_same = Sp²(1 − 1/Nj)
+#   SzSp_same = Sz*Sp*(1 − 1/Nj)
+# Cross j≠k are mean products. Ground (Sp=0, Sz=−Nj/2) ⇒ SmSp_same = Nj
+# (equivalently Nj/2 − Sz), so vacuum⊗ground is a 2nd-order fixed point.
+# :weak / :weak_inverted use _WEAK_SEED = 1e-3, which sits outside the
+# Bloch ball |⟨S⟩| = Nj/2 by design (a seed, not a physical CSS).
 
 @inline function _uncorrelated_same_moments(Sp, Sz, Nj)
     n = float(real(Nj))
     invN = n > 0 ? (1 - inv(n)) : zero(n)
     SpSp = Sp * Sp * invN
-    SzSp = Sz * Sp * invN + Sp / 2
+    SzSp = Sz * Sp * invN
     SmSp = abs2(Sp) * invN + n / 2 - Sz
     SzSz = Sz * Sz * invN + n / 4
     return SpSp, SzSp, SmSp, SzSz
