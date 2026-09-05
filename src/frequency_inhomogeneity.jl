@@ -139,14 +139,14 @@ function truncation_cooperativity(C_ens, p_delta, p_g=nothing)
     )
 end
 
-function maybe_print_truncation_cooperativity(C_ens, p_delta, p_g, freq_inhomogeneity)
+function maybe_print_truncation_cooperativity(C_ens, p_delta, p_g, freq_inhomogeneity; io::IO=stdout)
     kind = hasproperty(freq_inhomogeneity, :kind) ? freq_inhomogeneity.kind : :unknown
     kind === :lorentzian || return nothing
     renormalize_frequency_probs_enabled(freq_inhomogeneity) && return nothing
     info = truncation_cooperativity(C_ens, p_delta, p_g)
-    println("[ensemble] truncated Lorentzian (renormalize=false): ∑p_δ = $(info.sum_p_delta)")
-    println("[ensemble] ∑p_g = $(info.sum_p_g)")
-    println("[ensemble] effective C = $(info.C_eff)  vs claimed C_ens = $(info.C_ens)")
+    println(io, "[ensemble] truncated Lorentzian (renormalize=false): ∑p_δ = $(info.sum_p_delta)")
+    println(io, "[ensemble] ∑p_g = $(info.sum_p_g)")
+    println(io, "[ensemble] effective C = $(info.C_eff)  vs claimed C_ens = $(info.C_ens)")
     return info
 end
 

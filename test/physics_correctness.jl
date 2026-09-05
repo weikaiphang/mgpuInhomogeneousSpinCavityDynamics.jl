@@ -248,23 +248,18 @@ end
     @test info.C_eff ≈ C * info.sum_p_delta
     @test info.C_eff < C
 
-    printed = sprint() do io
-        redirect_stdout(io) do
-            maybe_print_truncation_cooperativity(C, pδ, p_g, freq)
-        end
-    end
+    buf = IOBuffer()
+    maybe_print_truncation_cooperativity(C, pδ, p_g, freq; io=buf)
+    printed = String(take!(buf))
     @test occursin("∑p_δ", printed)
     @test occursin("effective C", printed)
     @test occursin("claimed C_ens", printed)
-    @test occursin(string(info.C_eff), printed) || occursin("0.4", printed)
+    @test occursin("0.4", printed)
 
-    silent = sprint() do io
-        redirect_stdout(io) do
-            maybe_print_truncation_cooperativity(
-                C, pδ, p_g, merge(freq, (renormalize=true,)))
-        end
-    end
-    @test isempty(silent)
+    silent_buf = IOBuffer()
+    maybe_print_truncation_cooperativity(
+        C, pδ, p_g, merge(freq, (renormalize=true,)); io=silent_buf)
+    @test isempty(String(take!(silent_buf)))
 
     cfg = (
         C_ens = C,
