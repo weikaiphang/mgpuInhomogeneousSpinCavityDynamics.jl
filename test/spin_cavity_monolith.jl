@@ -227,6 +227,17 @@ function _tiny_pulse_problem(; Ttotal=4e-8)
     return pulse, d, u, Ttotal
 end
 
+@testset "host collectives are loud; GPU bar is honest" begin
+    col = M.Collective(:host, nothing, nothing)
+    @test_throws ErrorException M.allreduce_sum!(col, [ones(ComplexF64, 2), ones(ComplexF64, 2)])
+    @test_throws ErrorException M.allgather_shards!(
+        col, [ones(ComplexF64, 2)], [ones(ComplexF64, 4)], [2], [0], 1)
+    if M.gpu_count() == 0
+        @test !M.cuda_functional()
+        @test_throws ErrorException M.build_collectives(2)
+    end
+end
+
 @testset "adjoint vs forward-mode gradient parity" begin
     pulse, d, u, Ttotal = _tiny_pulse_problem()
     # One accepted Tsit5 step so Dual-through-solve and discrete adjoint share a mesh.

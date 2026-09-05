@@ -48,7 +48,9 @@ and optionally `BSPLINE`, `OPTIMIZER`, `COMPUTE`. JSON uses the same keys
 
 `:auto` uses Gauss–Legendre when frequency is `:lorentzian`/`:gaussian` and
 coupling is `:constant`/`:gaussian`/`:powerlaw_g`; otherwise histogram.
-**order2 uses the same prepare path.**
+**order2 uses the same prepare path.** Homemade Golub–Welsch GL is the
+implementation; FastGaussQuadrature.jl is an optional later swap for the
+same nodes/weights, not required now.
 
 ## Loss
 
@@ -78,9 +80,19 @@ cross j≠k = mean products
 
 ## Multi-GPU
 
-One order-2 RHS: small `3+9M` once on rank 0; large `5×M×mloc` =
-`SpSp, SzSp, SzSpT, SmSp, SzSz`. CUDA kernels + NCCL/P2P Allreduce of O(M)
-row-sums. CPU runs the same `rhs2_sharded!` (CI fallback).
+**Bar:** live ≥2-GPU NCCL/P2P. The Cloud Agent VM that landed this tip has
+no NVIDIA GPU (`nvidia-smi` absent). CPU `rhs2_sharded!` is the CI path
+here; do not treat a CPU run as multi-GPU.
+
+One order-2 RHS: small `3+9M` **on device** (rank 0); large `5×M×mloc` =
+`SpSp, SzSp, SzSpT, SmSp, SzSz`. Row-sums stay on device and are Allreduced
+with a **NCCL group** (every rank, `sumP`/`sumM`/`sumZ` in one
+`groupStart`/`groupEnd`), else P2P device copies. Host-staged collectives
+**error** (`HOST COLLECTIVE FALLBACK`) — never silent-green.
+
+Hot path: no per-RHS D2H of small state or row-sums. Small replicas for
+large kernels use P2P/`copyto!`. Error norms use device reductions + one
+scalar.
 
 ```bash
 julia --project=. scripts/run_monolith.jl -s examples/monolith_forward.jl

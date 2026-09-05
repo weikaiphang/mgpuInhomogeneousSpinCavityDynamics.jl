@@ -18,7 +18,12 @@ All implementations live in `src/SpinCavityMonolith.jl` unless noted.
 | Product-state ICs; ground `SmSp=Nⱼ` | `smsp_same_product` et al.; `build_u0_1st_order`, `build_u0_2nd_order`, `build_u0_2nd_mgpu` |
 | `κₜ = κₑ+κᵢ` | `prepare_derived` (`kappa_t`); `rhs1!`; `rhs2_small!` |
 | Auditable equations | Header of `src/SpinCavityMonolith.jl` (eqs. for ȧ, spins, same-bin ICs, loss) |
-| Live multi-GPU, no dense duplicate stack | `rhs2_sharded!` is the RHS. `rhs2_small!` once; `rhs2_large!` / `_large_kernel!` on column shards. `solve_2nd_gpu`: NCCL/P2P `allreduce_sum!` of row-sums. `rhs2!` only packs shards for tests/reporting — it calls `rhs2_sharded!`. |
+| Live multi-GPU, no dense duplicate stack | `rhs2_sharded!` is the RHS. Small once; large on column shards. `rhs2!` only packs shards for tests/reporting — it calls `rhs2_sharded!`. |
+| ≥2-GPU NCCL/P2P is the bar | `build_collectives` → `:nccl` (preferred) or `:p2p`. This VM has **no NVIDIA GPU**; CPU path is documented, not a substitute for live NCCL. |
+| On-device small RHS + rowsums (no hot-path D2H) | `_rowsum_kernel!` + `allreduce_sum_group!` + `_small_rhs_kernel!` / `_cuda_launch_small!` in `solve_2nd_gpu`. Shared math: `_small_cavity_derivs!`, `_small_bin_deriv!`. |
+| NCCL Allreduce **group**, not a naive loop | `allreduce_sum_group!` wraps ranks (and `sumP`/`sumM`/`sumZ`) in `NCCL.group` / `groupStart`+`groupEnd`. Refuses a serial per-rank Allreduce if the group API is missing. |
+| Host collective fallback is loud | `_host_collective_error` `@error`s and `error`s. Never returns `:host` as a live multi-GPU path. |
+| Homemade GL; FastGaussQuadrature later | `_gauss_legendre_pts` (Golub–Welsch). FastGaussQuadrature.jl is an optional later dependency, not wired in. |
 | CLI | `scripts/run_monolith.jl` → `main` / `run_mode` |
 
 ## Rename map (this tip)

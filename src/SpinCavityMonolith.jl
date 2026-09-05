@@ -37,6 +37,7 @@ end
 
 function _cuda_launch_rowsum! end
 function _cuda_launch_large! end
+function _cuda_launch_small! end
 
 function _load_optional_stacks!()
     _HAVE_CUDA[] = _try_using(:CUDA)
@@ -53,6 +54,14 @@ function _load_optional_stacks!()
             function _cuda_launch_large!(dlarge, large, small, delta_b, g_b, M, mloc, lo)
                 CUDA.@cuda threads=(16, 16) blocks=(cld(Int(M), 16), cld(Int(mloc), 16)) _large_kernel!(
                     dlarge, large, small, delta_b, g_b, Int(M), Int(mloc), Int(lo))
+                return nothing
+            end
+            function _cuda_launch_small!(dsmall, small, sumP, sumM, sumZ, delta_b, g_b,
+                                         delta0, kappa_e, kappa_i, Et, M)
+                thr = 256
+                CUDA.@cuda threads=thr blocks=cld(Int(M), thr) _small_rhs_kernel!(
+                    dsmall, small, sumP, sumM, sumZ, delta_b, g_b,
+                    Float64(delta0), Float64(kappa_e), Float64(kappa_i), ComplexF64(Et), Int(M))
                 return nothing
             end
         end
@@ -443,6 +452,8 @@ end
 #   Gaussian:   N = C_ens κₜ FWHM / (4 √(π ln 2) ⟨g²⟩)
 # κₜ = κₑ + κᵢ  is used here (internal loss included), matching the main package.
 
+# Homemade Golub–Welsch GL. FastGaussQuadrature.jl is an optional later swap
+# for the same (x, w) on [-1, 1]; not required for correctness.
 function _gauss_legendre_pts(n::Integer)
     n >= 1 || error("Gauss–Legendre n must be >= 1")
     n == 1 && return ([0.0], [2.0])
@@ -882,15 +893,10 @@ function _local_rowsums!(sumP, sumM, sumZ, large, g, M, mloc, lo)
     return nothing
 end
 
-"""Small RHS once (rank 0). `sumP/M/Z` are already-reduced Σ_{k≠j} large[j,k] g_k."""
-function rhs2_small!(dsmall, small, sumP, sumM, sumZ, delta0, kappa_e, kappa_i,
-                     delta_b, g_b, M, Et)
-    κe = kappa_e
-    κt = kappa_e + kappa_i
-    sq = sqrt(κe)
+# Shared by CPU `rhs2_small!` and the rank-0 GPU kernel (no D2H of small/rowsums).
+@inline function _small_cavity_derivs!(dsmall, small, g_b, M, delta0, κt, sq, Et)
     a = small[1]; ad_ad = small[2]; ad_a = small[3]
-    oSp, oSz, oadSp, oadSm, oadSz = mg_off(M, 1), mg_off(M, 2), mg_off(M, 3), mg_off(M, 4), mg_off(M, 5)
-    oPP, oZP, oMP, oZZ = mg_off(M, 6), mg_off(M, 7), mg_off(M, 8), mg_off(M, 9)
+    oSp, oadSp, oadSm = mg_off(M, 1), mg_off(M, 3), mg_off(M, 4)
     ca = conj(a)
     sSm = zero(a); sAdSp = zero(a); sAdSm = zero(a); sCAdSm = zero(a)
     @inbounds for j in 1:M
@@ -904,8 +910,16 @@ function rhs2_small!(dsmall, small, sumP, sumM, sumZ, delta0, kappa_e, kappa_i,
     dsmall[1] = sq * Et - 1im * delta0 * a - 1im * sSm - 0.5 * κt * a
     dsmall[2] = 2im * delta0 * ad_ad + 2im * sAdSp - κt * ad_ad + 2 * sq * ca * conj(Et)
     dsmall[3] = 1im * sCAdSm - 1im * sAdSm - κt * ad_a + sq * Et * ca + sq * conj(Et) * a
-    @inbounds for j in 1:M
-        gj = g_b[j]; dj = delta_b[j]
+    return nothing
+end
+
+@inline function _small_bin_deriv!(dsmall, small, sumP, sumM, sumZ, j, gj, dj,
+                                   M, delta0, κt, sq, Et)
+    a = small[1]; ad_ad = small[2]; ad_a = small[3]
+    ca = conj(a)
+    oSp, oSz, oadSp, oadSm, oadSz = mg_off(M, 1), mg_off(M, 2), mg_off(M, 3), mg_off(M, 4), mg_off(M, 5)
+    oPP, oZP, oMP, oZZ = mg_off(M, 6), mg_off(M, 7), mg_off(M, 8), mg_off(M, 9)
+    @inbounds begin
         Sp = small[oSp + j]; Sz = small[oSz + j]
         adSp = small[oadSp + j]; adSm = small[oadSm + j]; adSz = small[oadSz + j]
         PPs = small[oPP + j]; ZPs = small[oZP + j]; MPs = small[oMP + j]; ZZs = small[oZZ + j]
@@ -951,6 +965,19 @@ function rhs2_small!(dsmall, small, sumP, sumM, sumZ, delta0, kappa_e, kappa_i,
             - 2im * gj * (cadSz * Sp + ZPs * a + cadSm * Sz - 2 * Sp * a * Sz)
             + 2im * gj * (ca * cZPs + cSp * adSz + adSm * Sz - 2 * ca * cSp * Sz)
         )
+    end
+    return nothing
+end
+
+"""Small RHS once (rank 0). `sumP/M/Z` are already-reduced Σ_{k≠j} large[j,k] g_k."""
+function rhs2_small!(dsmall, small, sumP, sumM, sumZ, delta0, kappa_e, kappa_i,
+                     delta_b, g_b, M, Et)
+    κt = kappa_e + kappa_i
+    sq = sqrt(kappa_e)
+    _small_cavity_derivs!(dsmall, small, g_b, M, delta0, κt, sq, Et)
+    @inbounds for j in 1:M
+        _small_bin_deriv!(dsmall, small, sumP, sumM, sumZ, j, g_b[j], delta_b[j],
+                          M, delta0, κt, sq, Et)
     end
     return nothing
 end
@@ -1417,9 +1444,9 @@ end
 #   local S = Σ_{j∈shard} gⱼ Sⱼ⁻
 #   Allreduce(SUM) → global S          (NCCL, else P2P, never per-RHS D2H)
 #   then fused kernel for ȧ, ⟨Ṡ⁺⟩, ⟨Ṡᶻ⟩
-# 2nd-order: Allreduce of O(1) cavity sums + Allgather of O(M) row-sums
-# (SpSp_cross*g, SmSp_cross*g, SzSp_cross*g). Host-staged row-sum exchange
-# is a last-resort fallback and is logged.
+# 2nd-order: on-device row-sums, NCCL Allreduce *group* of O(M) vectors
+# (sumP/sumM/sumZ), then rank-0 on-device small RHS. No per-RHS D2H of
+# small or rowsums. Host-staged collectives error (never silent-green).
 
 function cuda_functional()
     _HAVE_CUDA[] || return false
@@ -1459,15 +1486,26 @@ function _enable_p2p!(devs)
 end
 
 mutable struct Collective
-    kind::Symbol          # :nccl | :p2p | :host | :single
+    kind::Symbol          # :nccl | :p2p | :single  (:host is never a live path)
     comms
     devices
 end
 
+function _host_collective_error(op::AbstractString)
+    msg = string(
+        "HOST COLLECTIVE FALLBACK (", op, "): live ≥2-GPU runs require NCCL or ",
+        "P2P device collectives. Staging through the host is not a supported ",
+        "multi-GPU path and is never silent-green.")
+    @error msg
+    error(msg)
+end
+
 function build_collectives(ndev::Int)
     ndev <= 1 && return Collective(:single, nothing, nothing)
-    cuda_functional() || return Collective(:host, nothing, nothing)
-    devs = collect(CUDA.devices())[1:min(ndev, length(CUDA.devices()))]
+    cuda_functional() || _host_collective_error("setup (no CUDA)")
+    nd = length(CUDA.devices())
+    nd >= ndev || _host_collective_error("setup (need $(ndev) GPUs, found $(nd))")
+    devs = collect(CUDA.devices())[1:ndev]
     if _HAVE_NCCL[]
         try
             comms = NCCL.Communicators(devs)
@@ -1475,50 +1513,83 @@ function build_collectives(ndev::Int)
         catch e
             @warn "NCCL communicator setup failed; trying P2P" exception=e
         end
+    else
+        @warn "NCCL.jl not loaded; trying P2P (NCCL Allreduce group is the preferred path)"
     end
     pfrac = _enable_p2p!(devs)
     pfrac > 0 && return Collective(:p2p, nothing, devs)
-    @warn "NCCL/P2P unavailable — collectives will stage through the host (not the preferred path)."
-    return Collective(:host, nothing, devs)
+    _host_collective_error("setup (NCCL and P2P both unavailable)")
+end
+
+function _nccl_group(f)
+    if isdefined(NCCL, :group)
+        return NCCL.group(f)
+    elseif isdefined(NCCL, :groupStart)
+        NCCL.groupStart()
+        try
+            return f()
+        finally
+            NCCL.groupEnd()
+        end
+    end
+    error("NCCL.jl exposes no groupStart/groupEnd; refusing a naive per-rank Allreduce loop")
+end
+
+function _nccl_allreduce_sum!(buf, comm)
+    try
+        return NCCL.Allreduce!(buf, +, comm)
+    catch
+    end
+    try
+        return NCCL.Allreduce!(buf, comm; op=NCCL.sum)
+    catch
+    end
+    return NCCL.Allreduce!(buf, buf, comm)
+end
+
+function _p2p_allreduce_sum!(col::Collective, bufs)
+    n = length(bufs)
+    CUDA.device!(col.devices[1])
+    acc = copy(bufs[1])
+    for p in 2:n
+        acc .+= bufs[p]
+    end
+    for p in 1:n
+        bufs[p] .= acc
+    end
+    return nothing
 end
 
 """
-Allreduce-sum a length-1 Complex buffer that already lives on each device.
-`bufs[p]` is the in/out CuVector on device p.
+Allreduce-sum device buffers. `bufs[p]` is the in/out vector on device p.
+NCCL uses a single `group` around every rank (and every list, if grouped).
 """
 function allreduce_sum!(col::Collective, bufs)
+    return allreduce_sum_group!(col, bufs)
+end
+
+"""Group several Allreduce-sum lists (e.g. sumP, sumM, sumZ) into one NCCL group."""
+function allreduce_sum_group!(col::Collective, buf_lists...)
     col.kind === :single && return nothing
+    col.kind === :host && _host_collective_error("Allreduce")
     if col.kind === :nccl
-        for (p, buf) in enumerate(bufs)
-            CUDA.device!(col.devices[p])
-            # NCCL.jl Allreduce! on the in-place buffer (sum).
-            try
-                NCCL.Allreduce!(buf, col.comms[p]; op=NCCL.sum)
-            catch
-                NCCL.Allreduce!(buf, buf, col.comms[p])
+        _nccl_group() do
+            for bufs in buf_lists
+                for (p, buf) in enumerate(bufs)
+                    CUDA.device!(col.devices[p])
+                    _nccl_allreduce_sum!(buf, col.comms[p])
+                end
             end
         end
         return nothing
     end
     if col.kind === :p2p
-        # Ring reduce-then-broadcast via device pointers (no host).
-        n = length(bufs)
-        CUDA.device!(col.devices[1])
-        acc = copy(bufs[1])
-        for p in 2:n
-            acc .+= bufs[p]   # P2P load
-        end
-        for p in 1:n
-            bufs[p] .= acc
+        for bufs in buf_lists
+            _p2p_allreduce_sum!(col, bufs)
         end
         return nothing
     end
-    # last-resort host
-    s = sum(Array(b) for b in bufs)
-    for b in bufs
-        copyto!(b, s)
-    end
-    return nothing
+    _host_collective_error("Allreduce")
 end
 
 """
@@ -1526,15 +1597,18 @@ Allgather shards of a vector. `locals[p]` is mloc_p * width; `fulls[p]` is M*wid
 """
 function allgather_shards!(col::Collective, locals, fulls, counts, offsets, width::Int)
     col.kind === :single && (copyto!(fulls[1], locals[1]); return nothing)
+    col.kind === :host && _host_collective_error("Allgather")
     if col.kind === :nccl
         try
-            for (p, loc) in enumerate(locals)
-                CUDA.device!(col.devices[p])
-                NCCL.Allgather!(loc, fulls[p], col.comms[p])
+            _nccl_group() do
+                for (p, loc) in enumerate(locals)
+                    CUDA.device!(col.devices[p])
+                    NCCL.Allgather!(loc, fulls[p], col.comms[p])
+                end
             end
             return nothing
         catch e
-            @warn "NCCL Allgather failed; using P2P/host" exception=e
+            @error "NCCL Allgather group failed; trying on-device P2P copies (not host)" exception=e
         end
     end
     if col.kind === :p2p || col.kind === :nccl
@@ -1547,11 +1621,7 @@ function allgather_shards!(col::Collective, locals, fulls, counts, offsets, widt
         end
         return nothing
     end
-    host = vcat((Array(l) for l in locals)...)
-    for f in fulls
-        copyto!(f, host)
-    end
-    return nothing
+    _host_collective_error("Allgather")
 end
 
 # Fused 1st-order kernel (one thread per bin). Register reuse: a, g, δ, Sp, Sz.
@@ -1756,7 +1826,8 @@ function solve_1st_gpu_resident(u0, p, tspan, col, ns, counts, offsets;
     return Array(U[1]), nsteps, col.kind
 end
 
-# Order-2 GPU: small RHS once on rank 0; large kernels per shard; NCCL/P2P collectives.
+# Order-2 GPU: on-device small RHS (rank 0) + large kernels per shard;
+# NCCL Allreduce group (or P2P) of row-sums. No per-RHS host traffic.
 function _rowsum_kernel!(sumP, sumM, sumZ, large, g, M::Int, mloc::Int, lo::Int)
     j = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     j > M && return
@@ -1775,6 +1846,22 @@ function _rowsum_kernel!(sumP, sumM, sumZ, large, g, M::Int, mloc::Int, lo::Int)
         sumP[j] = accP
         sumM[j] = accM
         sumZ[j] = accZ
+    end
+    return
+end
+
+# Rank-0 small RHS on device. Same helpers as CPU `rhs2_small!`.
+function _small_rhs_kernel!(dsmall, small, sumP, sumM, sumZ, delta_b, g_b,
+                            delta0, kappa_e, kappa_i, Et, M::Int)
+    j = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    κt = kappa_e + kappa_i
+    sq = sqrt(kappa_e)
+    if j == 1
+        _small_cavity_derivs!(dsmall, small, g_b, M, delta0, κt, sq, Et)
+    end
+    if 1 <= j <= M
+        _small_bin_deriv!(dsmall, small, sumP, sumM, sumZ, j, g_b[j], delta_b[j],
+                          M, delta0, κt, sq, Et)
     end
     return
 end
@@ -1873,8 +1960,7 @@ function solve_2nd_gpu(small_h, larges_h, counts, offsets, delta0, kappa_e, kapp
         end
         function rhs_gpu!(destS, destL, srcS, srcL, tt)
             Et = ComplexF64(E_of_t(tt))
-            # small lives on rank 0; broadcast replica for large kernels only
-            C.device!(C.devices()[1])
+            # small lives on rank 0; P2P/device replica for large kernels (no D2H)
             for p in 2:ns
                 C.device!(C.devices()[p])
                 copyto!(srcS[p], srcS[1])
@@ -1884,17 +1970,13 @@ function solve_2nd_gpu(small_h, larges_h, counts, offsets, delta0, kappa_e, kapp
                 _cuda_launch_rowsum!(sumP[p], sumM[p], sumZ[p], srcL[p], gdev[p],
                                      M, counts[p], offsets[p])
             end
-            allreduce_sum!(col, sumP)
-            allreduce_sum!(col, sumM)
-            allreduce_sum!(col, sumZ)
-            # small RHS once (rank 0), O(M) host round-trip — not host rowsum of O(M²)
+            allreduce_sum_group!(col, sumP, sumM, sumZ)
+            # small RHS fully on device (rank 0). No D2H of small or rowsums.
             C.device!(C.devices()[1])
-            sh = Array(srcS[1])
-            dsh = zero(sh)
-            rhs2_small!(dsh, sh, Array(sumP[1]), Array(sumM[1]), Array(sumZ[1]),
-                        delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
-            copyto!(destS[1], dsh)
+            _cuda_launch_small!(destS[1], srcS[1], sumP[1], sumM[1], sumZ[1],
+                                ddev[1], gdev[1], delta0, kappa_e, kappa_i, Et, M)
             for p in 2:ns
+                C.device!(C.devices()[p])
                 fill!(destS[p], 0)   # do not re-integrate ȧ on other GPUs
             end
             for p in 1:ns
