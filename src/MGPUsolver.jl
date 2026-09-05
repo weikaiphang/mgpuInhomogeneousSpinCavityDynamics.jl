@@ -33,9 +33,9 @@ function assemble_problem(M::Integer,
     end
 
     comms = nothing
-    if ns > 1
+    if ns > 1 && _NCCL !== nothing
         try
-            comms = NCCL.Communicators(devs)
+            comms = _NCCL.Communicators(devs)
         catch err
             verbose && @warn "NCCL communicators unavailable; using P2P or host row-sum exchange" exception=err
             comms = nothing

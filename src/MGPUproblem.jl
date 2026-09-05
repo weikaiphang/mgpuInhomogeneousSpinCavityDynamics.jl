@@ -241,19 +241,19 @@ function _nccl_allgather_rowsums!(prob::MGPUProblem{T}, rb) where {T}
             CUDA.synchronize(s.stream)
         end
         equal = all(s -> s.mloc == shards[1].mloc, shards)
-        NCCL.group() do
+        _NCCL.group() do
             for (s, comm) in zip(shards, comms)
                 CUDA.device!(s.dev)
                 buf = rb(s)
                 if equal
                     nloc = 3 * s.mloc
                     send = view(buf, 3 * s.joff + 1 : 3 * s.joff + nloc)
-                    NCCL.Allgather!(send, buf, comm)
+                    _NCCL.Allgather!(send, buf, comm)
                 else
                     s.nccl_send === nothing && error("padded NCCL buffers missing")
                     nloc = 3 * s.mloc
                     copyto!(s.nccl_send, 1, buf, 3 * s.joff + 1, nloc)
-                    NCCL.Allgather!(s.nccl_send, s.nccl_recv, comm)
+                    _NCCL.Allgather!(s.nccl_send, s.nccl_recv, comm)
                 end
             end
         end

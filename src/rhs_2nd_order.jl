@@ -11,7 +11,7 @@ end
 
 function _rhs2_workspace(u, M)
     CT = eltype(u)
-    alloc = u isa CuArray ? (n -> CUDA.zeros(CT, n)) : (n -> zeros(CT, n))
+    alloc = u isa Array ? (n -> zeros(CT, n)) : (n -> CUDA.zeros(CT, n))
     return RHS2Workspace(alloc(M), alloc(M), alloc(M), alloc(M), alloc(M), alloc(M))
 end
 
@@ -21,7 +21,8 @@ function rhs_2nd_order!(du, u, p, t)
     E_t = E_of_t(t)
 
     # CPU / Array path: same equations as MGPUrhs_cpu! (parity tests).
-    if !(u isa CuArray)
+    # Dispatch on Array so this file can be tested without CUDA loaded.
+    if u isa Array
         T = real(eltype(u))
         return rhs_cpu!(du, u, T(delta0), T(kappa_e), T(kappa_i),
                         delta_b_gpu, g_b_gpu, Complex{T}(E_t))

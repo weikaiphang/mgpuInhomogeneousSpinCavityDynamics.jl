@@ -7,11 +7,19 @@ using Distributions
 using ForwardDiff
 using JLD2
 using LinearAlgebra
-using NCCL
 using Plots
 using Printf
 using QuadGK
 using Random
+
+# NCCL.jl / NCCL_jll need a working libnccl. Keep the package loadable
+# on CPU-only hosts; multi-GPU then falls back to P2P or host staging.
+const _NCCL = try
+    Base.require(Base.PkgId(
+        Base.UUID("3fe64909-d7a1-4096-9b7d-7a0f12cf0f6b"), "NCCL"))
+catch
+    nothing
+end
 
 include("config.jl")
 include("frequency_inhomogeneity.jl")
