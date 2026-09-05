@@ -44,9 +44,12 @@ function rhs_2nd_order!(du, u, p, t)
 
 
 
-    sumgSpSp_jk = SpSp_same .* g_b_gpu .+ SpSp_cross * g_b_gpu
-    sumgSmSp_jk = SmSp_same .* g_b_gpu .+ SmSp_cross * g_b_gpu
-    sumgSzSp_jk = SzSp_same .* g_b_gpu .+ SzSp_cross * g_b_gpu
+    # Same-bin moments live in *_same, not on the cross-block diagonal
+    # (diag_mask = .!I). The MGPU kernels skip k == j in the row-sum;
+    # the monolith must do the same or custom / random states diverge.
+    sumgSpSp_jk = SpSp_same .* g_b_gpu .+ (SpSp_cross .* diag_mask) * g_b_gpu
+    sumgSmSp_jk = SmSp_same .* g_b_gpu .+ (SmSp_cross .* diag_mask) * g_b_gpu
+    sumgSzSp_jk = SzSp_same .* g_b_gpu .+ (SzSp_cross .* diag_mask) * g_b_gpu
 
     dadSp .= (
     1im * delta0 .* adSp .+ 1im .* delta_b_gpu .* adSp .+ 1im .* sumgSpSp_jk

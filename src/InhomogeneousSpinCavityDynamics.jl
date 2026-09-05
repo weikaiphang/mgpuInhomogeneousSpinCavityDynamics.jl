@@ -83,6 +83,8 @@ export product_state_samebin, build_u0_2nd_order
 export mgpu_run_simulation
 export mgpu_run_sim_2nd_order
 export assemble_problem
+export choose_rowsum_exchange, assemble_rowsums!
+export assemble_rowsums_nccl!, assemble_rowsums_p2p!, assemble_rowsums_host!
 export free_shards!
 export set_initial_condition!
 export scatter_state!, gather_state

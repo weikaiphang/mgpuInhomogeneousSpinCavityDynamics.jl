@@ -13,7 +13,8 @@ function assemble_problem(M::Integer,
                           rtol::Real = 1e-8,
                           threaded::Union{Nothing,Bool} = nothing,
                           T::Type = Float64,
-                          verbose::Bool = true)
+                          verbose::Bool = true,
+                          exchange::Symbol = :auto)
 
     length(delta_b) == M || error("length(delta_b) = $(length(delta_b)) ≠ M = $M.")
     length(g_b)     == M || error("length(g_b) = $(length(g_b)) ≠ M = $M.")
@@ -25,11 +26,7 @@ function assemble_problem(M::Integer,
     exec = Executor(ns; threaded = threaded)
     nreg = register_count(integrator)
 
-    pfrac = enable_peer_access!(devs)
-    if ns > 1 && pfrac < 1 && verbose
-        @warn "Peer-to-peer access is not available on every GPU pair; " *
-              "the O(M) row-sum exchange will stage through the host." pfrac
-    end
+    enable_peer_access!(devs)
 
     if verbose
         println("Assembling $ns shard(s) over M = $M ensemble bins:")
@@ -54,41 +51,79 @@ function assemble_problem(M::Integer,
         rethrow()
     end
 
-    comms, exchange = _setup_rowsum_exchange(devs, ns, verbose)
+    comms, ex = _setup_rowsum_exchange(devs, ns, verbose; exchange = exchange)
 
     return MGPUProblem{T,typeof(E_of_t)}(
         Int(M), part, shards, exec, nreg,
         T(delta0), T(kappa_e), T(kappa_e + kappa_i), T(sqrt(kappa_e)),
         E_of_t, T(atol), T(rtol), Ref(0), Ref(0), hostbuf,
-        comms, exchange,
+        comms, ex,
     )
 end
 
-function _setup_rowsum_exchange(devs, ns::Int, verbose::Bool)
+function _force_rowsum_exchange(devs, ns::Int, exchange::Symbol, verbose::Bool)
+    ns <= 1 && return nothing, :none
+    if exchange === :nccl
+        HAVE_NCCL || error("exchange = :nccl requested but NCCL.jl is not available.")
+        comms = NCCL.Communicators(devs)
+        verbose && println("Row-sum exchange: NCCL Allreduce (forced).")
+        return comms, :nccl
+    elseif exchange === :p2p
+        enable_peer_access!(devs)
+        verbose && println("Row-sum exchange: CUDA peer copies (forced).")
+        return nothing, :p2p
+    elseif exchange === :host
+        verbose && println("Row-sum exchange: host staging (forced).")
+        return nothing, :host
+    elseif exchange === :none
+        return nothing, :none
+    else
+        error("Unknown exchange = $(exchange). Use :auto, :nccl, :p2p, :host, or :none.")
+    end
+end
+
+function _setup_rowsum_exchange(devs, ns::Int, verbose::Bool;
+                                exchange::Symbol = :auto)
+    if exchange !== :auto
+        return _force_rowsum_exchange(devs, ns, exchange, verbose)
+    end
+
     ns <= 1 && return nothing, :none
 
+    nccl_ok = false
+    comms = nothing
     if HAVE_NCCL && length(unique(devs)) == ns
         try
             comms = NCCL.Communicators(devs)
-            verbose && println("Row-sum exchange: NCCL Allreduce (device-side, no host staging).")
-            return comms, :nccl
+            nccl_ok = true
         catch err
             verbose && @warn "NCCL communicator setup failed; trying P2P." err
         end
     end
 
-    if try
-            pfrac = enable_peer_access!(devs)
-            pfrac >= 1
-        catch
-            false
-        end
-        verbose && println("Row-sum exchange: CUDA peer copies (no host staging).")
-        return nothing, :p2p
+    p2p_ok = try
+        enable_peer_access!(devs) >= 1
+    catch
+        false
     end
 
-    verbose && @warn "Row-sum exchange falling back to host staging."
-    return nothing, :host
+    mode = choose_rowsum_exchange(ns;
+        have_nccl = HAVE_NCCL,
+        nunique_devices = length(unique(devs)),
+        nccl_ok = nccl_ok,
+        p2p_ok = p2p_ok,
+    )
+
+    if mode === :nccl
+        verbose && println("Row-sum exchange: NCCL Allreduce (device-side, no host staging).")
+        return comms, :nccl
+    elseif mode === :p2p
+        verbose && println("Row-sum exchange: CUDA peer copies (no host staging).")
+        return nothing, :p2p
+    else
+        verbose && @warn "Row-sum exchange falling back to host staging."
+        return nothing, :host
+    end
 end
 
 
@@ -105,7 +140,8 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
                            dtmax::Real = Inf,
                            maxiters::Int = 10_000_000,
                            verbose::Bool = true,
-                           clean_gpu::Bool = true)
+                           clean_gpu::Bool = true,
+                           exchange = UNSET)
 
     CONFIG = mgpu_build_full_config(SIM_SETTING, SYSTEM_CONFIG)
     validate_config(CONFIG)
@@ -117,6 +153,7 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
     smode     = pick(SIM_SETTING, :save_mode, save_mode, :tstops)
     s_spins   = pick(SIM_SETTING, :save_spins, save_spins, true)
     th_kw     = pick(SIM_SETTING, :threaded, threaded, nothing)
+    ex_kw     = pick(SIM_SETTING, :exchange, exchange, :auto)
 
     mkpath(dirname(CONFIG.saved_file_name))
 
@@ -131,7 +168,7 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
         M, d.delta_b, d.g_b, d.Nj, E_of_t, d.delta0, d.kappa_e, d.kappa_i;
         nshards = ns_kw, device_ids = dev_kw, integrator = integ,
         atol = CONFIG.abstol, rtol = CONFIG.reltol, threaded = th_kw, T = T,
-        verbose = verbose,
+        verbose = verbose, exchange = ex_kw,
     )
 
 
