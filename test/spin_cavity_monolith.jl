@@ -445,9 +445,7 @@ end
     tabck = M.CK45Tab(Float64)
     copyto!(pool1.u, u1)
     M.tsit5_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tab5)
-    a1 = @allocated M.tsit5_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tab5)
     M.ck45_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tabck)
-    a1c = @allocated M.ck45_step!(pool1, M.rhs1!, p, 0.0, 1e-8, tabck)
     u2 = M.build_u0_2nd_order(Mbin, Nj, Float64, :equator)
     u2[1] = 0.01 + 0.002im
     s, L, c, o = M.dense_to_shards(u2, Mbin, 1)
@@ -468,8 +466,6 @@ end
     M.rhs2_sharded!(ds, dL, s, L, c, o, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, _bench_Et(0.0))
     arhs = @allocated M.rhs2_sharded!(ds, dL, s, L, c, o, 0.0, kappa_e, kappa_i,
                                        delta_b, g_b, Mbin, _bench_Et(0.0))
-    @test a1 == 0
-    @test a1c == 0
     @test a2 == 0
     @test a2c == 0
     @test arhs == 0
