@@ -19,6 +19,15 @@ for (pred, rel) in (
     pred && include(joinpath(_PHYS_SRC, rel))
 end
 
+if !isdefined(@__MODULE__, :compute_output_mode_noise)
+    using CUDA
+    include(joinpath(_PHYS_SRC, "noise.jl"))
+end
+if !isdefined(@__MODULE__, :_direct_product_curve)
+    isdefined(@__MODULE__, :CUDA) || eval(:(using CUDA))
+    include(joinpath(_PHYS_SRC, "correlations.jl"))
+end
+
 if !isdefined(@__MODULE__, :_WEAK_SEED)
     const _WEAK_SEED = 1.0e-3
 end
@@ -728,6 +737,40 @@ end
     @test !occursin("stepper! = _tsit5_step_one_gpu!", corr)
     @test !occursin("stepper! = _rk4_step_one_gpu!", corr)
     @test occursin("jacobian = QRT_PRODUCT", corr)
+end
+
+@testset "paper APIs invoke product QRT at runtime" begin
+    M = 2
+    Nt = 6
+    t = collect(range(0.0, 1.0; length = Nt))
+    a = fill(0.1 + 0.0im, Nt)
+    n = fill(0.05, Nt)
+    adad = fill(0.01 + 0im, Nt)
+    Sp = fill(0.2 + 0im, M, Nt)
+    Sz = fill(-2.0, M, Nt)
+    adSp = fill(0.01 + 0im, M, Nt)
+    adSm = fill(0.01 + 0im, M, Nt)
+    adSz = fill(-0.02 + 0im, M, Nt)
+    Nj = fill(4.0, M)
+    d = NoiseSimulationData(
+        "runtime-smoke", t, a, n, adad, Sp, Sz, adSp, adSm, adSz,
+        2, 1, M, 0.0, [-0.1, 0.1], [0.12, 0.12], 1.5, 0.25, 1.75, Nj,
+    )
+    r = compute_output_mode_noise(d, 0.5, 1.0; Nkeep = 6, batch_size = 2)
+    @info "paper compute_output_mode_noise" jacobian = r.jacobian EdE = r.EdE
+    @test r.jacobian === QRT_PRODUCT
+    @test r.jacobian === :star_samebin_cavity
+    @test isfinite(r.EdE)
+
+    ws = CorrelationWorkspace(
+        "runtime-smoke", t, a, ComplexF64.(n), adad, Sp, Sz, adSp, adSm, adSz,
+        fill(1.5, Nt), fill(1.75, Nt), M, [-0.1, 0.1], [0.12, 0.12], 0.0, Nj,
+    )
+    Cxx, Cpp, Cadaga, Cadagadag = _direct_product_curve(2, [2, 3, 4], ws; stepper = :rk4)
+    @info "paper _direct_product_curve" Cadaga = Cadaga
+    @test length(Cadaga) == 3
+    @test all(isfinite, real.(Cadaga))
+    @test_throws ErrorException _direct_gpu_curve(2, [2], ws, nothing, nothing, nothing, nothing; stepper! = identity)
 end
 
 
