@@ -192,7 +192,7 @@ end
     @test state_length_2nd_order(M) == 3 + 9M + 4M*M
     @test global_state_length(M) == 3 + 9M + 4M*M
     @test small_length(M) == 3 + 9M
-    @test large_length(M, 2) == 5 * M * 2
+    @test large_length(M, 2) == 3 * M * 2
     @test shard_length(M, 2) == small_length(M) + large_length(M, 2)
 end
 
@@ -322,7 +322,7 @@ function _stress_scatter(u_full, part::EnsemblePartition)
         mloc = part.counts[p]
         joff = part.offsets[p]
         lo = nsmall
-        n = shard_length(M, mloc)
+        n = small_length(M) + 5 * M * mloc
         u = zeros(ComplexF64, n)
         u[1:nsmall] .= u_full[1:nsmall]
         bs = M * mloc
@@ -922,6 +922,60 @@ end
         rhs_cpu!(du_cpu, u, delta0, ke, ki, delta, g, Et)
         @test du_cpu ≈ du2 rtol=1e-13 atol=1e-13
         @test all(isfinite, du2)
+    end
+end
+
+@testset "hardware inventory (honest multi-GPU gate)" begin
+    ndev = try
+        CUDA.functional() ? length(collect(CUDA.devices())) : 0
+    catch
+        0
+    end
+    @test ndev >= 0
+    if ndev < 2
+        @test_skip "≥2 CUDA devices required for live NCCL Allreduce / P2P / device row-sums; this worker has $ndev"
+    end
+end
+
+@testset "production sharded RHS matches monolith rhs_2nd_order!" begin
+    cases = (
+        (3, PHYS_NJ, :ground),
+        (3, PHYS_NJ, :equator),
+        (3, PHYS_NJ, :weak),
+        (1, [5.0], :ground),
+        (5, [1.0, 2.0, 0.5, 8.0, 3.0], :equator),
+        (7, collect(1.0:7.0), :weak),
+    )
+    for (M, Nj, kind) in cases
+        delta, g, ke, ki, Et, delta0 = _stress_phys_p(M, Nj)
+        u = build_u0_2nd_order(M, Nj, kind)
+        du_mono = _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+        mask = ComplexF64.(.!Matrix(I, M, M))
+        p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
+        shard_counts = unique(filter(ns -> 1 <= ns <= M, (1, 2, 3, M)))
+        for ns in shard_counts
+            part = EnsemblePartition(M, ns)
+            modes = ns == 1 ? (:none,) : (:nccl, :p2p, :host)
+            for mode in modes
+                du = zero(u)
+                rhs_2nd_order_sharded!(du, u, p, 0.0, part, mode)
+                @test du ≈ du_mono rtol=1e-12 atol=1e-12
+                @test all(isfinite, du)
+            end
+        end
+    end
+
+    rng = MersenneTwister(2711)
+    for M in (3, 5, 8)
+        delta, g, ke, ki, Et, delta0 = _stress_phys_p(M, ones(M))
+        u = randn(rng, ComplexF64, state_length_2nd_order(M))
+        du_mono = _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+        mask = ComplexF64.(.!Matrix(I, M, M))
+        p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
+        part = EnsemblePartition(M, min(3, M))
+        du = zero(u)
+        rhs_2nd_order_sharded!(du, u, p, 0.0, part, :host)
+        @test du ≈ du_mono rtol=1e-11 atol=1e-11
     end
 end
 

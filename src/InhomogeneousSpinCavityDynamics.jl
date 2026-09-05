@@ -64,8 +64,7 @@ export assemble_rowsums_nccl!, assemble_rowsums_p2p!, assemble_rowsums_host!
 export free_shards!
 export set_initial_condition!
 export scatter_state!, gather_state
-export rhs!, rhs_cpu!
-export solve_mgpu!
+export rhs_cpu!, rhs_2nd_order_sharded!, rhs_2nd_order_mgpu!
 export memory_report, max_bins, EnsemblePartition
 export SolverOptions, ObservableStore
 

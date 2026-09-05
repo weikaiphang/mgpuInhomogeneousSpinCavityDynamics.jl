@@ -15,24 +15,22 @@ const F_SmSp_s = 8
 const F_SzSz_s = 9
 const NSMALLFIELD = 9
 
-# Large blocks are local columns only. B_SzSpT is an explicit transpose
-# copy of SzSp for coalesced reads; it is not an extra physical DOF.
+# Row-sum shards store local columns of the three cross blocks that
+# enter the 3M Allreduce (SpSp, SmSp, SzSp). No SzSpT transpose copy —
+# that existed only for the deleted fused RHS kernel.
 const B_SpSp  = 1
-const B_SzSp  = 2
-const B_SzSpT = 3
-const B_SmSp  = 4
-const B_SzSz  = 5
-const NBLOCK  = 5
+const B_SmSp  = 2
+const B_SzSp  = 3
+const NROWSUM_BLOCK = 3
 
 @inline small_offset(M::Integer, f::Integer) = NSCALAR + (f - 1) * M
 @inline small_range(M::Integer, f::Integer) =
     (small_offset(M, f) + 1):(small_offset(M, f) + M)
 
-# shard_length = small_length + large_length
-# small_length = 3 + 9M  (full small state, replicated on every GPU)
-# large_length = 5 * M * mloc  (local columns of the four cross blocks + SzSpT)
+# Logical small prefix (3 + 9M) of the monolith state. Multi-GPU no
+# longer keeps a private register file; OrdinaryDiffEq holds one u.
 small_length(M::Integer) = NSCALAR + NSMALLFIELD * M
-large_length(M::Integer, mloc::Integer) = NBLOCK * M * mloc
+large_length(M::Integer, mloc::Integer) = NROWSUM_BLOCK * M * mloc
 shard_length(M::Integer, mloc::Integer) = small_length(M) + large_length(M, mloc)
 
 
@@ -78,35 +76,23 @@ Base.getindex(part::EnsemblePartition, p::Integer) =
 
 
 
-function register_count(integrator::Symbol)
-    if integrator === :tsit5
-
-        return 9
-    elseif integrator === :ck45
-
-        return 5
-    else
-        error("Unknown integrator = $(integrator). Use :tsit5 or :ck45.")
-    end
-end
-
-
-function shard_bytes(M::Integer, mloc::Integer, integrator::Symbol, ::Type{T}) where {T}
+# Workspace only: local columns of 3 cross blocks + 3M row-sum buffer.
+# OrdinaryDiffEq owns the assembled 3+9M+4M² state (one copy).
+function shard_bytes(M::Integer, mloc::Integer, ::Type{T}) where {T}
     elt = sizeof(Complex{T})
-    state = shard_length(M, mloc) * elt
-    regs  = register_count(integrator) * state
-
-    scratch = (2 * 3 * M + 3 * 8 * mloc + 3 + save_prefix_length(M)) * elt
-    consts  = 2 * M * sizeof(T)
-    return regs + scratch + consts
+    cols = large_length(M, mloc) * elt
+    rowsum = 2 * 3 * M * elt
+    scratch = (3 * 8 * mloc + 3) * elt
+    consts = 2 * M * sizeof(T)
+    return cols + rowsum + scratch + consts
 end
 
 
-function memory_report(M::Integer, ns::Integer; integrator::Symbol = :tsit5,
-                       T::Type = Float64)
+function memory_report(M::Integer, ns::Integer; T::Type = Float64)
     part = EnsemblePartition(M, ns)
     mloc = maximum(part.counts)
-    per = shard_bytes(M, mloc, integrator, T)
+    per = shard_bytes(M, mloc, T)
+    assembled = global_state_length(M) * sizeof(Complex{T})
 
     gib(x) = x / 2^30
 
@@ -115,25 +101,25 @@ function memory_report(M::Integer, ns::Integer; integrator::Symbol = :tsit5,
     println(io, "Shards (GPUs)              : $ns")
     println(io, "Bins per shard (max)       : $mloc")
     println(io, "Element type               : Complex{$T}")
-    println(io, "Integrator                 : $integrator ($(register_count(integrator)) registers)")
-    println(io, "State per shard            : $(round(gib(shard_length(M, mloc)*sizeof(Complex{T})), digits=3)) GiB")
-    println(io, "Device memory per shard    : $(round(gib(per), digits=3)) GiB")
-    println(io, "Device memory total        : $(round(gib(per*ns), digits=3)) GiB")
+    println(io, "Stepper                    : OrdinaryDiffEq Tsit5 (one assembled VF)")
+    println(io, "Assembled state            : $(round(gib(assembled), digits=3)) GiB")
+    println(io, "Row-sum workspace / shard  : $(round(gib(per), digits=3)) GiB")
+    println(io, "Device workspace total     : $(round(gib(per * ns), digits=3)) GiB")
     return String(take!(io))
 end
 
 
-function max_bins(bytes_per_gpu::Real, ns::Integer; integrator::Symbol = :tsit5,
+function max_bins(bytes_per_gpu::Real, ns::Integer;
                   T::Type = Float64, safety::Real = 0.85)
     budget = safety * bytes_per_gpu
     lo, hi = 1, 1
-    while hi < 10^7 && shard_bytes(hi, cld(hi, ns), integrator, T) < budget
+    while hi < 10^7 && shard_bytes(hi, cld(hi, ns), T) < budget
         lo = hi
         hi *= 2
     end
     while lo < hi
         mid = (lo + hi + 1) ÷ 2
-        if shard_bytes(mid, cld(mid, ns), integrator, T) < budget
+        if shard_bytes(mid, cld(mid, ns), T) < budget
             lo = mid
         else
             hi = mid - 1

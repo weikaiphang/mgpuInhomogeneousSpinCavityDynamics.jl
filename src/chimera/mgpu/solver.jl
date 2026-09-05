@@ -1,5 +1,16 @@
-# Production multi-GPU API. Row-sum exchange defaults to NCCL Allreduce
-# (device collectives). P2P then host are fallbacks only.
+# Production multi-GPU API. OrdinaryDiffEq steps one assembled VF.
+# Multi-GPU only shards correlator columns and Allreduces the 3M row-sums
+# (NCCL default; P2P then host fallbacks).
+
+Base.@kwdef struct SolverOptions{T}
+    reltol::T = T(1e-8)
+    abstol::T = T(1e-8)
+    dtmax::T = T(Inf)
+    dt0::T = T(0)
+    maxiters::Int = 10_000_000
+    verbose::Bool = true
+    progress_every::Int = 0
+end
 
 function assemble_problem(M::Integer,
                           delta_b::AbstractVector,
@@ -20,45 +31,59 @@ function assemble_problem(M::Integer,
     length(delta_b) == M || error("length(delta_b) = $(length(delta_b)) ≠ M = $M.")
     length(g_b)     == M || error("length(g_b) = $(length(g_b)) ≠ M = $M.")
     length(Nj)      == M || error("length(Nj) = $(length(Nj)) ≠ M = $M.")
+    integrator === :tsit5 || integrator === :sciml || integrator === :ordinarydiffeq ||
+        error("Unknown integrator = $(integrator). Production stepper is OrdinaryDiffEq Tsit5.")
 
-    devs = resolve_devices(nshards, device_ids)
-    ns = length(devs)
+    use_gpu = cuda_available()
+    ns_req = nshards === nothing ? nothing : Int(nshards)
+
+    if use_gpu
+        devs = resolve_devices(ns_req, device_ids)
+        ns = length(devs)
+        part = EnsemblePartition(M, ns)
+        exec = Executor(ns; threaded = threaded)
+        enable_peer_access!(devs)
+
+        if verbose
+            println("Assembling $ns shard(s) over M = $M ensemble bins:")
+            print(device_summary(devs))
+            println(memory_report(M, ns; T = T))
+        end
+
+        shards = build_shards(T, M, part, devs, g_b)
+        hostbuf = try
+            CUDA.device!(devs[1])
+            CUDA.pin(Vector{Complex{T}}(undef, 3M))
+        catch
+            free_shards!(shards)
+            rethrow()
+        end
+        comms, ex = _setup_rowsum_exchange(devs, ns, verbose; exchange = exchange)
+        return MGPUProblem{T,typeof(E_of_t)}(
+            Int(M), part, shards, exec,
+            T(delta0), T(kappa_e), T(kappa_i), E_of_t,
+            collect(T.(delta_b)), collect(T.(g_b)),
+            hostbuf, comms, ex, Ref(0),
+        )
+    end
+
+    ns = ns_req === nothing ? 1 : ns_req
     part = EnsemblePartition(M, ns)
-    exec = Executor(ns; threaded = threaded)
-    nreg = register_count(integrator)
-
-    enable_peer_access!(devs)
-
-    if verbose
-        println("Assembling $ns shard(s) over M = $M ensemble bins:")
-        print(device_summary(devs))
-        println(memory_report(M, ns; integrator = integrator, T = T))
+    ex = if ns <= 1
+        :none
+    elseif exchange === :auto
+        :host
+    else
+        exchange
     end
-
-    shards = build_shards(T, M, part, devs, delta_b, g_b, Nj, nreg)
-
-
-
-
-
-    local hostbuf
-    try
-        CUDA.device!(devs[1])
-        hostbuf = CUDA.pin(Vector{Complex{T}}(undef, 3M))
-    catch
-
-
-        free_shards!(shards)
-        rethrow()
-    end
-
-    comms, ex = _setup_rowsum_exchange(devs, ns, verbose; exchange = exchange)
-
+    verbose && println(memory_report(M, ns; T = T))
+    verbose && ns > 1 && println("Row-sum exchange: CPU stand-in ($ex).")
     return MGPUProblem{T,typeof(E_of_t)}(
-        Int(M), part, shards, exec, nreg,
-        T(delta0), T(kappa_e), T(kappa_e + kappa_i), T(sqrt(kappa_e)),
-        E_of_t, T(atol), T(rtol), Ref(0), Ref(0), hostbuf,
-        comms, ex,
+        Int(M), part, Shard{T}[], Executor(1; threaded = false),
+        T(delta0), T(kappa_e), T(kappa_i), E_of_t,
+        collect(T.(delta_b)), collect(T.(g_b)),
+        Vector{Complex{T}}(undef, 3M),
+        nothing, ex, Ref(0),
     )
 end
 
@@ -128,7 +153,6 @@ function _setup_rowsum_exchange(devs, ns::Int, verbose::Bool;
 end
 
 
-
 function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
                            nshards = UNSET,
                            device_ids = UNSET,
@@ -151,10 +175,11 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
     ns_kw     = pick(SIM_SETTING, :nshards, nshards, nothing)
     dev_kw    = pick(SIM_SETTING, :device_ids, device_ids, nothing)
     integ     = pick(SIM_SETTING, :integrator, integrator, :tsit5)
-    smode     = pick(SIM_SETTING, :save_mode, save_mode, :tstops)
     s_spins   = pick(SIM_SETTING, :save_spins, save_spins, true)
     th_kw     = pick(SIM_SETTING, :threaded, threaded, nothing)
     ex_kw     = pick(SIM_SETTING, :exchange, exchange, :auto)
+    integ === :tsit5 || integ === :sciml || integ === :ordinarydiffeq ||
+        error("Unknown integrator = $(integ). Production stepper is OrdinaryDiffEq Tsit5.")
 
     mkpath(dirname(CONFIG.saved_file_name))
 
@@ -167,31 +192,26 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
     T = Float64
     prob = assemble_problem(
         M, d.delta_b, d.g_b, d.Nj, E_of_t, d.delta0, d.kappa_e, d.kappa_i;
-        nshards = ns_kw, device_ids = dev_kw, integrator = integ,
+        nshards = ns_kw, device_ids = dev_kw,
         atol = CONFIG.abstol, rtol = CONFIG.reltol, threaded = th_kw, T = T,
         verbose = verbose, exchange = ex_kw,
     )
 
-
-
-
-
-
-
-
-
-
-
-
-
     data = try
-        set_initial_condition!(prob, d.Nj, kind)
+        u0 = set_initial_condition!(prob, d.Nj, kind)
+        if !isempty(prob.shards) && cuda_available()
+            u0 = CuArray(u0)
+        end
 
         store = ObservableStore(T, M, Nt; save_spins = s_spins)
+        kref = Ref(0)
+        function affect!(integrator)
+            kref[] += 1
+            record!(store, integrator.u, kref[], integrator.t)
+        end
+        cb = PresetTimeCallback(d.t_save, affect!; save_positions = (false, false))
 
         opts = SolverOptions{T}(
-            integrator = integ,
-            save_mode = smode,
             reltol = T(CONFIG.reltol),
             abstol = T(CONFIG.abstol),
             dtmax = T(dtmax),
@@ -201,20 +221,26 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
             progress_every = progress_every,
         )
 
-        verbose && println("Integrating with $(integ), save_mode = $(smode)...")
+        verbose && println("Integrating with OrdinaryDiffEq Tsit5 ",
+                           "(shards = $(nshards(prob)), exchange = $(prob.exchange))...")
 
-        stats = solve_mgpu!(prob, d.timespan[1], d.timespan[2], d.t_save,
-                            (k, t, ireg) -> record!(store, prob, ireg, k, t),
-                            opts)
+        ode = chimera_ode_problem(rhs_2nd_order_mgpu!, u0, d.timespan, prob)
+        t0 = time_ns()
+        sol = chimera_solve(ode;
+            reltol = opts.reltol,
+            abstol = opts.abstol,
+            callback = cb,
+            dtmax = opts.dtmax > 0 && isfinite(opts.dtmax) ? opts.dtmax : typemax(T),
+            maxiters = opts.maxiters,
+        )
+        elapsed = (time_ns() - t0) / 1e9
 
         nsave = store.saved[]
         verbose && begin
             println("Callback saved $nsave / $Nt requested time points")
-            println("Time taken: $(stats.elapsed) seconds")
-            println("  accepted steps : $(stats.naccept)")
-            println("  rejected steps : $(stats.nreject)")
-            println("  RHS evaluations: $(stats.nrhs)")
-            println("  dt range       : $(stats.dtmin_used) … $(stats.dtmax_used)")
+            println("Time taken: $elapsed seconds")
+            println("  RHS evaluations: $(prob.nrhs[])")
+            println("  SciML retcode  : $(sol.retcode)")
         end
         nsave > 0 || error("Order-2 MGPU callback saved 0 of $Nt requested time points.")
         if nsave != Nt
@@ -245,23 +271,21 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
             g_b_1d = d.g_b_1d,
             Nj_2d = d.Nj_2d,
             N_total = d.N_total,
-            elapsed_seconds = stats.elapsed,
-            solver_stats = stats,
-            nshards = length(prob.shards),
+            elapsed_seconds = elapsed,
+            solver_stats = (nrhs = prob.nrhs[], retcode = sol.retcode, elapsed = elapsed),
+            nshards = nshards(prob),
             partition = prob.part,
             n_saved = nsave,
             n_requested = Nt,
             rowsum_exchange = prob.exchange,
         )
     finally
-        if clean_gpu
+        if clean_gpu && !isempty(prob.shards)
             verbose && println("Cleaning GPU memory...")
             free_shards!(prob.shards)
             verbose && println("GPU memory cleanup finished.")
         end
     end
-
-
 
     filename = CONFIG.saved_file_name
     save_run_data(filename, data)
@@ -275,14 +299,10 @@ function mgpu_run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...
     SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, order)
     if order in (:first_order, :order1, :first, 1)
         println("Start running 1st-order cumulant spin-cavity simulation...")
-
-
-
-
         kw1 = haskey(kwargs, :clean_gpu) ? (clean_gpu = kwargs[:clean_gpu],) : NamedTuple()
         return run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kw1...)
     elseif order in (:second_order, :order2, :second, 2)
-        println("Start running 2nd-order cumulant spin-cavity simulation (multi-GPU)...")
+        println("Start running 2nd-order cumulant spin-cavity simulation (multi-GPU / SciML)...")
         return mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...)
     else
         error("Unknown simulation_order = $(order). Use :order1 or :order2.")
