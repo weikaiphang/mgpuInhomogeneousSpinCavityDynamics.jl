@@ -828,7 +828,7 @@ end
         rhs_cpu!(du_cpu, u, delta0, ke, ki, delta, g, Et)
         @test du_cpu ≈ du_mono rtol=1e-13 atol=1e-13
 
-        shard_counts = unique(vcat(1, 2, min(3, M), min(5, M), M))
+        shard_counts = unique(filter(ns -> 1 <= ns <= M, (1, 2, 3, 5, M)))
         dus = Dict{Tuple{Int,Symbol},Vector{ComplexF64}}()
         for ns in shard_counts
             part = EnsemblePartition(M, ns)
