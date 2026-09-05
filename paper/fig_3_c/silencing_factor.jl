@@ -158,7 +158,7 @@ SYSTEM_CONFIG_BASE = (
         mean = 2 * pi * 100,
         std  = 2 * pi * 1,
         span_sigma = 3.0,
-        renormalize = true,
+        renormalize = PAPER_G_RENORMALIZE,
     ),
 )
 print_cooperativity_honesty(SYSTEM_CONFIG_BASE)

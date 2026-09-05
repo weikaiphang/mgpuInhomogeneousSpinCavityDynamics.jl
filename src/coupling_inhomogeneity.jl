@@ -9,6 +9,47 @@ function coupling_renormalize_enabled(g_inhomogeneity)
     end
 end
 
+# Paper convention (tip 3): truncated g meshes keep native mass
+# (renormalize=false), matching frequency honesty (span_gamma=2.5,
+# renormalize=false). Constant g has mass 1 either way. ⟨g²⟩, C_eff,
+# and ARP Ω_rms all see that mesh. fig_3_c / fig_4_c / fig_4_d / rose
+# / 3ARP must use this flag — do not silently switch one figure.
+const PAPER_G_RENORMALIZE = false
+
+# RMS coupling for drive ↔ Rabi. Bin-wise
+#   Ω_j = 4 g_j √κ_e / κ_t · |E|
+# so Ω_rms = √⟨Ω_j²⟩ = 4 √⟨g²⟩ √κ_e / κ_t · |E|.
+# Targeting Ω(⟨g⟩) instead of Ω_rms can fake F≈0/1 when g is
+# inhomogeneous. Mean-g-only is not the paper ARP path.
+function coupling_rms(g2_avg::Real)
+    g2 = Float64(g2_avg)
+    g2 > 0 || error("coupling_rms: g2_avg must be positive, got $g2_avg.")
+    return sqrt(g2)
+end
+
+function coupling_rms(d)
+    hasproperty(d, :g2_avg) || error(
+        "coupling_rms: no g2_avg (pass prepare_derived output, not bare SYSTEM_CONFIG)."
+    )
+    return coupling_rms(d.g2_avg)
+end
+
+function arp_amp_scale(kappa_e::Real, kappa_t::Real, g_rms::Real)
+    ke = Float64(kappa_e)
+    kt = Float64(kappa_t)
+    g = Float64(g_rms)
+    (ke > 0 && kt > 0 && g > 0) || error(
+        "arp_amp_scale: need positive kappa_e, kappa_t, g_rms (got $ke, $kt, $g)."
+    )
+    return kt / (4 * g * sqrt(ke))
+end
+
+function arp_drive_amplitude(kappa_e::Real, kappa_t::Real, g2_avg::Real, Omega_target::Real)
+    Ω = Float64(Omega_target)
+    Ω > 0 || error("arp_drive_amplitude: Omega_target must be positive, got $Omega_target.")
+    return arp_amp_scale(kappa_e, kappa_t, coupling_rms(g2_avg)) * Ω
+end
+
 
 function maybe_renormalize_coupling_probs!(p_g, g_inhomogeneity)
     if coupling_renormalize_enabled(g_inhomogeneity)

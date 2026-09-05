@@ -773,4 +773,73 @@ end
     @test_throws ErrorException _direct_gpu_curve(2, [2], ws, nothing, nothing, nothing, nothing; stepper! = identity)
 end
 
+# ---------------------------------------------------------------------------
+# Tip (3): ARP Ω from √⟨g²⟩; paper g.renormalize locked.
+# ---------------------------------------------------------------------------
+@testset "ARP Ω uses √⟨g²⟩ not mean g" begin
+    @test PAPER_G_RENORMALIZE === false
+    g_const = (kind = :constant, g_value = 2π * 100)
+    _, _, _, _, _, g2c, _ = build_constant_coupling_bins(g_const, 1)
+    @test coupling_rms(g2c) ≈ 2π * 100
+    ke = 2π * 1e6
+    kt = ke
+    Ω = π * 2π * 1e6
+    amp_c = arp_drive_amplitude(ke, kt, g2c, Ω)
+    @test amp_c ≈ arp_amp_scale(ke, kt, coupling_rms(g2c)) * Ω
+
+    g_gauss = (
+        kind = :gaussian, mean = 2π * 100, std = 2π * 20,
+        span_sigma = 3.0, renormalize = PAPER_G_RENORMALIZE,
+    )
+    _, _, _, gm, _, g2g, info = build_gaussian_coupling_bins(g_gauss, 21)
+    @test info.renormalize === PAPER_G_RENORMALIZE
+    @test coupling_rms(g2g) > gm
+    @test coupling_rms(g2g) ≈ sqrt(g2g)
+    amp_rms = arp_drive_amplitude(ke, kt, g2g, Ω)
+    amp_mean = arp_amp_scale(ke, kt, gm) * Ω
+    @test amp_rms < amp_mean
+    @info "ARP Ω_rms vs mean-g amp" amp_rms amp_mean g_rms = coupling_rms(g2g) g_mean = gm
+end
+
+@testset "paper figs lock g.renormalize and ARP Ω convention" begin
+    repo = joinpath(@__DIR__, "..")
+    lock_dirs = (
+        joinpath(repo, "paper", "fig_3_c"),
+        joinpath(repo, "paper", "fig_4_c"),
+        joinpath(repo, "paper", "fig_4_d"),
+    )
+    offenders = String[]
+    for dir in lock_dirs
+        isdir(dir) || error("missing paper lock dir $dir")
+        for (root, _, files) in walkdir(dir)
+            for f in files
+                endswith(f, ".jl") || continue
+                path = joinpath(root, f)
+                txt = read(path, String)
+                occursin("g_inhomogeneity", txt) || continue
+                if !occursin("PAPER_G_RENORMALIZE", txt)
+                    push!(offenders, relpath(path, repo))
+                end
+            end
+        end
+    end
+    @test isempty(offenders)
+
+    rose = read(joinpath(repo, "scripts", "rose_reference_harness.jl"), String)
+    @test occursin("PAPER_G_RENORMALIZE", rose)
+
+    arp = read(joinpath(repo, "src", "composite_arp_pulses.jl"), String)
+    @test occursin("coupling_rms", arp)
+    @test occursin("arp_drive_amplitude", arp)
+    @test occursin("g2_avg", arp)
+    @test !occursin("Float64(gi.g_value)", arp)
+    @test !occursin("Float64(gi.mean)", arp)
+    @test !occursin("Float64(d.g_mean)", arp)
+    @test occursin("omega_convention=:rms_g2", arp)
+
+    three = read(joinpath(repo, "scripts", "run_105_3arp_M20000.jl"), String)
+    @test occursin("arp_drive_amplitude", three)
+    @test !occursin("d.g_mean * d.sqrt_kappa_e", three)
+end
+
 

@@ -76,7 +76,7 @@ BASE_SYSTEM_CONFIG = (
         mean        = 2π * 100.0,
         std         = 2π * 1.0,
         span_sigma  = 3.0,
-        renormalize = true,
+        renormalize = PAPER_G_RENORMALIZE,
     ),
 )
 

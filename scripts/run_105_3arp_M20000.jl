@@ -30,9 +30,8 @@ bw       = 5.0 * d.FWHM
 Tb       = 0.6 * (d.timespan[2] - d.timespan[1])
 dur_odd  = Tb / 4
 dur_even = 2 * dur_odd
-amp_scale    = d.kappa_t / (4 * d.g_mean * d.sqrt_kappa_e)
 Omega_target = pi * d.FWHM
-amp_odd  = amp_scale * Omega_target
+amp_odd  = arp_drive_amplitude(d.kappa_e, d.kappa_t, d.g2_avg, Omega_target)
 amp_even = amp_odd / sqrt(2)
 
 t_start = 0.0

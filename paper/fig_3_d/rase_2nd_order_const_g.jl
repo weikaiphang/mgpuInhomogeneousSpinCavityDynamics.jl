@@ -66,7 +66,7 @@ BASE_SYSTEM_CONFIG = (
     g_inhomogeneity = (
         kind        = :constant,
         g_value     = 2π * 100.0,
-        renormalize = false,
+        renormalize = PAPER_G_RENORMALIZE,
     ),
 )
 

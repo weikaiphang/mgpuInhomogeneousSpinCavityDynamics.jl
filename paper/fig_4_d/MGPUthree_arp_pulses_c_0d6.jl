@@ -49,7 +49,7 @@ SYSTEM_CONFIG = (
         mean = 2*pi*100,
         std  = 2*pi*5,
         span_sigma = 3.0,
-        renormalize = true,
+        renormalize = PAPER_G_RENORMALIZE,
     ),
 )
 

@@ -136,6 +136,7 @@ export SignalControlRejected
 export generate_2n1_arp_pi_pulse
 export generate_2n1_arp_from_jld2
 export generate_3arp_pi_pulse
+export PAPER_G_RENORMALIZE, coupling_rms, arp_amp_scale, arp_drive_amplitude
 
 export NoiseSimulationData
 export load_noise_data

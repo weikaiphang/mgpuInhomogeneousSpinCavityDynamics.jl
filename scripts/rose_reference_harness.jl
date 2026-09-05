@@ -29,7 +29,7 @@ function frozen_case(; outdir)
             mean       = 2π * 100.0,
             std        = 2π * 12.0,
             span_sigma = 2.5,
-            renormalize = false,
+            renormalize = PAPER_G_RENORMALIZE,
         ),
     )
 

@@ -1,4 +1,5 @@
-
+# ARP drive scale: Ω_rms from √⟨g²⟩, not bare ⟨g⟩ / g_value / g.mean.
+# See coupling_rms / arp_amp_scale. Mean-g-only is not the paper path.
 
 function _arp_system_scales(d)
     fi = d.freq_inhomogeneity
@@ -12,20 +13,13 @@ function _arp_system_scales(d)
     kappa_i = Float64(d.kappa_i)
     kappa_t = kappa_e + kappa_i
 
-    gi = d.g_inhomogeneity
-    g_scale = if gi.kind === :constant
-        Float64(gi.g_value)
-    elseif gi.kind === :gaussian
-        Float64(gi.mean)
-    else
-        Float64(d.g_mean)
-    end
+    g_rms = coupling_rms(d)
 
-    (FWHM > 0 && kappa_e > 0 && kappa_t > 0 && g_scale > 0) || error(
+    (FWHM > 0 && kappa_e > 0 && kappa_t > 0 && g_rms > 0) || error(
         "_arp_system_scales: non-positive scale (FWHM=$FWHM, kappa_e=$kappa_e, " *
-        "kappa_t=$kappa_t, g_scale=$g_scale)."
+        "kappa_t=$kappa_t, g_rms=$g_rms)."
     )
-    return FWHM, kappa_e, kappa_t, g_scale
+    return FWHM, kappa_e, kappa_t, g_rms
 end
 
 
@@ -82,24 +76,27 @@ function generate_2n1_arp_pi_pulse(
     )
 
 
-    FWHM, kappa_e, kappa_t, g_scale = _arp_system_scales(d)
+    FWHM, kappa_e, kappa_t, g_rms = _arp_system_scales(d)
 
     bw = bandwidth_fwhm_mult * FWHM
     bw > 0 || error(
         "bandwidth_fwhm_mult*FWHM must be positive (got bandwidth_fwhm_mult=$bandwidth_fwhm_mult, FWHM=$FWHM)."
     )
 
-    amp_scale = kappa_t / (4 * g_scale * sqrt(kappa_e))
     Omega_target = Omega_max === nothing ? pi * FWHM : Float64(Omega_max)
     Omega_target > 0 || error(
         Omega_max === nothing ?
         "default Rabi target pi*FWHM = $Omega_target is not positive; check d.freq_inhomogeneity.FWHM." :
         "Omega_max must be positive, got $Omega_target."
     )
-    amp = amp_scale * Omega_target
+    amp = arp_drive_amplitude(kappa_e, kappa_t, d.g2_avg, Omega_target)
     amp > 0 || error(
-        "derived segment amplitude amp_scale*Omega_target = $amp is not positive; " *
-        "check d.kappa_e / d.kappa_i / the coupling mean."
+        "derived segment amplitude from Ω_rms(√⟨g²⟩) = $amp is not positive; " *
+        "check d.kappa_e / d.kappa_i / d.g2_avg."
+    )
+    println(
+        "ARP Ω convention: Ω_rms = 4√⟨g²⟩ √κ_e / κ_t · |E|  ",
+        "(g_rms=$(g_rms), g_mean=$(d.g_mean), ⟨g²⟩=$(d.g2_avg); not mean-g)"
     )
 
 
@@ -152,6 +149,8 @@ function generate_2n1_arp_pi_pulse(
         bandwidth=bw, duration_odd=dur_odd, duration_even=dur_even,
         amp_odd=amp, amp_even=amp,
         n_pairs=n, total_segments=n_seg,
+        g_rms=g_rms, g2_avg=Float64(d.g2_avg), g_mean=Float64(d.g_mean),
+        Omega_target=Omega_target, omega_convention=:rms_g2,
     )
 
     if keep_final_state
