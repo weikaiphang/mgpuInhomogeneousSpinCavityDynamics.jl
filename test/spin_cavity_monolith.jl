@@ -307,6 +307,16 @@ end
     ); ensemble_method=:auto)
     @test dren.p_delta_mass ≈ 1 rtol=1e-12
     @test dren.C_eff ≈ dren.C_ens
+    # g-mass under coupling truncation is included in C_eff
+    dgt = M.prepare_derived((
+        C_ens=0.6, M_delta=5, M_g=7, Ttotal=1e-5, Nt_save=3,
+        delta0=0.0, kappa_e=2π*1e6, kappa_i=0.0,
+        freq_inhomogeneity=(kind=:lorentzian, FWHM=2π*1e6, span_gamma=2.5, renormalize=false),
+        g_inhomogeneity=(kind=:gaussian, mean=2π*100, std=2π*40, span_sigma=1.5, renormalize=false),
+    ); ensemble_method=:auto)
+    @test dgt.p_g_mass < 1
+    @test dgt.C_eff ≈ dgt.C_ens * dgt.p_delta_mass * dgt.p_g_mass
+    @test dgt.C_eff < dgt.C_ens * dgt.p_delta_mass
 end
 
 @testset "amp_scale uses √⟨g²⟩ not g_mean" begin
@@ -344,7 +354,17 @@ end
     @test M._canon_mode(:order2_bspline) === :order2_bspline
     @test M._canon_mode(Symbol("order2-bspline")) === :order2_bspline
     settings = M.load_settings(joinpath(@__DIR__, "..", "examples", "monolith_order2.jl"))
-    prep = M.prepare(settings; ensemble_method=:auto)
+    buf = IOBuffer()
+    prep = redirect_stdout(buf) do
+        M.prepare(settings; ensemble_method=:auto)
+    end
+    printed = String(take!(buf))
+    @test occursin("C_ens", printed)
+    @test occursin("C_eff", printed)
+    @test occursin("Σp_g", printed)
+    @test occursin("√g2_avg", printed)
+    @test hasproperty(prep.d, :C_ens) && hasproperty(prep.d, :C_eff)
+    @test hasproperty(prep.d, :p_g_mass)
     @test prep.d.ensemble_method === :quadrature
     @test prep.d.kappa_t == prep.d.kappa_e + prep.d.kappa_i
     @test prep.d.C_eff ≈ prep.d.C_ens * prep.d.p_mass

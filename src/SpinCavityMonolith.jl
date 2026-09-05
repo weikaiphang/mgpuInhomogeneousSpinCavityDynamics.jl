@@ -16,6 +16,9 @@
 # Loss: ss=1-(silencing-target_F)²; fid=I*ss; J=(1-fid)² + (κ_I/2)[I_min-I]₊²
 #       + (κ_S/2)[S_min-ss]₊² + w_time(T/Tmax) + w_tmax(tmax_ex/Tmax)²
 #       + w_power(‖cA/amp_scale‖²/n_cA)
+# Cooperativity: C_ens = requested (sets analytic N); C_eff = C_ens × Σp_δ × Σp_g
+#   (simulated OD; g-mass counts when coupling is truncated).
+# amp_scale convention: ∝ κₜ / (4 √g2_avg √κₑ)   √g2_avg = √⟨g²⟩, not g_mean.
 
 module SpinCavityMonolith
 
@@ -241,18 +244,20 @@ function CompositePulse(k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
     dur_floor = T_max * 1e-3
     typical = max(dur_scale, 1e-30)
     Ω = max(pi / typical, d.FWHM, sqrt(d.FWHM / typical))
-    # Adiabatic / power scale tracks the ensemble second moment, not ⟨g⟩.
-    # Under inhomogeneous g, √⟨g²⟩ = √(⟨g⟩² + Var(g)) > |⟨g⟩|.
+    # Convention: amp_scale = (κₜ / (4 √g2_avg √κₑ)) × Ω
+    # √g2_avg = √⟨g²⟩ (ensemble second moment). Not g_mean.
     g_rms = _g_rms_for_scale(d)
-    g_rms > 0 || error("amp_scale needs √⟨g²⟩ > 0 (g2_avg or g_mean)")
+    g_rms > 0 || error("amp_scale needs √g2_avg > 0 (g2_avg or g_mean fallback)")
     amp_scale = (d.kappa_t / (4 * g_rms * d.sqrt_kappa_e)) * Ω
     return CompositePulse(k, n_coeff_A, n_coeff_f, degree, T_max,
                           gap_scale, dur_scale, dur_floor, amp_scale, Float64(d.FWHM), Float64(taper_frac))
 end
 
+# √g2_avg = √⟨g²⟩. Preferred key is d.g2_avg from prepare_derived.
+# Handmade test `d` without g2_avg falls back to |g_mean| (constant-g equivalent).
 @inline function _g_rms_for_scale(d)
     g2 = Float64(_get(d, :g2_avg, 0.0))
-    g2 > 0 && return sqrt(g2)
+    g2 > 0 && return sqrt(g2)          # √g2_avg
     grms = Float64(_get(d, :g_rms, 0.0))
     grms > 0 && return grms
     return abs(Float64(d.g_mean))
@@ -3334,15 +3339,18 @@ function summarize_result(mode, d, extra)
     return nothing
 end
 
-# C_ens is the requested (analytic, infinite-line) cooperativity used to set N.
-# C_eff = C_ens × Σp is the optical depth of the bins that were actually built.
-# renormalize=false (default for frequency) does not silently restore full C_ens.
+# prepare / mode output: always print both C_ens and C_eff.
+# C_eff = C_ens × Σp_δ × Σp_g. g-mass (Σp_g) matters when coupling is truncated.
+# renormalize=false does not silently restore full C_ens.
 function summarize_cooperativity(d)
-    println("C_ens requested : ", d.C_ens)
-    println("Σp_δ, Σp_g, Σp  : ", d.p_delta_mass, ", ", d.p_g_mass, ", ", d.p_mass)
-    println("C_eff (sim. OD) : ", d.C_eff, "  (= C_ens × Σp; truncated mass is not claimed as full C_ens)")
-    println("N analytic/N_tot: ", d.N, " / ", d.N_total)
-    println("g_rms=√⟨g²⟩     : ", d.g_rms, "  (⟨g⟩=", d.g_mean, ")")
+    println("C_ens            : ", d.C_ens, "  (requested; sets analytic N)")
+    println("C_eff            : ", d.C_eff, "  (= C_ens × Σp_δ × Σp_g; simulated OD)")
+    gnote = d.p_g_mass < 1 - 1e-12 ? "  (g-mass truncated; included in C_eff)" : ""
+    println("Σp_δ (freq mass) : ", d.p_delta_mass)
+    println("Σp_g (g mass)    : ", d.p_g_mass, gnote)
+    println("Σp               : ", d.p_mass)
+    println("N analytic/N_tot : ", d.N, " / ", d.N_total)
+    println("√g2_avg          : ", d.g_rms, "  (amp_scale ∝ 1/√g2_avg; ⟨g⟩=", d.g_mean, ")")
     return nothing
 end
 
