@@ -146,11 +146,22 @@ make_diag_mask_host(M) = ComplexF64.(.!Matrix(I, M, M))
 # PULSE_CONFIG : tuple/vector of gaussian | wurst | custom | bspline pulses
 # BSPLINE : k, n_coeff_A, n_coeff_f, degree, taper_frac
 # OPTIMIZER : num_epochs, learning_rate, w_time, w_power, w_tmax, target_F,
-#             I_min, kappa_I, S_min, kappa_S, track, seed
+#             I_min, kappa_I, S_min, kappa_S, track, seed, grad (:adjoint|:forward),
+#             checkpoint_stride
 # COMPUTE : backend (:auto/:cpu/:gpu), integrator (:tsit5/:ck45), nshards
-# MODE : forward | forward-bspline | order2 | order2-bspline | optimizer
+# MODE : forward | forward_bspline | order2 | order2_bspline | optimizer
+#        (hyphenated aliases forward-bspline / order2-bspline are accepted)
 
-const MODES = (:forward, Symbol("forward-bspline"), :order2, Symbol("order2-bspline"), :optimizer)
+const MODES = (:forward, :forward_bspline, Symbol("forward-bspline"),
+               :order2, :order2_bspline, Symbol("order2-bspline"), :optimizer)
+
+function _canon_mode(mode)
+    s = _sym(mode)
+    s === Symbol("forward-bspline") && return :forward_bspline
+    s === Symbol("order2-bspline") && return :order2_bspline
+    s in (:forward, :forward_bspline, :order2, :order2_bspline, :optimizer) && return s
+    error("unknown mode $mode; expected forward | forward_bspline | order2 | order2_bspline | optimizer")
+end
 
 _sym(x) = x isa Symbol ? x : Symbol(string(x))
 _get(nt, k, default) = hasproperty(nt, k) ? getproperty(nt, k) : default
@@ -164,7 +175,8 @@ function default_optimizer()
     return (num_epochs=20, learning_rate=0.05, patience=8, seed=42,
             w_time=0.15, w_power=0.05, w_tmax=1.0, target_F=1.0,
             I_min=0.85, kappa_I=50.0, S_min=0.85, kappa_S=50.0,
-            track=:weak, cf_lr_scale=0.25)
+            track=:weak, cf_lr_scale=0.25, grad=:adjoint,
+            checkpoint_stride=typemax(Int))
 end
 
 function default_compute()
@@ -504,15 +516,24 @@ function _spin_means(Nj, kind::Symbol)
 end
 
 """
-Same-bin product-state closures (eqs. 4–5).
-`invN = 1/Nⱼ` for Nⱼ>0 else 0. Ground: SmSp = Nⱼ, SzSz = Nⱼ²/4.
+Same-bin product-state closures (Reader / finite-N algebra).
+  SpSp_same = Sp² (1 − 1/Nⱼ)
+  SzSp_same = Sz Sp (1 − 1/Nⱼ)
+  SmSp_same = |Sp|² (1 − 1/Nⱼ) + Nⱼ/2 − Sz     # ground ⇒ Nⱼ  (package IC = 0 is WRONG)
+  SzSz_same = Sz² (1 − 1/Nⱼ) + Nⱼ/4
+Cross j≠k = products of means. Nⱼ≤0 → 0.
 """
+@inline function _invN(Nj)
+    N = real(Nj)
+    return N > 0 ? (1 - inv(N)) : zero(N)
+end
+@inline spsp_same_product(Sp, Nj) = Sp * Sp * _invN(Nj)
+@inline szsp_same_product(Sz, Sp, Nj) = Sz * Sp * _invN(Nj)
 @inline function smsp_same_product(Sp, Sz, Nj)
     N = real(Nj)
     N <= 0 && return zero(Sp)
     return abs2(Sp) * (1 - inv(N)) + N / 2 - Sz
 end
-
 @inline function szsz_same_product(Sz, Nj)
     N = real(Nj)
     N <= 0 && return zero(Sz)
@@ -541,11 +562,10 @@ function build_u0_2nd_order(M, Nj, ::Type{T}, kind::Symbol=:ground) where {T}
         u0[idx2_adSp_start(M)+j-1] = 0
         u0[idx2_adSm_start(M)+j-1] = 0
         u0[idx2_adSz_start(M)+j-1] = 0
-        u0[idx2_adSz_start(M)+M+j-1] = Sp * Sp                 # SpSp_same
-        u0[idx2_adSz_start(M)+2M+j-1] = Sz * Sp                # SzSp_same
-        # CORRECTED: ⟨S⁻S⁺⟩ = |Sp|²(1-1/N)+N/2-Sz   (ground → N, not 0)
+        u0[idx2_adSz_start(M)+M+j-1] = spsp_same_product(Sp, N)          # Sp²(1-1/N)
+        u0[idx2_adSz_start(M)+2M+j-1] = szsp_same_product(Sz, Sp, N)     # Sz Sp (1-1/N)
+        # CORRECTED vs package: ⟨S⁻S⁺⟩ = |Sp|²(1-1/N)+N/2-Sz   (ground → N, not 0)
         u0[idx2_adSz_start(M)+3M+j-1] = smsp_same_product(Sp, Sz, N)
-        # CORRECTED: ⟨SᶻSᶻ⟩ = Sz²(1-1/N)+N/4
         u0[idx2_adSz_start(M)+4M+j-1] = szsz_same_product(Sz, N)
     end
     # Cross-bin product means (j≠k). Layout after same-bin block of 4M.
@@ -695,6 +715,81 @@ function rhs2!(du, u, p, t)
 end
 
 # =============================================================================
+# §7b  Order-2 multi-GPU layout  (package MGPUlayout.jl — NCCL/P2P, not host)
+# =============================================================================
+#
+# small (replicated, length 3+9M):  a, a†a†, a†a | Sp, Sz, adSp, adSm, adSz |
+#                                   SpSp_s, SzSp_s, SmSp_s, SzSz_s
+#   Small RHS is evaluated ONCE (rank 0 / a single fused kernel), then broadcast.
+#   Do not re-integrate ȧ independently on every GPU.
+#
+# large (sharded by contiguous columns k ∈ [lo:hi], mloc = hi-lo+1):
+#   5 × M × mloc blocks, column-major per block:
+#     B_SpSp=1, B_SzSp=2, B_SzSpT=3, B_SmSp=4, B_SzSz=5
+#   SzSpT is the *explicit* transpose of SzSp (avoids a device transpose).
+#   Diagonals of large blocks are zero (same-bin lives in small).
+#
+# Collectives each RHS (on-device):
+#   Allreduce(SUM)  of O(1) cavity sums  Σ g Sp*, Σ g adSp, Σ g adSm
+#   Allgather       of O(M) row-sums     (SpSp, SmSp, SzSp)×g  over column shards
+# Host `exchange_rowsums!` (MGPUproblem.jl) is intentionally NOT used.
+# κₜ = κₑ + κᵢ always (do not copy sim_2nd_multi_gpu_opt.jl which drops κᵢ).
+
+const MG_NSCALAR = 3
+const MG_NSMALLFIELD = 9
+const MG_B_SpSp, MG_B_SzSp, MG_B_SzSpT, MG_B_SmSp, MG_B_SzSz = 1, 2, 3, 4, 5
+const MG_NBLOCK = 5
+mg_small_length(M) = MG_NSCALAR + MG_NSMALLFIELD * M
+mg_large_length(M, mloc) = MG_NBLOCK * M * mloc
+mg_shard_length(M, mloc) = mg_small_length(M) + mg_large_length(M, mloc)
+
+function mg_column_partition(M::Integer, nshards::Integer)
+    nshards = clamp(Int(nshards), 1, M)
+    base, rem_ = divrem(M, nshards)
+    counts = [base + (p <= rem_ ? 1 : 0) for p in 1:nshards]
+    offsets = zeros(Int, nshards)
+    for p in 2:nshards
+        offsets[p] = offsets[p-1] + counts[p-1]
+    end
+    return counts, offsets
+end
+
+"""Fill small + 5-block large ICs with the corrected product-state algebra."""
+function build_u0_2nd_mgpu(M, Nj, kind::Symbol, nshards::Integer=1)
+    Sp0, Sz0 = _spin_means(collect(Float64, Nj), kind)
+    small = zeros(ComplexF64, mg_small_length(M))
+    @inbounds for j in 1:M
+        Sp, Sz, N = ComplexF64(Sp0[j]), ComplexF64(Sz0[j]), Float64(Nj[j])
+        small[MG_NSCALAR + 0M + j] = Sp
+        small[MG_NSCALAR + 1M + j] = Sz
+        small[MG_NSCALAR + 5M + j] = spsp_same_product(Sp, N)
+        small[MG_NSCALAR + 6M + j] = szsp_same_product(Sz, Sp, N)
+        small[MG_NSCALAR + 7M + j] = smsp_same_product(Sp, Sz, N)
+        small[MG_NSCALAR + 8M + j] = szsz_same_product(Sz, N)
+    end
+    counts, offsets = mg_column_partition(M, nshards)
+    larges = Vector{Vector{ComplexF64}}(undef, length(counts))
+    for p in eachindex(counts)
+        mloc = counts[p]; lo = offsets[p]
+        L = zeros(ComplexF64, mg_large_length(M, mloc))
+        @inbounds for jl in 1:mloc
+            k = lo + jl
+            for j in 1:M
+                j == k && continue
+                i = (jl - 1) * M + j
+                L[0 * M * mloc + i] = Sp0[j] * Sp0[k]                 # SpSp
+                L[1 * M * mloc + i] = Sz0[j] * Sp0[k]                 # SzSp
+                L[2 * M * mloc + i] = Sz0[k] * Sp0[j]                 # SzSpT
+                L[3 * M * mloc + i] = conj(Sp0[j]) * Sp0[k]           # SmSp
+                L[4 * M * mloc + i] = Sz0[j] * Sz0[k]                 # SzSz
+            end
+        end
+        larges[p] = L
+    end
+    return small, larges, counts, offsets
+end
+
+# =============================================================================
 # §8  Real-state pack + analytic VJP of the 1st-order RHS (discrete adjoint)
 # =============================================================================
 
@@ -835,11 +930,18 @@ function StagePool(u0::AbstractVector, nstages::Int)
                         zeros(T, n), zeros(T, n), zeros(T, n))
 end
 
+@inline _primal(x::Real) = Float64(x)
+@inline _primal(x::Complex) = hypot(Float64(real(x)), Float64(imag(x)))
+if _HAVE_FORWARDDIFF
+    @inline _primal(x::ForwardDiff.Dual) = Float64(ForwardDiff.value(x))
+    @inline _primal(x::Complex{<:ForwardDiff.Dual}) = hypot(_primal(real(x)), _primal(imag(x)))
+end
+
 function _errnorm(u, u1, err, atol, rtol)
     acc = 0.0
     @inbounds for i in eachindex(err)
-        sc = atol + rtol * max(abs(u[i]), abs(u1[i]))
-        acc += abs2(err[i] / sc)
+        sc = atol + rtol * max(_primal(abs(u[i])), _primal(abs(u1[i])))
+        acc += _primal(abs2(err[i] / sc))
     end
     return sqrt(acc / length(err))
 end
@@ -919,7 +1021,7 @@ function integrate!(rhs!, u0, p, tspan; integrator::Symbol=:tsit5,
         dt = T(dt0)
     else
         rhs!(pool.k[1], pool.u, p, t)
-        d1 = sqrt(sum(abs2, pool.k[1]) / length(pool.u))
+        d1 = _primal(sqrt(sum(abs2, pool.k[1]) / length(pool.u)))
         dt = d1 < 1e-8 ? T(1e-6) * (tfinal - t) : T(0.01) / max(d1, 1e-12)
         dt = min(dt, T(tfinal - t), T(dtmax))
     end
@@ -1438,12 +1540,69 @@ function tsit5_step_vjp!(λ_n, gθ, λ_np1, u_n, t, dt, p, pulse, u_pulse, tab=A
     return λ_n
 end
 
-function record_tsit5_mesh(u0, p, tspan; reltol=1e-8, abstol=1e-8, tstops=Float64[])
+function _checkpoint_indices(n::Integer, stride::Integer)
+    idxs = Int[1]
+    if stride < n
+        k = 1 + stride
+        while k < n
+            push!(idxs, k)
+            k += stride
+        end
+    end
+    idxs[end] != n && push!(idxs, n)
+    return idxs
+end
+
+function tsit5_forced_step_copy(u, p, t, dt)
+    tab = ADJTAB
+    N = length(u)
+    k = ntuple(_ -> zeros(eltype(u), N), 6)
+    y = ntuple(_ -> zeros(eltype(u), N), 6)
+    copyto!(y[1], u)
+    rhs1!(k[1], y[1], p, t)
+    for i in 2:6
+        @inbounds for j in 1:N
+            acc = k[1][j] * _adj_a(tab, i, 1)
+            for s in 2:(i - 1)
+                acc += k[s][j] * _adj_a(tab, i, s)
+            end
+            y[i][j] = u[j] + dt * acc
+        end
+        rhs1!(k[i], y[i], p, t + (i == 6 ? dt : _adj_c(tab, i) * dt))
+    end
+    u1 = similar(u)
+    @inbounds for j in 1:N
+        u1[j] = u[j] + dt * (_adj_b(tab, 1)*k[1][j] + _adj_b(tab, 2)*k[2][j] +
+                             _adj_b(tab, 3)*k[3][j] + _adj_b(tab, 4)*k[4][j] +
+                             _adj_b(tab, 5)*k[5][j] + _adj_b(tab, 6)*k[6][j])
+    end
+    return u1
+end
+
+function replay_tsit5_window(u_start, p, t_start, dts)
+    u = copy(u_start)
+    us = Vector{typeof(u)}(undef, length(dts) + 1)
+    us[1] = copy(u)
+    t = Float64(t_start)
+    @inbounds for n in eachindex(dts)
+        Δt = Float64(dts[n])
+        u = tsit5_forced_step_copy(u, p, t, Δt)
+        t += Δt
+        us[n + 1] = copy(u)
+    end
+    return us
+end
+
+function record_tsit5_mesh(u0, p, tspan; reltol=1e-8, abstol=1e-8, tstops=Float64[],
+                           checkpoint_stride::Integer=typemax(Int), dt0=0.0)
     u, ts, us, nsteps = integrate!(rhs1!, u0, p, tspan; integrator=:tsit5,
                                    reltol=reltol, abstol=abstol, save_states=true,
-                                   tsave=isempty(tstops) ? nothing : tstops)
+                                   tsave=isempty(tstops) ? nothing : tstops, dt0=dt0)
     dts = diff(ts)
-    return ts, dts, us, u, nsteps
+    stride = max(Int(checkpoint_stride), 1)
+    idxs = _checkpoint_indices(length(us), stride)
+    stack_u = [copy(us[i]) for i in idxs]
+    return ts, dts, us, u, nsteps, idxs, stack_u
 end
 
 function reverse_tsit5!(gθ, λx, states, t, dts, p, pulse, u_pulse)
@@ -1452,6 +1611,22 @@ function reverse_tsit5!(gθ, λx, states, t, dts, p, pulse, u_pulse)
         Δt = Float64(dts[n])
         Δt == 0 && continue
         tsit5_step_vjp!(λx, gθ, λx, states[n], t[n], Δt, p, pulse, u_pulse)
+    end
+    return gθ
+end
+
+"""Checkpointed reverse (package `reverse_tsit5_on_checkpoints!`): replay each
+window from a stored checkpoint, then VJP. Primary optimizer path."""
+function reverse_tsit5_checkpoints!(gθ, λx, ts, dts, idxs, stack_u, p, pulse, u_pulse)
+    nchk = length(idxs)
+    nchk >= 2 || return reverse_tsit5!(gθ, λx, stack_u, ts, dts, p, pulse, u_pulse)
+    @inbounds for w in (nchk - 1):-1:1
+        i0 = idxs[w]
+        i1 = idxs[w + 1]
+        dtsw = @view dts[i0:(i1 - 1)]
+        us = replay_tsit5_window(stack_u[w], p, ts[i0], dtsw)
+        tloc = ts[i0:i1]
+        reverse_tsit5!(gθ, λx, us, collect(tloc), dtsw, p, pulse, u_pulse)
     end
     return gθ
 end
@@ -1572,10 +1747,27 @@ function _ode_p(d, E_of_t)
             Int(d.M), E_of_t)
 end
 
+function _pulse_tstops(t_start, t_end, tspan)
+    t0, t1 = Float64(tspan[1]), Float64(tspan[2])
+    out = Float64[]
+    for x in Iterators.flatten((t_start, t_end))
+        xv = _primal(x)
+        (t0 + 1e-15 < xv <= t1 + 1e-15) && push!(out, min(xv, t1))
+    end
+    return unique!(sort!(out))
+end
+
+function _widen_u0(u0, E_of_t)
+    probe = first(u0) + zero(E_of_t(0.0))
+    typeof(probe) === eltype(u0) && return u0
+    return map(x -> x + zero(E_of_t(0.0)), u0)
+end
+
 function solve_1st_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e-8,
-                         integrator=:tsit5, backend=:auto, nshards=nothing, tsave=nothing)
+                         integrator=:tsit5, backend=:auto, nshards=nothing, tsave=nothing,
+                         dt0=0.0)
     M = Int(d.M)
-    u0 = build_u0_1st_order(M, d.Nj, Float64, kind)
+    u0 = _widen_u0(build_u0_1st_order(M, d.Nj, Float64, kind), E_of_t)
     p = _ode_p(d, E_of_t)
     tspan = d.timespan
     want_gpu = backend === :gpu || (backend === :auto && cuda_functional() && M >= 64)
@@ -1586,7 +1778,7 @@ function solve_1st_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e
         return a, collect(Sp), collect(Sz), (backend=:gpu, collective=how, nsteps=nsteps)
     end
     u, ts, us, nsteps = integrate!(rhs1!, u0, p, tspan; integrator=integrator,
-                                   reltol=reltol, abstol=abstol, tsave=tsave)
+                                   reltol=reltol, abstol=abstol, tsave=tsave, dt0=dt0)
     a, Sp, Sz = unpack_state_1st_order_u(u, M)
     return a, collect(Sp), collect(Sz), (backend=:cpu, collective=:none, nsteps=nsteps, t=ts, u=us)
 end
@@ -1614,24 +1806,28 @@ end
 function pulse_cost_theta(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                           I_min=0.85, kappa_I=50.0, S_min=0.85, kappa_S=50.0,
                           track=:weak, reltol=1e-8, abstol=1e-8, backend=:auto,
-                          integrator=:tsit5, nshards=nothing)
+                          integrator=:tsit5, nshards=nothing, dt0=0.0)
     T = Float64
     E = build_E_of_t(pulse, u)
     duration = pulse_duration(pulse, u)
-    _, t_end, _, cA, _ = decode(pulse, u)
-    tmax_excess = max(t_end[end] - pulse.T_max, zero(T))
+    t_start, t_end, _, cA, _ = decode(pulse, u)
+    tstops = _pulse_tstops(t_start, t_end, d.timespan)
+    tmax_excess = max(t_end[end] - pulse.T_max, zero(eltype(t_end)))
     tmax_penalty = w_tmax * (tmax_excess / pulse.T_max)^2
     n_cA = length(cA)
     power_penalty = w_power * (sum(abs2, cA ./ pulse.amp_scale) / n_cA)
     if track === :dual
         _, _, Sz, _ = solve_1st_order(d, E, :ground; reltol=reltol, abstol=abstol,
-                                      integrator=integrator, backend=backend, nshards=nshards)
+                                      integrator=integrator, backend=backend, nshards=nshards,
+                                      dt0=dt0, tsave=tstops)
         inversion = _weighted_inversion(Sz, d.g_b, d.Nj, T)
         _, Sp, _, _ = solve_1st_order(d, E, :weak; reltol=reltol, abstol=abstol,
-                                      integrator=integrator, backend=backend, nshards=nshards)
+                                      integrator=integrator, backend=backend, nshards=nshards,
+                                      dt0=dt0, tsave=tstops)
     else
         _, Sp, Sz_w, _ = solve_1st_order(d, E, :weak; reltol=reltol, abstol=abstol,
-                                         integrator=integrator, backend=backend, nshards=nshards)
+                                         integrator=integrator, backend=backend, nshards=nshards,
+                                         dt0=dt0, tsave=tstops)
         inversion = _weighted_inversion(Sz_w, d.g_b, d.Nj, T)
     end
     silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, T)
@@ -1642,23 +1838,36 @@ end
 
 function pulse_cost_grad_adjoint(u, pulse, d; target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0,
                                  I_min=0.85, kappa_I=50.0, S_min=0.85, kappa_S=50.0,
-                                 track=:weak, reltol=1e-8, abstol=1e-8)
+                                 track=:weak, reltol=1e-8, abstol=1e-8,
+                                 checkpoint_stride::Integer=typemax(Int), dt0=0.0)
     M = Int(d.M)
     E = build_E_of_t(pulse, u)
     p = _ode_p(d, E)
     t_start, t_end, _, cA, _ = decode(pulse, u)
-    tstops = Float64.(vcat(t_start, t_end))
+    tstops = _pulse_tstops(t_start, t_end, d.timespan)
     uθ = collect(Float64, u)
     gθ = zeros(Float64, length(uθ))
 
+    function _rev!(gθ, λ, ts, dts, us, idxs, stack)
+        if checkpoint_stride < typemax(Int) && length(idxs) >= 2 && length(idxs) < length(us)
+            reverse_tsit5_checkpoints!(gθ, λ, ts, dts, idxs, stack, p, pulse, uθ)
+        else
+            reverse_tsit5!(gθ, λ, us, ts, dts, p, pulse, uθ)
+        end
+    end
+
     if track === :dual
         u0g = build_u0_1st_order(M, d.Nj, Float64, :ground)
-        tsg, dtsg, usg, u_endg, _ = record_tsit5_mesh(u0g, p, d.timespan; reltol=reltol, abstol=abstol, tstops=tstops)
+        tsg, dtsg, usg, u_endg, _, idxg, stkg = record_tsit5_mesh(
+            u0g, p, d.timespan; reltol=reltol, abstol=abstol, tstops=tstops,
+            checkpoint_stride=checkpoint_stride, dt0=dt0)
         _, _, Sz = unpack_state_1st_order_u(u_endg, M)
         Sz = collect(Sz)
         inversion = _weighted_inversion(Sz, d.g_b, d.Nj, Float64)
         u0w = build_u0_1st_order(M, d.Nj, Float64, :weak)
-        tsw, dtsw, usw, u_endw, _ = record_tsit5_mesh(u0w, p, d.timespan; reltol=reltol, abstol=abstol, tstops=tstops)
+        tsw, dtsw, usw, u_endw, _, idxw, stkw = record_tsit5_mesh(
+            u0w, p, d.timespan; reltol=reltol, abstol=abstol, tstops=tstops,
+            checkpoint_stride=checkpoint_stride, dt0=dt0)
         _, Sp, _ = unpack_state_1st_order_u(u_endw, M)
         Sp = collect(Sp)
         silencing = _weighted_silencing_factor(Sp, d.g_b, d.Nj, d.delta_b, Float64)
@@ -1666,13 +1875,15 @@ function pulse_cost_grad_adjoint(u, pulse, d; target_F=1.0, w_time=0.15, w_power
         cI, cS = _fidelity_gradient_coefficients(inversion, ss, fid, I_min, kappa_I, S_min, kappa_S)
         λI = zeros(Float64, real_state_length_1st_order(M))
         inversion_pullback!(λI, Sz, d.g_b, d.Nj); λI .*= cI
-        reverse_tsit5!(gθ, λI, usg, tsg, dtsg, p, pulse, uθ)
+        _rev!(gθ, λI, tsg, dtsg, usg, idxg, stkg)
         λS = zeros(Float64, real_state_length_1st_order(M))
         silencing_pullback!(λS, Sp, d.g_b, d.Nj, d.delta_b); λS .*= cS
-        reverse_tsit5!(gθ, λS, usw, tsw, dtsw, p, pulse, uθ)
+        _rev!(gθ, λS, tsw, dtsw, usw, idxw, stkw)
     else
         u0 = build_u0_1st_order(M, d.Nj, Float64, :weak)
-        ts, dts, us, u_end, _ = record_tsit5_mesh(u0, p, d.timespan; reltol=reltol, abstol=abstol, tstops=tstops)
+        ts, dts, us, u_end, _, idxs, stack = record_tsit5_mesh(
+            u0, p, d.timespan; reltol=reltol, abstol=abstol, tstops=tstops,
+            checkpoint_stride=checkpoint_stride, dt0=dt0)
         _, Sp, Sz = unpack_state_1st_order_u(u_end, M)
         Sp = collect(Sp); Sz = collect(Sz)
         inversion = _weighted_inversion(Sz, d.g_b, d.Nj, Float64)
@@ -1684,7 +1895,7 @@ function pulse_cost_grad_adjoint(u, pulse, d; target_F=1.0, w_time=0.15, w_power
         λS = zeros(Float64, length(λ))
         silencing_pullback!(λS, Sp, d.g_b, d.Nj, d.delta_b)
         λ .+= cS .* λS
-        reverse_tsit5!(gθ, λ, us, ts, dts, p, pulse, uθ)
+        _rev!(gθ, λ, ts, dts, us, idxs, stack)
     end
 
     if _HAVE_FORWARDDIFF
@@ -1703,6 +1914,15 @@ function pulse_cost_grad_adjoint(u, pulse, d; target_F=1.0, w_time=0.15, w_power
     power_penalty = w_power * (sum(abs2, cA ./ pulse.amp_scale) / length(cA))
     cost = physics + w_time * (duration / pulse.T_max) + w_tmax * (tmax_excess / pulse.T_max)^2 + power_penalty
     return gθ, cost, inversion, silencing, duration
+end
+
+"""Dual-through-solve gradient (non-hot path). Kept for parity tests vs adjoint."""
+function pulse_cost_grad_forward(u, pulse, d; kwargs...)
+    _HAVE_FORWARDDIFF || error("grad=:forward requires ForwardDiff")
+    uθ = collect(Float64, u)
+    cost, inv, sil, dur, _, _ = pulse_cost_theta(uθ, pulse, d; kwargs...)
+    g = ForwardDiff.gradient(uu -> pulse_cost_theta(uu, pulse, d; kwargs...)[1], uθ)
+    return g, cost, inv, sil, dur
 end
 
 # =============================================================================
@@ -1732,9 +1952,11 @@ end
 function optimize_bspline!(u, pulse, d; num_epochs=20, learning_rate=0.05, patience=8,
                            w_time=0.15, w_power=0.05, w_tmax=1.0, target_F=1.0,
                            I_min=0.85, kappa_I=50.0, S_min=0.85, kappa_S=50.0,
-                           track=:weak, reltol=1e-8, abstol=1e-8, cf_lr_scale=0.25)
+                           track=:weak, reltol=1e-8, abstol=1e-8, cf_lr_scale=0.25,
+                           grad::Symbol=:adjoint, checkpoint_stride::Integer=typemax(Int))
     n = length(u)
     n == n_params(pulse) || error("optimizer: length(u)=$(length(u)) != n_params=$(n_params(pulse))")
+    grad in (:adjoint, :forward) || error("grad must be :adjoint or :forward, got $grad")
     adam = AdamState(n)
     lr_scale = ones(n)
     k = pulse.k
@@ -1745,10 +1967,17 @@ function optimize_bspline!(u, pulse, d; num_epochs=20, learning_rate=0.05, patie
     wait = 0
     hist = NamedTuple[]
     for epoch in 1:num_epochs
-        g, cost, inv, sil, dur = pulse_cost_grad_adjoint(
-            u, pulse, d; target_F=target_F, w_time=w_time, w_power=w_power, w_tmax=w_tmax,
-            I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S, track=track,
-            reltol=reltol, abstol=abstol)
+        if grad === :forward
+            g, cost, inv, sil, dur = pulse_cost_grad_forward(
+                u, pulse, d; target_F=target_F, w_time=w_time, w_power=w_power, w_tmax=w_tmax,
+                I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S, track=track,
+                reltol=reltol, abstol=abstol)
+        else
+            g, cost, inv, sil, dur = pulse_cost_grad_adjoint(
+                u, pulse, d; target_F=target_F, w_time=w_time, w_power=w_power, w_tmax=w_tmax,
+                I_min=I_min, kappa_I=kappa_I, S_min=S_min, kappa_S=kappa_S, track=track,
+                reltol=reltol, abstol=abstol, checkpoint_stride=checkpoint_stride)
+        end
         push!(hist, (epoch=epoch, cost=cost, inversion=inv, silencing=sil, duration=dur))
         @printf("[optimizer] epoch %d  cost=%.6g  I=%.4f  S=%.4f  T=%.3g\n", epoch, cost, inv, sil, dur)
         if cost < best_cost
@@ -1969,82 +2198,163 @@ function summarize_result(mode, d, extra)
     return nothing
 end
 
-function run_mode(settings; mode_override=nothing)
-    mode = mode_override === nothing ? _sym(settings.mode) : _sym(mode_override)
-    mode in MODES || error("unknown mode $mode; expected one of $MODES")
+# =============================================================================
+# §16  Public API
+#   settings → prepare(ensemble_method=:auto|:quadrature|:histogram)
+#            → forward / forward_bspline(u) / order2 / order2_bspline(u)
+#            → optimize(u; grad=:adjoint|:forward)
+# =============================================================================
+
+struct Prepared
+    settings
+    d
+    kind::Symbol
+    backend::Symbol
+    integrator::Symbol
+    nshards
+    reltol::Float64
+    abstol::Float64
+    E_raw
+    bspline
+end
+
+function prepare(src; ensemble_method::Symbol=:auto)
+    settings = src isa AbstractString ? load_settings(src) : src
     CONFIG = merge_full_config(settings.sim, settings.sys)
-    want = _sym(_get(CONFIG, :ensemble_method, :auto))
-    d = prepare_derived(CONFIG; ensemble_method=want)
+    d = prepare_derived(CONFIG; ensemble_method=ensemble_method)
     cmp = settings.compute
-    backend = _sym(_get(cmp, :backend, :auto))
-    integrator = _sym(_get(cmp, :integrator, :tsit5))
-    nshards = _get(cmp, :nshards, nothing)
-    reltol = Float64(_get(settings.sim, :reltol, 1e-8))
-    abstol = Float64(_get(settings.sim, :abstol, 1e-8))
-    kind = _sym(_get(settings.sim, :initial_condition, :ground))
-    bsp = settings.bspline
-    E_raw = build_E_of_t_raw(settings.pulse)
+    return Prepared(
+        settings, d,
+        _sym(_get(settings.sim, :initial_condition, :ground)),
+        _sym(_get(cmp, :backend, :auto)),
+        _sym(_get(cmp, :integrator, :tsit5)),
+        _get(cmp, :nshards, nothing),
+        Float64(_get(settings.sim, :reltol, 1e-8)),
+        Float64(_get(settings.sim, :abstol, 1e-8)),
+        build_E_of_t_raw(settings.pulse),
+        settings.bspline)
+end
 
-    pulse = nothing
-    uθ = nothing
-    if mode in (Symbol("forward-bspline"), Symbol("order2-bspline"), :optimizer)
-        pulse, uθ, segs = fit_raw_pulse_bspline(E_raw, d, bsp; force_k=bsp.k)
-        println("[bspline] k=", pulse.k, " n_params=", n_params(pulse),
-                " layout=3k + k*nA + k*nf = ", 3 * pulse.k, "+", pulse.k * pulse.n_coeff_A,
-                "+", pulse.k * pulse.n_coeff_f, "  segments=", segs)
-        E = build_E_of_t(pulse, uθ)
-    else
-        E = E_raw
+function _ensure_pulse(prep::Prepared, u=nothing)
+    pulse, uθ, segs = fit_raw_pulse_bspline(prep.E_raw, prep.d, prep.bspline; force_k=prep.bspline.k)
+    println("[bspline] k=", pulse.k, " n_params=", n_params(pulse),
+            " layout=3k + k*nA + k*nf = ", 3 * pulse.k, "+", pulse.k * pulse.n_coeff_A,
+            "+", pulse.k * pulse.n_coeff_f, "  segments=", segs)
+    if u !== nothing
+        length(u) == n_params(pulse) ||
+            error("u length $(length(u)) != n_params=$(n_params(pulse))")
+        uθ = collect(Float64, u)
     end
+    return pulse, uθ
+end
 
-    if mode === :forward || mode === Symbol("forward-bspline")
-        a, Sp, Sz, info = solve_1st_order(d, E, kind; reltol=reltol, abstol=abstol,
-                                          integrator=integrator, backend=backend, nshards=nshards,
-                                          tsave=d.t_save)
-        inv, sil = pulse_metrics_from_state(Sp, Sz, d)
-        extra = (a=a, inversion=inv, silencing=sil, backend=info.backend,
-                 collective=get(info, :collective, :none), nsteps=info.nsteps)
-        summarize_result(mode, d, extra)
-        return (mode=mode, d=d, a=a, Sp=Sp, Sz=Sz, inversion=inv, silencing=sil,
-                pulse=pulse, u=uθ, info=info)
-    elseif mode === :order2 || mode === Symbol("order2-bspline")
-        st, info = solve_2nd_order(d, E, kind; reltol=reltol, abstol=abstol,
-                                   integrator=integrator, tsave=d.t_save)
-        a = st[1]; Sp = st[4]; Sz = st[5]; SmSp = st[11]
-        inv, sil = pulse_metrics_from_state(collect(Sp), collect(Sz), d)
-        extra = (a=a, inversion=inv, silencing=sil, SmSp_mean=sum(real, SmSp) / length(SmSp),
-                 nsteps=info.nsteps)
-        summarize_result(mode, d, extra)
-        return (mode=mode, d=d, state=st, inversion=inv, silencing=sil,
-                pulse=pulse, u=uθ, info=info)
+function _solve_first(prep::Prepared, E, kind)
+    return solve_1st_order(prep.d, E, kind; reltol=prep.reltol, abstol=prep.abstol,
+                           integrator=prep.integrator, backend=prep.backend,
+                           nshards=prep.nshards, tsave=prep.d.t_save)
+end
+
+function _solve_second(prep::Prepared, E, kind)
+    return solve_2nd_order(prep.d, E, kind; reltol=prep.reltol, abstol=prep.abstol,
+                           integrator=prep.integrator, tsave=prep.d.t_save)
+end
+
+function forward(prep::Prepared; kind=prep.kind)
+    a, Sp, Sz, info = _solve_first(prep, prep.E_raw, kind)
+    inv, sil = pulse_metrics_from_state(Sp, Sz, prep.d)
+    extra = (a=a, inversion=inv, silencing=sil, backend=info.backend,
+             collective=get(info, :collective, :none), nsteps=info.nsteps)
+    summarize_result(:forward, prep.d, extra)
+    return (mode=:forward, d=prep.d, a=a, Sp=Sp, Sz=Sz, inversion=inv, silencing=sil,
+            pulse=nothing, u=nothing, info=info)
+end
+
+function forward_bspline(prep::Prepared, u=nothing; kind=prep.kind)
+    pulse, uθ = _ensure_pulse(prep, u)
+    E = build_E_of_t(pulse, uθ)
+    a, Sp, Sz, info = _solve_first(prep, E, kind)
+    inv, sil = pulse_metrics_from_state(Sp, Sz, prep.d)
+    extra = (a=a, inversion=inv, silencing=sil, backend=info.backend,
+             collective=get(info, :collective, :none), nsteps=info.nsteps)
+    summarize_result(:forward_bspline, prep.d, extra)
+    return (mode=:forward_bspline, d=prep.d, a=a, Sp=Sp, Sz=Sz, inversion=inv, silencing=sil,
+            pulse=pulse, u=uθ, info=info)
+end
+
+function order2(prep::Prepared; kind=prep.kind)
+    st, info = _solve_second(prep, prep.E_raw, kind)
+    a = st[1]; Sp = st[4]; Sz = st[5]; SmSp = st[11]
+    inv, sil = pulse_metrics_from_state(collect(Sp), collect(Sz), prep.d)
+    extra = (a=a, inversion=inv, silencing=sil, SmSp_mean=sum(real, SmSp) / length(SmSp),
+             nsteps=info.nsteps)
+    summarize_result(:order2, prep.d, extra)
+    return (mode=:order2, d=prep.d, state=st, inversion=inv, silencing=sil,
+            pulse=nothing, u=nothing, info=info)
+end
+
+function order2_bspline(prep::Prepared, u=nothing; kind=prep.kind)
+    pulse, uθ = _ensure_pulse(prep, u)
+    E = build_E_of_t(pulse, uθ)
+    st, info = _solve_second(prep, E, kind)
+    a = st[1]; Sp = st[4]; Sz = st[5]; SmSp = st[11]
+    inv, sil = pulse_metrics_from_state(collect(Sp), collect(Sz), prep.d)
+    extra = (a=a, inversion=inv, silencing=sil, SmSp_mean=sum(real, SmSp) / length(SmSp),
+             nsteps=info.nsteps)
+    summarize_result(:order2_bspline, prep.d, extra)
+    return (mode=:order2_bspline, d=prep.d, state=st, inversion=inv, silencing=sil,
+            pulse=pulse, u=uθ, info=info)
+end
+
+function optimize(prep::Prepared, u=nothing; grad::Symbol=:adjoint, kwargs...)
+    pulse, uθ = _ensure_pulse(prep, u)
+    opt = prep.settings.optimizer
+    gsym = _sym(grad)
+    uθ, best, hist = optimize_bspline!(
+        uθ, pulse, prep.d;
+        num_epochs=Int(_get(opt, :num_epochs, 20)),
+        learning_rate=Float64(_get(opt, :learning_rate, 0.05)),
+        patience=Int(_get(opt, :patience, 8)),
+        w_time=Float64(_get(opt, :w_time, 0.15)),
+        w_power=Float64(_get(opt, :w_power, 0.05)),
+        w_tmax=Float64(_get(opt, :w_tmax, 1.0)),
+        target_F=Float64(_get(opt, :target_F, 1.0)),
+        I_min=Float64(_get(opt, :I_min, 0.85)),
+        kappa_I=Float64(_get(opt, :kappa_I, 50.0)),
+        S_min=Float64(_get(opt, :S_min, 0.85)),
+        kappa_S=Float64(_get(opt, :kappa_S, 50.0)),
+        track=_sym(_get(opt, :track, :weak)),
+        reltol=prep.reltol, abstol=prep.abstol,
+        cf_lr_scale=Float64(_get(opt, :cf_lr_scale, 0.25)),
+        grad=gsym,
+        checkpoint_stride=Int(_get(opt, :checkpoint_stride, typemax(Int))),
+        kwargs...)
+    extra = (best_cost=best, n_params=n_params(pulse), epochs=length(hist), grad=gsym)
+    summarize_result(:optimizer, prep.d, extra)
+    return (mode=:optimizer, d=prep.d, pulse=pulse, u=uθ, best_cost=best, history=hist, grad=gsym)
+end
+
+function run_mode(settings; mode_override=nothing, grad=nothing)
+    mode = _canon_mode(mode_override === nothing ? settings.mode : mode_override)
+    want = _sym(_get(merge_full_config(settings.sim, settings.sys), :ensemble_method, :auto))
+    prep = prepare(settings; ensemble_method=want)
+    if mode === :forward
+        return forward(prep)
+    elseif mode === :forward_bspline
+        return forward_bspline(prep)
+    elseif mode === :order2
+        return order2(prep)
+    elseif mode === :order2_bspline
+        return order2_bspline(prep)
     elseif mode === :optimizer
-        pulse === nothing && error("optimizer requires B-spline parameterization")
-        opt = settings.optimizer
-        uθ, best, hist = optimize_bspline!(
-            uθ, pulse, d;
-            num_epochs=Int(_get(opt, :num_epochs, 20)),
-            learning_rate=Float64(_get(opt, :learning_rate, 0.05)),
-            patience=Int(_get(opt, :patience, 8)),
-            w_time=Float64(_get(opt, :w_time, 0.15)),
-            w_power=Float64(_get(opt, :w_power, 0.05)),
-            w_tmax=Float64(_get(opt, :w_tmax, 1.0)),
-            target_F=Float64(_get(opt, :target_F, 1.0)),
-            I_min=Float64(_get(opt, :I_min, 0.85)),
-            kappa_I=Float64(_get(opt, :kappa_I, 50.0)),
-            S_min=Float64(_get(opt, :S_min, 0.85)),
-            kappa_S=Float64(_get(opt, :kappa_S, 50.0)),
-            track=_sym(_get(opt, :track, :weak)),
-            reltol=reltol, abstol=abstol,
-            cf_lr_scale=Float64(_get(opt, :cf_lr_scale, 0.25)))
-        extra = (best_cost=best, n_params=n_params(pulse), epochs=length(hist))
-        summarize_result(mode, d, extra)
-        return (mode=mode, d=d, pulse=pulse, u=uθ, best_cost=best, history=hist)
+        g = grad === nothing ? _sym(_get(settings.optimizer, :grad, :adjoint)) : _sym(grad)
+        return optimize(prep; grad=g)
     end
 end
 
 function parse_cli(args)
     settings = nothing
     mode = nothing
+    grad = nothing
     i = 1
     while i <= length(args)
         a = args[i]
@@ -2054,9 +2364,12 @@ function parse_cli(args)
         elseif a == "--mode" || a == "-m"
             i += 1
             mode = Symbol(args[i])
+        elseif a == "--grad" || a == "-g"
+            i += 1
+            grad = Symbol(args[i])
         elseif a == "--help" || a == "-h"
-            println("Usage: julia --project=. scripts/nude_quad_monolith.jl --settings FILE [--mode MODE]")
-            println("Modes: forward | forward-bspline | order2 | order2-bspline | optimizer")
+            println("Usage: julia --project=. scripts/nude_quad_monolith.jl --settings FILE [--mode MODE] [--grad adjoint|forward]")
+            println("Modes: forward | forward_bspline | order2 | order2_bspline | optimizer")
             return nothing
         elseif settings === nothing && !startswith(a, "-")
             settings = a
@@ -2066,7 +2379,7 @@ function parse_cli(args)
         i += 1
     end
     settings === nothing && error("pass --settings PATH")
-    return (settings=settings, mode=mode)
+    return (settings=settings, mode=mode, grad=grad)
 end
 
 function main(args=ARGS)
@@ -2074,16 +2387,17 @@ function main(args=ARGS)
     cli = parse_cli(args)
     cli === nothing && return 0
     settings = load_settings(cli.settings)
-    run_mode(settings; mode_override=cli.mode)
+    run_mode(settings; mode_override=cli.mode, grad=cli.grad)
     return 0
 end
 
 export pack, unpack, decode, n_params, CompositePulse, initial_guess
-export build_u0_1st_order, build_u0_2nd_order
-export smsp_same_product, szsz_same_product
+export build_u0_1st_order, build_u0_2nd_order, build_u0_2nd_mgpu
+export smsp_same_product, szsz_same_product, spsp_same_product, szsp_same_product
 export rhs1!, rhs2!, rhs_1st_order!
 export prepare_derived, ensemble_method_for, resolve_ensemble_method
-export pulse_cost_theta, pulse_cost_grad_adjoint, optimize_bspline!
+export prepare, forward, forward_bspline, order2, order2_bspline, optimize
+export pulse_cost_theta, pulse_cost_grad_adjoint, pulse_cost_grad_forward, optimize_bspline!
 export fit_raw_pulse_bspline, run_mode, load_settings, main
 export state_length_1st_order, state_length_2nd_order
 

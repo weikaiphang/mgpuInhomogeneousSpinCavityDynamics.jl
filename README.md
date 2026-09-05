@@ -7,5 +7,6 @@ schema, the `pulse_cost` loss, correctness notes, and how NCCL is used.
 
 ```bash
 julia --project=. scripts/nude_quad_monolith.jl --settings examples/monolith_forward.jl
+julia --project=. scripts/nude_quad_monolith.jl -s examples/monolith_optimizer.jl --grad adjoint
 julia --project=. test/monolith_mgpu.jl
 ```

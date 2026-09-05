@@ -53,6 +53,8 @@ OPTIMIZER = (
     S_min = 0.85,
     kappa_S = 50.0,
     track = :weak,
+    grad = :adjoint,
+    checkpoint_stride = typemax(Int),
 )
 
 COMPUTE = (backend = :auto, integrator = :tsit5, nshards = nothing)

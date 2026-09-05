@@ -60,7 +60,8 @@
     "kappa_I": 50.0,
     "S_min": 0.85,
     "kappa_S": 50.0,
-    "track": "weak"
+    "track": "weak",
+    "grad": "adjoint"
   },
   "compute": {
     "backend": "auto",

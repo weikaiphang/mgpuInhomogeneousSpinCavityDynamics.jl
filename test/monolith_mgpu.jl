@@ -93,14 +93,66 @@ end
 
 @testset "product-state same-bin algebra" begin
     N = 10.0
-    # equator
+    # equator: Sp = N/2, Sz = 0
     Sp = N / 2; Sz = 0.0
     @test M.smsp_same_product(Sp, Sz, N) ≈ abs2(Sp) * (1 - 1/N) + N/2 - Sz
     @test M.szsz_same_product(Sz, N) ≈ Sz^2 * (1 - 1/N) + N/4
+    @test M.spsp_same_product(Sp, N) ≈ Sp^2 * (1 - 1/N)
+    @test M.szsp_same_product(Sz, Sp, N) ≈ Sz * Sp * (1 - 1/N)
     u = M.build_u0_2nd_order(1, [N], Float64, :equator)
     st = M.unpack_state_2nd_order_u(u, 1)
+    @test real(st[9][1]) ≈ M.spsp_same_product(N/2, N)          # SpSp_same
+    @test real(st[10][1]) ≈ M.szsp_same_product(0.0, N/2, N)    # SzSp_same
     @test real(st[11][1]) ≈ M.smsp_same_product(N/2, 0.0, N)
     @test real(st[12][1]) ≈ M.szsz_same_product(0.0, N)
+    # weak seed: Sp = ε N/2, Sz = −N/2
+    uw = M.build_u0_2nd_order(1, [N], Float64, :weak)
+    stw = M.unpack_state_2nd_order_u(uw, 1)
+    Spw = M.WEAK_SEED * N / 2
+    Szw = -N / 2
+    @test real(stw[9][1]) ≈ M.spsp_same_product(Spw, N)
+    @test real(stw[10][1]) ≈ M.szsp_same_product(Szw, Spw, N)
+    @test real(stw[11][1]) ≈ M.smsp_same_product(Spw, Szw, N)
+    # cross j≠k = mean products
+    Nj = [4.0, 6.0]
+    u2 = M.build_u0_2nd_order(2, Nj, Float64, :equator)
+    st2 = M.unpack_state_2nd_order_u(u2, 2)
+    @test st2[13][1, 2] ≈ (Nj[1] / 2) * (Nj[2] / 2)   # SpSp
+    @test st2[14][1, 2] ≈ 0.0 * (Nj[2] / 2)           # SzSp
+    @test st2[15][1, 2] ≈ (Nj[1] / 2) * (Nj[2] / 2)   # SmSp (real Sp)
+    @test st2[16][1, 2] ≈ 0.0
+    @test st2[13][1, 1] == 0 && st2[13][2, 2] == 0    # same-bin lives in small
+end
+
+@testset "MGPU 5-block product-state ICs" begin
+    Mbin = 4
+    Nj = [3.0, 5.0, 2.0, 8.0]
+    small, larges, counts, offsets = M.build_u0_2nd_mgpu(Mbin, Nj, :ground, 2)
+    @test length(small) == M.mg_small_length(Mbin)
+    @test length(larges) == 2
+    @test sum(counts) == Mbin
+    for j in 1:Mbin
+        @test real(small[M.MG_NSCALAR + 7 * Mbin + j]) ≈ Nj[j] atol=1e-12  # SmSp_same
+        @test real(small[M.MG_NSCALAR + 8 * Mbin + j]) ≈ (Nj[j]^2) / 4 atol=1e-12
+        @test small[M.MG_NSCALAR + 5 * Mbin + j] == 0  # SpSp_same (ground)
+        @test small[M.MG_NSCALAR + 6 * Mbin + j] == 0  # SzSp_same
+    end
+    for (p, L) in enumerate(larges)
+        mloc = counts[p]; lo = offsets[p]
+        for jl in 1:mloc
+            k = lo + jl
+            for j in 1:Mbin
+                i = (jl - 1) * Mbin + j
+                if j == k
+                    @test L[i] == 0 && L[Mbin * mloc + i] == 0
+                    @test L[3 * Mbin * mloc + i] == 0 && L[4 * Mbin * mloc + i] == 0
+                else
+                    @test real(L[4 * Mbin * mloc + i]) ≈ (Nj[j] * Nj[k]) / 4 atol=1e-12  # SzSz
+                    @test L[2 * Mbin * mloc + i] == 0  # SzSpT ground
+                end
+            end
+        end
+    end
 end
 
 @testset "ensemble :auto uses quadrature for Lorentzian×constant" begin
@@ -117,6 +169,54 @@ end
     @test d.ensemble_method === :quadrature
     @test d.kappa_t == d.kappa_e + d.kappa_i
     @test d.M == 5
+    # order2 must use the same :auto → quadrature rule
+    @test M.prepare_derived(CONFIG; ensemble_method=:auto).ensemble_method === :quadrature
+end
+
+@testset "Modes API aliases + prepare" begin
+    @test M._canon_mode(:forward) === :forward
+    @test M._canon_mode(:forward_bspline) === :forward_bspline
+    @test M._canon_mode(Symbol("forward-bspline")) === :forward_bspline
+    @test M._canon_mode(:order2_bspline) === :order2_bspline
+    @test M._canon_mode(Symbol("order2-bspline")) === :order2_bspline
+    settings = M.load_settings(joinpath(@__DIR__, "..", "examples", "monolith_order2.jl"))
+    prep = M.prepare(settings; ensemble_method=:auto)
+    @test prep.d.ensemble_method === :quadrature
+    @test prep.d.kappa_t == prep.d.kappa_e + prep.d.kappa_i
+end
+
+function _tiny_pulse_problem(; Ttotal=4e-8)
+    κe = 2π * 1e6
+    d = (
+        timespan = (0.0, Ttotal),
+        FWHM = 2π * 1e6,
+        kappa_t = κe,
+        kappa_e = κe,
+        kappa_i = 0.0,
+        g_mean = 2π * 100,
+        sqrt_kappa_e = sqrt(κe),
+        delta0 = 0.0,
+        M = 1,
+        Nj = [8.0],
+        delta_b = [0.0],
+        g_b = [2π * 100],
+    )
+    pulse = M.CompositePulse(1, 4, 4, d; degree=3, taper_frac=0.1)
+    u = M.initial_guess(pulse; seed=3)
+    return pulse, d, u, Ttotal
+end
+
+@testset "adjoint vs forward-mode gradient parity" begin
+    pulse, d, u, Ttotal = _tiny_pulse_problem()
+    # One accepted Tsit5 step so Dual-through-solve and discrete adjoint share a mesh.
+    kw = (reltol=1e2, abstol=1e2, dt0=Ttotal, track=:weak)
+    g_adj, c_adj, = M.pulse_cost_grad_adjoint(u, pulse, d; kw..., checkpoint_stride=typemax(Int))
+    g_chk, c_chk, = M.pulse_cost_grad_adjoint(u, pulse, d; kw..., checkpoint_stride=1)
+    @test c_chk ≈ c_adj rtol=1e-12
+    @test g_chk ≈ g_adj rtol=1e-10 atol=1e-10
+    g_fwd, c_fwd, = M.pulse_cost_grad_forward(u, pulse, d; kw..., backend=:cpu)
+    @test c_fwd ≈ c_adj rtol=1e-8
+    @test g_fwd ≈ g_adj rtol=5e-3 atol=1e-6
 end
 
 println("monolith_mgpu tests finished.")

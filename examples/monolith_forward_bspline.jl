@@ -1,7 +1,7 @@
 # Mode: forward-bspline — fit raw pulse as k B-spline sub-pulses, then 1st-order.
 include(joinpath(@__DIR__, "monolith_common.jl"))
 
-MODE = Symbol("forward-bspline")
+MODE = :forward_bspline
 
 SIM_SETTING = (
     simulation_order = :first_order,
