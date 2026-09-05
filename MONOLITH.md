@@ -52,6 +52,33 @@ coupling is `:constant`/`:gaussian`/`:powerlaw_g`; otherwise histogram.
 implementation; FastGaussQuadrature.jl is an optional later swap for the
 same nodes/weights, not required now.
 
+### C_eff honesty (truncated frequency mass)
+
+`C_ens` is the **requested** infinite-line cooperativity used to set the
+analytic spin number `N`. Frequency `renormalize=false` (default, e.g.
+Lorentzian `span_gamma=2.5`) keeps the truncated mass `Σp_δ ≈ 2 atan(span)/π`
+(~76% at 2.5). That mass is **not** silently restored to 1.
+
+`prepare` / `prepare_derived` expose, and mode output prints:
+
+| Field | Meaning |
+|---|---|
+| `C_ens` | requested cooperativity (settings) |
+| `p_delta_mass`, `p_g_mass` | `Σp_δ`, `Σp_g` |
+| `p_mass` | `N_total / N` (= `Σp_δ × Σp_g`) |
+| `C_eff` | **simulated optical depth** `= C_ens × Σp` |
+| `N`, `N_total` | analytic `N(C_ens)` vs `Σⱼ Nⱼ` actually built |
+
+Do not quote `C_ens` as the optical depth of a `renormalize=false` run.
+Quote `C_eff`.
+
+### amp_scale from √⟨g²⟩
+
+`CompositePulse` sets `amp_scale` from `g_rms = √⟨g²⟩` (`d.g2_avg`), not
+from `g_mean`. Under inhomogeneous `g`, `⟨g²⟩ = ⟨g⟩² + Var(g)`, so the
+adiabatic/power scale tracks the second moment. Constant-`g` is unchanged
+(`√⟨g²⟩ = |g|`). Handmade `d` without `g2_avg` falls back to `|g_mean|`.
+
 ## Loss
 
 ```

@@ -241,9 +241,21 @@ function CompositePulse(k::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
     dur_floor = T_max * 1e-3
     typical = max(dur_scale, 1e-30)
     Ω = max(pi / typical, d.FWHM, sqrt(d.FWHM / typical))
-    amp_scale = (d.kappa_t / (4 * d.g_mean * d.sqrt_kappa_e)) * Ω
+    # Adiabatic / power scale tracks the ensemble second moment, not ⟨g⟩.
+    # Under inhomogeneous g, √⟨g²⟩ = √(⟨g⟩² + Var(g)) > |⟨g⟩|.
+    g_rms = _g_rms_for_scale(d)
+    g_rms > 0 || error("amp_scale needs √⟨g²⟩ > 0 (g2_avg or g_mean)")
+    amp_scale = (d.kappa_t / (4 * g_rms * d.sqrt_kappa_e)) * Ω
     return CompositePulse(k, n_coeff_A, n_coeff_f, degree, T_max,
                           gap_scale, dur_scale, dur_floor, amp_scale, Float64(d.FWHM), Float64(taper_frac))
+end
+
+@inline function _g_rms_for_scale(d)
+    g2 = Float64(_get(d, :g2_avg, 0.0))
+    g2 > 0 && return sqrt(g2)
+    grms = Float64(_get(d, :g_rms, 0.0))
+    grms > 0 && return grms
+    return abs(Float64(d.g_mean))
 end
 
 n_params(pulse::CompositePulse) = 3 * pulse.k + pulse.k * pulse.n_coeff_A + pulse.k * pulse.n_coeff_f
@@ -551,8 +563,9 @@ end
 #   Lorentzian  FWHM → γ=FWHM/2,  δ = γ tan(θ), θ ∈ [−atan(span_γ), atan(span_γ)]
 #               Gauss–Legendre on θ; weight p ∝ w θ_max / π
 #               MODELING: truncated Lorentzian. renormalize=false (default) keeps
-#               the truncated mass < 1, so N from cooperativity uses the analytic
-#               C_ens formula while the discrete Σ p_δ may be < 1.
+#               the truncated mass < 1. N uses the analytic C_ens formula;
+#               C_eff = C_ens × Σp is the optical depth actually simulated.
+#               Do not silently claim full C_ens when Σp_δ < 1.
 #   Gaussian    Gauss–Legendre on [−span_σ σ, span_σ σ] times Normal pdf
 # Coupling:
 #   constant    single node; M_g forced to 1
@@ -800,15 +813,24 @@ function prepare_derived(CONFIG; ensemble_method::Symbol=:config)
     M_g = length(g_1d)
     M_delta = length(delta_1d)
 
-    N = total_spin_number_from_cooperativity(CONFIG.C_ens, kappa_t, g2_avg, freq)
+    C_ens = Float64(CONFIG.C_ens)
+    N = total_spin_number_from_cooperativity(C_ens, kappa_t, g2_avg, freq)
     Nj, delta_b, g_b, N_total = build_2d_bins(N, delta_1d, p_delta, g_1d, p_g)
     M = M_delta * M_g
+    p_delta_mass = sum(p_delta)
+    p_g_mass = sum(p_g)
+    p_mass = N > 0 ? N_total / N : p_delta_mass * p_g_mass
+    C_eff = C_ens * p_mass
+    g_rms = sqrt(g2_avg)
     timespan = (0.0, Float64(CONFIG.Ttotal))
     t_save = collect(range(0.0, Float64(CONFIG.Ttotal); length=Int(CONFIG.Nt_save)))
     return (
-        C_ens=Float64(CONFIG.C_ens), M_delta=M_delta, M_g=M_g, M=M,
+        C_ens=C_ens, C_eff=C_eff, p_mass=p_mass,
+        p_delta_mass=p_delta_mass, p_g_mass=p_g_mass,
+        M_delta=M_delta, M_g=M_g, M=M,
         freq_inhomogeneity=freq, FWHM=Float64(freq.FWHM),
-        g_inhomogeneity=gcfg, g_mean=g_mean, g_std=g_std, g2_avg=g2_avg,
+        freq_renormalize=Bool(_get(freq, :renormalize, false)),
+        g_inhomogeneity=gcfg, g_mean=g_mean, g_std=g_std, g2_avg=g2_avg, g_rms=g_rms,
         kappa_e=kappa_e, kappa_i=kappa_i, kappa_t=kappa_t, sqrt_kappa_e=sqrt(kappa_e),
         delta0=Float64(CONFIG.delta0), N=N, N_total=N_total,
         Nj=Nj, delta_b=delta_b, g_b=g_b,
@@ -3305,10 +3327,22 @@ function summarize_result(mode, d, extra)
     println("ensemble        : ", d.ensemble_method, "  M=", d.M,
             "  (M_δ×M_g = ", d.M_delta, "×", d.M_g, ")")
     println("κₑ, κᵢ, κₜ      : ", d.kappa_e, ", ", d.kappa_i, ", ", d.kappa_t)
-    println("N (cooperativity): ", d.N)
+    summarize_cooperativity(d)
     for (k, v) in pairs(extra)
         println(rpad(string(k), 16), ": ", v)
     end
+    return nothing
+end
+
+# C_ens is the requested (analytic, infinite-line) cooperativity used to set N.
+# C_eff = C_ens × Σp is the optical depth of the bins that were actually built.
+# renormalize=false (default for frequency) does not silently restore full C_ens.
+function summarize_cooperativity(d)
+    println("C_ens requested : ", d.C_ens)
+    println("Σp_δ, Σp_g, Σp  : ", d.p_delta_mass, ", ", d.p_g_mass, ", ", d.p_mass)
+    println("C_eff (sim. OD) : ", d.C_eff, "  (= C_ens × Σp; truncated mass is not claimed as full C_ens)")
+    println("N analytic/N_tot: ", d.N, " / ", d.N_total)
+    println("g_rms=√⟨g²⟩     : ", d.g_rms, "  (⟨g⟩=", d.g_mean, ")")
     return nothing
 end
 
@@ -3336,6 +3370,7 @@ function prepare(src; ensemble_method::Symbol=:auto)
     settings = src isa AbstractString ? load_settings(src) : src
     CONFIG = merge_full_config(settings.sim, settings.sys)
     d = prepare_derived(CONFIG; ensemble_method=ensemble_method)
+    summarize_cooperativity(d)
     cmp = settings.compute
     return Prepared(
         settings, d,

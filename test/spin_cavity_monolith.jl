@@ -243,6 +243,17 @@ end
     @test d.ensemble_method === :quadrature
     @test d.kappa_t == d.kappa_e + d.kappa_i
     @test d.M == 5
+    # C_eff honesty: renormalize=false Lorentzian span_γ=2.5 keeps ~76% mass
+    pδ_analytic = 2 * atan(2.5) / π
+    @test d.p_delta_mass ≈ pδ_analytic rtol=1e-12
+    @test d.p_g_mass ≈ 1
+    @test d.p_mass ≈ d.p_delta_mass * d.p_g_mass
+    @test d.C_ens == 0.6
+    @test d.C_eff ≈ d.C_ens * d.p_mass
+    @test d.C_eff < d.C_ens
+    @test d.N_total / d.N ≈ d.p_mass
+    @test d.g_rms ≈ sqrt(d.g2_avg)
+    @test d.g_rms ≈ abs(d.g_mean)  # constant g
     # order2 must use the same :auto → quadrature rule
     @test M.prepare_derived(CONFIG; ensemble_method=:auto).ensemble_method === :quadrature
     hist = M.ensemble_method_for((kind=:uniform, FWHM=1.0), (kind=:constant, g_value=1.0))
@@ -287,6 +298,43 @@ end
     end
     @test occursin("no quadrature rule", err8)
     @test occursin("notakind", err8)
+    # renormalize=true restores Σp_δ → 1, so C_eff = C_ens
+    dren = M.prepare_derived((
+        C_ens=0.6, M_delta=5, M_g=1, Ttotal=1e-5, Nt_save=3,
+        delta0=0.0, kappa_e=2π*1e6, kappa_i=0.0,
+        freq_inhomogeneity=(kind=:lorentzian, FWHM=2π*1e6, span_gamma=2.5, renormalize=true),
+        g_inhomogeneity=(kind=:constant, g_value=2π*100),
+    ); ensemble_method=:auto)
+    @test dren.p_delta_mass ≈ 1 rtol=1e-12
+    @test dren.C_eff ≈ dren.C_ens
+end
+
+@testset "amp_scale uses √⟨g²⟩ not g_mean" begin
+    base = (
+        C_ens=0.6, M_delta=5, M_g=1, Ttotal=1e-4, Nt_save=3,
+        delta0=0.0, kappa_e=2π*1e6, kappa_i=0.0,
+        freq_inhomogeneity=(kind=:lorentzian, FWHM=2π*1e6, span_gamma=2.5, renormalize=false),
+        g_inhomogeneity=(kind=:constant, g_value=2π*100),
+    )
+    dconst = M.prepare_derived(base)
+    dinh = M.prepare_derived(merge(base, (
+        M_g=7,
+        g_inhomogeneity=(kind=:gaussian, mean=2π*100, std=2π*40, span_sigma=3.0, renormalize=true),
+    )))
+    pconst = M.CompositePulse(1, 4, 4, dconst)
+    pinh = M.CompositePulse(1, 4, 4, dinh)
+    @test dconst.g_rms ≈ abs(dconst.g_mean)
+    @test dinh.g_rms ≈ sqrt(dinh.g2_avg)
+    @test dinh.g_rms > abs(dinh.g_mean)          # Var(g) > 0
+    @test pinh.amp_scale / pconst.amp_scale ≈ dconst.g_rms / dinh.g_rms rtol=1e-12
+    @test pinh.amp_scale < pconst.amp_scale       # larger √⟨g²⟩ → smaller power scale
+    naive_ratio = dconst.g_mean / dinh.g_mean
+    @test pinh.amp_scale / pconst.amp_scale ≉ naive_ratio atol=1e-3
+    # handmade d without g2_avg still falls back to |g_mean|
+    dhand = (timespan=dconst.timespan, FWHM=dconst.FWHM, kappa_t=dconst.kappa_t,
+             g_mean=dconst.g_mean, sqrt_kappa_e=dconst.sqrt_kappa_e)
+    phand = M.CompositePulse(1, 4, 4, dhand)
+    @test phand.amp_scale ≈ pconst.amp_scale rtol=1e-12
 end
 
 @testset "Modes API aliases + prepare" begin

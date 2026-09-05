@@ -13,7 +13,7 @@ SYSTEM_CONFIG = (
         kind = :lorentzian,
         FWHM = FWHM,
         span_gamma = 2.5,
-        renormalize = false,   # truncated Lorentzian; mass is not forced to 1
+        renormalize = false,   # truncated Lorentzian; Σp_δ < 1. Quote C_eff, not C_ens.
     ),
     g_inhomogeneity = (
         kind = :constant,
