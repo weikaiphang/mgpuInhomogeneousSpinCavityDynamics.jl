@@ -78,21 +78,28 @@ SzSp_same = Sz·Sp·(1−1/N)
 cross j≠k = mean products
 ```
 
-## Multi-GPU
+## CPU Threads (this tip)
 
-**Bar:** live ≥2-GPU NCCL/P2P. The Cloud Agent VM that landed this tip has
-no NVIDIA GPU (`nvidia-smi` absent). CPU `rhs2_sharded!` is the CI path
-here; do not treat a CPU run as multi-GPU.
+Production path until Tuesday iron: **CPU multicore**, not fake GPUs.
 
-One order-2 RHS: small `3+9M` **on device** (rank 0); large `5×M×mloc` =
-`SpSp, SzSp, SzSpT, SmSp, SzSz`. Row-sums stay on device and are Allreduced
-with a **NCCL group** (every rank, `sumP`/`sumM`/`sumZ` in one
-`groupStart`/`groupEnd`), else P2P device copies. Host-staged collectives
-**error** (`HOST COLLECTIVE FALLBACK`) — never silent-green.
+- `nshards` on CPU is a cache partition (`resolve_cpu_nshards`, default **1**
+  contiguous large buffer). It is **not** `gpu_count()`.
+- `rhs1!` / `rhs2_sharded!` use `Threads.@threads` over bins/columns when
+  `nthreads() > 1` and the work is large enough. Per-thread row-sum
+  buffers avoid false sharing.
+- `RHS2Work` preallocates `sumP/M/Z` + thread locals. Tsit5 reuses stage
+  buffers; `_axpy_shards!` / `_lincomb_shards!` are scalar loops (no
+  temporary Complex arrays).
+- Run with `julia -t auto` / `JULIA_NUM_THREADS`.
 
-Hot path: no per-RHS D2H of small state or row-sums. Small replicas for
-large kernels use P2P/`copyto!`. Error norms use device reductions + one
-scalar.
+## Multi-GPU — Tuesday iron gate
+
+**Not claimed done.** Live ≥2-GPU NCCL/P2P proof is deferred to Tuesday
+iron. This VM has no NVIDIA GPU (`nvidia-smi` absent). Do not treat a
+CPU or single-device run as multi-GPU.
+
+Wired (unproven here): on-device small RHS + row-sums, NCCL Allreduce
+*group*, host collectives `error` (`HOST COLLECTIVE FALLBACK`).
 
 ```bash
 julia --project=. scripts/run_monolith.jl -s examples/monolith_forward.jl

@@ -18,10 +18,11 @@ All implementations live in `src/SpinCavityMonolith.jl` unless noted.
 | Product-state ICs; ground `SmSp=Nⱼ` | `smsp_same_product` et al.; `build_u0_1st_order`, `build_u0_2nd_order`, `build_u0_2nd_mgpu` |
 | `κₜ = κₑ+κᵢ` | `prepare_derived` (`kappa_t`); `rhs1!`; `rhs2_small!` |
 | Auditable equations | Header of `src/SpinCavityMonolith.jl` (eqs. for ȧ, spins, same-bin ICs, loss) |
-| Live multi-GPU, no dense duplicate stack | `rhs2_sharded!` is the RHS. Small once; large on column shards. `rhs2!` only packs shards for tests/reporting — it calls `rhs2_sharded!`. |
-| ≥2-GPU NCCL/P2P is the bar | `build_collectives` → `:nccl` (preferred) or `:p2p`. This VM has **no NVIDIA GPU**; CPU path is documented, not a substitute for live NCCL. |
-| On-device small RHS + rowsums (no hot-path D2H) | `_rowsum_kernel!` + `allreduce_sum_group!` + `_small_rhs_kernel!` / `_cuda_launch_small!` in `solve_2nd_gpu`. Shared math: `_small_cavity_derivs!`, `_small_bin_deriv!`. |
-| NCCL Allreduce **group**, not a naive loop | `allreduce_sum_group!` wraps ranks (and `sumP`/`sumM`/`sumZ`) in `NCCL.group` / `groupStart`+`groupEnd`. Refuses a serial per-rank Allreduce if the group API is missing. |
+| Live multi-GPU, no dense duplicate stack | `rhs2_sharded!` is the RHS. Small once; large on column shards. `rhs2!` only packs shards for tests/reporting — it calls `rhs2_sharded!`. **Not claimed done** — Tuesday iron gate for live ≥2-GPU NCCL/P2P. |
+| CPU Threads (until Tuesday) | `resolve_cpu_nshards` (default 1, not `gpu_count`). `RHS2Work` / `rhs2_work`. `@threads` in `rhs1!`, `_rowsums_shards!`, `rhs2_large!`, `rhs2_small!`. Allocation-free Tsit5: `_axpy_shards!`, `_lincomb_shards!`, `_lincomb_from_zero_shards!`. |
+| ≥2-GPU NCCL/P2P is the bar | Deferred to Tuesday iron. `build_collectives` is wired (`:nccl` / `:p2p`) but unproven here. This VM has **no NVIDIA GPU**. |
+| On-device small RHS + rowsums (no hot-path D2H) | Wired in `solve_2nd_gpu`; not executed on this VM. Shared math: `_small_cavity_derivs!`, `_small_bin_deriv!`. |
+| NCCL Allreduce **group**, not a naive loop | Wired in `allreduce_sum_group!`. Unproven until Tuesday iron. |
 | Host collective fallback is loud | `_host_collective_error` `@error`s and `error`s. Never returns `:host` as a live multi-GPU path. |
 | Homemade GL; FastGaussQuadrature later | `_gauss_legendre_pts` (Golub–Welsch). FastGaussQuadrature.jl is an optional later dependency, not wired in. |
 | CLI | `scripts/run_monolith.jl` → `main` / `run_mode` |

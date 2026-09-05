@@ -12,6 +12,6 @@ julia --startup-file=no test/spin_cavity_monolith.jl
 See **[MONOLITH.md](MONOLITH.md)** for modes and settings, and
 **[REQUIREMENTS.md](REQUIREMENTS.md)** for the requirement → code map.
 
-Optional: CUDA + NCCL (live ≥2-GPU NCCL/P2P is the multi-GPU bar; host
-collectives error). Required: ForwardDiff (discrete-adjoint drive VJP).
-The Cloud Agent VM that landed this tip has no NVIDIA GPU.
+CPU Threads is the production path until Tuesday iron (`julia -t auto`).
+Live ≥2-GPU NCCL/P2P is **not claimed done**. Required: ForwardDiff
+(discrete-adjoint drive VJP). This VM has no NVIDIA GPU.

@@ -59,6 +59,26 @@ end
     du0 = zeros(ComplexF64, length(u))
     M.rhs1!(du0, u, p0, 1.7e-6)
     @test du[1] != du0[1]
+    @test real(du[1] - du0[1]) ≈ real(-0.5 * kappa_i * a) atol=1e-12
+end
+
+@testset "order-2 κₜ = κₑ+κᵢ in ȧ" begin
+    Mbin = 3
+    Nj = [2.0, 4.0, 6.0]
+    delta_b = [0.0, 1e5, -2e5]
+    g_b = [2π * 100, 2π * 90, 2π * 110]
+    kappa_e = 2π * 1e6
+    kappa_i = 2π * 1e5
+    u = M.build_u0_2nd_order(Mbin, Nj, Float64, :weak)
+    u[1] = 0.02 + 0.01im
+    mask = M.make_diag_mask_host(Mbin)
+    E = t -> 0.3 + 0.1im
+    du = zeros(ComplexF64, length(u))
+    du0 = zeros(ComplexF64, length(u))
+    M.rhs2!(du, u, (0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, mask, E), 0.0)
+    M.rhs2!(du0, u, (0.0, kappa_e, 0.0, delta_b, g_b, Mbin, mask, E), 0.0)
+    @test du[1] != du0[1]
+    @test du[1] - du0[1] ≈ -0.5 * kappa_i * u[1] rtol=1e-12 atol=1e-8
 end
 
 @testset "sharded RHS nshards=1 vs 2 parity" begin
@@ -110,39 +130,72 @@ end
     du = zeros(ComplexF64, M.state_length_2nd_order(Mbin))
     M.rhs2!(du, u, p, 0.0)
     @test maximum(abs, du) < 1e-10
+    # 1st-order: vacuum⊗ground and vacuum⊗inverted are fixed points (E=0).
+    # 2nd-order: only ground is — inverted leaves `+2i g Sz` in dadSm because
+    # SmSp_same = N/2−Sz is 0, not N, so the product-state cancel fails.
+    for kind in (:ground, :inverted)
+        u1 = M.build_u0_1st_order(Mbin, Nj, Float64, kind)
+        du1 = zeros(ComplexF64, length(u1))
+        M.rhs1!(du1, u1, (0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, E0), 0.0)
+        @test maximum(abs, du1) < 1e-12
+    end
+    ui = M.build_u0_2nd_order(Mbin, Nj, Float64, :inverted)
+    dui = zeros(ComplexF64, length(ui))
+    M.rhs2!(dui, ui, p, 0.0)
+    dblk = M.unpack_state_2nd_order_du(dui, Mbin)
+    @test maximum(abs, dblk[4]) > 1.0          # dadSm
+    @test maximum(abs, dblk[1]) < 1e-12        # dSp
+    @test maximum(abs, dblk[2]) < 1e-12        # dSz
+    @test abs(dui[1]) < 1e-12
+    # equator is not a free-evolution fixed point
+    ue = M.build_u0_2nd_order(Mbin, Nj, Float64, :equator)
+    due = zeros(ComplexF64, length(ue))
+    M.rhs2!(due, ue, p, 0.0)
+    @test maximum(abs, due) > 1e-8
 end
 
-@testset "product-state same-bin algebra" begin
-    N = 10.0
-    # equator: Sp = N/2, Sz = 0
-    Sp = N / 2; Sz = 0.0
-    @test M.smsp_same_product(Sp, Sz, N) ≈ abs2(Sp) * (1 - 1/N) + N/2 - Sz
-    @test M.szsz_same_product(Sz, N) ≈ Sz^2 * (1 - 1/N) + N/4
-    @test M.spsp_same_product(Sp, N) ≈ Sp^2 * (1 - 1/N)
-    @test M.szsp_same_product(Sz, Sp, N) ≈ Sz * Sp * (1 - 1/N)
-    u = M.build_u0_2nd_order(1, [N], Float64, :equator)
-    st = M.unpack_state_2nd_order_u(u, 1)
-    @test real(st[9][1]) ≈ M.spsp_same_product(N/2, N)          # SpSp_same
-    @test real(st[10][1]) ≈ M.szsp_same_product(0.0, N/2, N)    # SzSp_same
-    @test real(st[11][1]) ≈ M.smsp_same_product(N/2, 0.0, N)
-    @test real(st[12][1]) ≈ M.szsz_same_product(0.0, N)
-    # weak seed: Sp = ε N/2, Sz = −N/2
-    uw = M.build_u0_2nd_order(1, [N], Float64, :weak)
-    stw = M.unpack_state_2nd_order_u(uw, 1)
-    Spw = M.WEAK_SEED * N / 2
-    Szw = -N / 2
-    @test real(stw[9][1]) ≈ M.spsp_same_product(Spw, N)
-    @test real(stw[10][1]) ≈ M.szsp_same_product(Szw, Spw, N)
-    @test real(stw[11][1]) ≈ M.smsp_same_product(Spw, Szw, N)
-    # cross j≠k = mean products
-    Nj = [4.0, 6.0]
-    u2 = M.build_u0_2nd_order(2, Nj, Float64, :equator)
-    st2 = M.unpack_state_2nd_order_u(u2, 2)
-    @test st2[13][1, 2] ≈ (Nj[1] / 2) * (Nj[2] / 2)   # SpSp
-    @test st2[14][1, 2] ≈ 0.0 * (Nj[2] / 2)           # SzSp
-    @test st2[15][1, 2] ≈ (Nj[1] / 2) * (Nj[2] / 2)   # SmSp (real Sp)
-    @test st2[16][1, 2] ≈ 0.0
-    @test st2[13][1, 1] == 0 && st2[13][2, 2] == 0    # same-bin lives in small
+@testset "product-state IC algebra, all kinds" begin
+    kinds = (:ground, :inverted, :equator, :weak, :weak_inverted)
+    Nj = [3.0, 5.0, 2.0, 8.0]
+    Mbin = length(Nj)
+    for kind in kinds
+        Sp0, Sz0 = M._spin_means(Nj, kind)
+        u1 = M.build_u0_1st_order(Mbin, Nj, Float64, kind)
+        u2 = M.build_u0_2nd_order(Mbin, Nj, Float64, kind)
+        a1, Sp1, Sz1 = M.unpack_state_1st_order_u(u1, Mbin)
+        st = M.unpack_state_2nd_order_u(u2, Mbin)
+        a, _, _, Sp2, Sz2, adSp, adSm, adSz,
+            SpSp_s, SzSp_s, SmSp_s, SzSz_s,
+            SpSp_x, SzSp_x, SmSp_x, SzSz_x = st
+        @test a1 == 0 && a == 0
+        @test collect(Sp1) ≈ Sp0
+        @test collect(Sz1) ≈ Sz0
+        @test collect(Sp2) ≈ Sp0
+        @test collect(Sz2) ≈ Sz0
+        @test all(iszero, adSp) && all(iszero, adSm) && all(iszero, adSz)
+        for j in 1:Mbin
+            N = Nj[j]; Sp = Sp0[j]; Sz = Sz0[j]
+            @test real(SpSp_s[j]) ≈ real(M.spsp_same_product(Sp, N)) atol=1e-12
+            @test real(SzSp_s[j]) ≈ real(M.szsp_same_product(Sz, Sp, N)) atol=1e-12
+            @test real(SmSp_s[j]) ≈ real(M.smsp_same_product(Sp, Sz, N)) atol=1e-12
+            @test real(SzSz_s[j]) ≈ real(M.szsz_same_product(Sz, N)) atol=1e-12
+            @test SpSp_x[j, j] == 0 && SzSp_x[j, j] == 0
+            @test SmSp_x[j, j] == 0 && SzSz_x[j, j] == 0
+        end
+        for k in 1:Mbin, j in 1:Mbin
+            j == k && continue
+            @test SpSp_x[j, k] ≈ Sp0[j] * Sp0[k] atol=1e-12
+            @test SzSp_x[j, k] ≈ Sz0[j] * Sp0[k] atol=1e-12
+            @test SmSp_x[j, k] ≈ conj(Sp0[j]) * Sp0[k] atol=1e-12
+            @test SzSz_x[j, k] ≈ Sz0[j] * Sz0[k] atol=1e-12
+        end
+        small, larges, counts, offsets = M.build_u0_2nd_mgpu(Mbin, Nj, kind, 2)
+        ud = zeros(ComplexF64, M.state_length_2nd_order(Mbin))
+        M.shards_to_dense!(ud, small, larges, counts, offsets, Mbin)
+        @test ud ≈ u2 atol=1e-12
+    end
+    @test M.smsp_same_product(0.0, -10.0 / 2, 10.0) ≈ 10.0
+    @test M.smsp_same_product(0.0, 10.0 / 2, 10.0) ≈ 0.0
 end
 
 @testset "5-block product-state ICs" begin
@@ -192,6 +245,11 @@ end
     @test d.M == 5
     # order2 must use the same :auto → quadrature rule
     @test M.prepare_derived(CONFIG; ensemble_method=:auto).ensemble_method === :quadrature
+    hist = M.ensemble_method_for((kind=:uniform, FWHM=1.0), (kind=:constant, g_value=1.0))
+    @test hist.method === :histogram
+    @test M.resolve_ensemble_method(
+        (freq_inhomogeneity=(kind=:uniform,), g_inhomogeneity=(kind=:constant,), ensemble_method=:auto),
+        :auto).method === :histogram
 end
 
 @testset "Modes API aliases + prepare" begin
@@ -225,6 +283,70 @@ function _tiny_pulse_problem(; Ttotal=4e-8)
     pulse = M.CompositePulse(1, 4, 4, d; degree=3, taper_frac=0.1)
     u = M.initial_guess(pulse; seed=3)
     return pulse, d, u, Ttotal
+end
+
+@testset "1st vs 2nd mean-field consistency" begin
+    Mbin = 4
+    Nj = [3.0, 5.0, 2.0, 8.0]
+    delta_b = [0.0, 1e5, -2e5, 3e4]
+    g_b = [2π * 80, 2π * 100, 2π * 90, 2π * 110]
+    kappa_e = 2π * 1e6
+    kappa_i = 2π * 2e5
+    delta0 = 1e4
+    E = t -> 0.2 + 0.05im
+    u1 = M.build_u0_1st_order(Mbin, Nj, Float64, :equator)
+    u1[1] = 0.03 - 0.01im
+    u2 = M.build_u0_2nd_order(Mbin, Nj, Float64, :equator)
+    u2[1] = u1[1]
+    a = u1[1]; ca = conj(a)
+    @inbounds for j in 1:Mbin
+        Sp = u2[M.IDX2_Sp_start + j - 1]
+        Sz = u2[M.idx2_Sz_start(Mbin) + j - 1]
+        u2[M.idx2_adSp_start(Mbin) + j - 1] = ca * Sp
+        u2[M.idx2_adSm_start(Mbin) + j - 1] = ca * conj(Sp)
+        u2[M.idx2_adSz_start(Mbin) + j - 1] = ca * Sz
+    end
+    du1 = zeros(ComplexF64, length(u1))
+    du2 = zeros(ComplexF64, length(u2))
+    M.rhs1!(du1, u1, (delta0, kappa_e, kappa_i, delta_b, g_b, Mbin, E), 1.2e-6)
+    M.rhs2!(du2, u2, (delta0, kappa_e, kappa_i, delta_b, g_b, Mbin, M.make_diag_mask_host(Mbin), E), 1.2e-6)
+    @test du2[1] ≈ du1[1] rtol=1e-12 atol=1e-14
+    @test du2[4:3+Mbin] ≈ du1[2:1+Mbin] rtol=1e-12 atol=1e-14          # dSp
+    @test du2[4+Mbin:3+2Mbin] ≈ du1[2+Mbin:1+2Mbin] rtol=1e-12 atol=1e-14  # dSz
+end
+
+@testset "CPU nshards is not fake-GPU; RHS hot path is allocation-free" begin
+    @test M.resolve_cpu_nshards(16) == 1
+    @test M.resolve_cpu_nshards(16; nshards=4) == 4
+    @test M.resolve_cpu_nshards(3; nshards=8) == 3
+    Mbin = 8
+    Nj = fill(4.0, Mbin)
+    delta_b = [2π * 1e4 * (j - 4) for j in 1:Mbin]
+    g_b = fill(2π * 100.0, Mbin)
+    kappa_e = 2π * 1e6
+    kappa_i = 2π * 1e5
+    u = M.build_u0_2nd_order(Mbin, Nj, Float64, :equator)
+    u[1] = 0.01 + 0.002im
+    Et = 0.1 + 0.05im
+    s1, L1, c1, o1 = M.dense_to_shards(u, Mbin, 1)
+    ds1 = zero(s1); dL1 = [zero(L) for L in L1]
+    M.rhs2_sharded!(ds1, dL1, s1, L1, c1, o1, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, Et)
+    ds2 = zero(s1); dL2 = [zero(L) for L in L1]
+    allocs = @allocated M.rhs2_sharded!(ds2, dL2, s1, L1, c1, o1, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, Et)
+    @test ds1 ≈ ds2 rtol=1e-15 atol=1e-15
+    if Threads.nthreads() == 1
+        @test allocs == 0
+    else
+        @test allocs < 8192
+    end
+    s4, L4, c4, o4 = M.dense_to_shards(u, Mbin, 4)
+    ds4 = zero(s4); dL4 = [zero(L) for L in L4]
+    M.rhs2_sharded!(ds4, dL4, s4, L4, c4, o4, 0.0, kappa_e, kappa_i, delta_b, g_b, Mbin, Et)
+    du1 = zeros(ComplexF64, M.state_length_2nd_order(Mbin))
+    du4 = zeros(ComplexF64, length(du1))
+    M.shards_to_dense!(du1, ds1, dL1, c1, o1, Mbin)
+    M.shards_to_dense!(du4, ds4, dL4, c4, o4, Mbin)
+    @test du1 ≈ du4 rtol=1e-12 atol=1e-14
 end
 
 @testset "host collectives are loud; GPU bar is honest" begin

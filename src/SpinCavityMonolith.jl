@@ -1,5 +1,7 @@
-# Spin–cavity multi-GPU monolith: inhomogeneous ensemble cumulant dynamics.
+# Spin–cavity monolith: inhomogeneous ensemble cumulant dynamics.
 # Single module. Equations in this file are the implementation.
+# Live ≥2-GPU NCCL/P2P proof is deferred to Tuesday iron (do not claim done).
+# Until then the production path here is CPU Threads (not fake GPUs).
 #
 #   ȧ = √κₑ E(t) − i δ₀ a − i Σⱼ gⱼ ⟨Sⱼ⁻⟩ − (κₜ/2) a          κₜ = κₑ+κᵢ
 #   ⟨Ṡ⁺⟩ⱼ = i δⱼ ⟨S⁺⟩ⱼ − 2i gⱼ a* ⟨Sᶻ⟩ⱼ
@@ -21,6 +23,7 @@ using LinearAlgebra
 using Random
 using Printf
 using ForwardDiff
+using Base.Threads: @threads, nthreads, threadid
 
 const _HAVE_CUDA = Ref(false)
 const _HAVE_NCCL = Ref(false)
@@ -831,13 +834,33 @@ function build_u0_2nd_order(M, Nj, ::Type{T}, kind::Symbol=:ground) where {T}
     return u0
 end
 
+# CPU multicore: Threads over bins/columns. nshards is a cache partition, not a
+# fake GPU. Default CPU nshards = 1 (one contiguous large buffer).
+@inline _cpu_nthreads() = max(1, nthreads())
+@inline _cpu_should_thread(nwork::Integer) = _cpu_nthreads() > 1 && Int(nwork) >= 32
+function resolve_cpu_nshards(M::Integer; nshards=nothing)
+    nshards === nothing && return 1
+    return clamp(Int(nshards), 1, Int(M))
+end
+
 # =============================================================================
 # §6  First-order RHS  (eqs. 1–3)
 # =============================================================================
 
+@inline function _rhs1_spin!(dSp, dSz, Sp, Sz, delta_b, g_b, a, ca, j)
+    @inbounds begin
+        gj = g_b[j]
+        sp = Sp[j]; sz = Sz[j]
+        dSp[j] = 1im * delta_b[j] * sp - 2im * gj * ca * sz
+        dSz[j] = -1im * gj * a * sp + 1im * gj * ca * conj(sp)
+    end
+    return nothing
+end
+
 function rhs1!(du, u, p, t)
     delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t = p
     a = u[IDX1_a]
+    ca = conj(a)
     Sp = @view u[IDX1_Sp_start:IDX1_Sp_start+M-1]
     Sz = @view u[idx1_Sz_start(M):idx1_Sz_start(M)+M-1]
     dSp = @view du[IDX1_Sp_start:IDX1_Sp_start+M-1]
@@ -850,11 +873,15 @@ function rhs1!(du, u, p, t)
         s += g_b[j] * conj(Sp[j])
     end
     du[IDX1_a] = sqrt(kappa_e) * Et - 1im * delta0 * a - 1im * s - (0.5 * κt) * a
-    # (2)(3)
-    @inbounds for j in 1:M
-        gj = g_b[j]
-        dSp[j] = 1im * delta_b[j] * Sp[j] - 2im * gj * conj(a) * Sz[j]
-        dSz[j] = -1im * gj * a * Sp[j] + 1im * gj * conj(a) * conj(Sp[j])
+    # (2)(3) — thread over bins when the ensemble is large enough
+    if _cpu_should_thread(M)
+        @threads :static for j in 1:M
+            _rhs1_spin!(dSp, dSz, Sp, Sz, delta_b, g_b, a, ca, j)
+        end
+    else
+        @inbounds for j in 1:M
+            _rhs1_spin!(dSp, dSz, Sp, Sz, delta_b, g_b, a, ca, j)
+        end
     end
     return nothing
 end
@@ -875,20 +902,103 @@ end
 
 @inline _muli(z) = Complex(-imag(z), real(z))  # i*z
 
+# Preallocated RHS2 scratch. Reused across Tsit5 stages (no hot-path zeros()).
+mutable struct RHS2Work{T}
+    M::Int
+    nt::Int
+    sumP::Vector{T}
+    sumM::Vector{T}
+    sumZ::Vector{T}
+    locP::Vector{Vector{T}}
+    locM::Vector{Vector{T}}
+    locZ::Vector{Vector{T}}
+end
+
+function RHS2Work(::Type{T}, M::Integer; nt::Integer=_cpu_nthreads()) where {T}
+    M = Int(M); nt = max(1, Int(nt))
+    return RHS2Work{T}(M, nt, zeros(T, M), zeros(T, M), zeros(T, M),
+                       [zeros(T, M) for _ in 1:nt],
+                       [zeros(T, M) for _ in 1:nt],
+                       [zeros(T, M) for _ in 1:nt])
+end
+
+const _RHS2_WORK = Ref{Any}(nothing)
+
+function rhs2_work(::Type{T}, M::Integer) where {T}
+    w = _RHS2_WORK[]
+    nt = _cpu_nthreads()
+    if w isa RHS2Work{T} && w.M == M && w.nt == nt
+        return w::RHS2Work{T}
+    end
+    w = RHS2Work(T, M; nt=nt)
+    _RHS2_WORK[] = w
+    return w
+end
+
+@inline function _rowsum_column!(sumP, sumM, sumZ, large, g, M, mloc, lo, jl)
+    k = lo + jl
+    gk = g[k]
+    col = (jl - 1) * M
+    bs = M * mloc
+    @inbounds for j in 1:M
+        j == k && continue
+        i = col + j
+        sumP[j] += large[i] * gk
+        sumZ[j] += large[i + bs] * gk
+        sumM[j] += large[i + 3bs] * gk
+    end
+    return nothing
+end
+
 function _local_rowsums!(sumP, sumM, sumZ, large, g, M, mloc, lo)
     fill!(sumP, 0); fill!(sumM, 0); fill!(sumZ, 0)
-    bs = M * mloc
     @inbounds for jl in 1:mloc
-        k = lo + jl
-        gk = g[k]
-        col = (jl - 1) * M
-        for j in 1:M
-            j == k && continue
-            i = col + j
-            sumP[j] += large[i] * gk
-            sumZ[j] += large[i + bs] * gk
-            sumM[j] += large[i + 3bs] * gk
+        _rowsum_column!(sumP, sumM, sumZ, large, g, M, mloc, lo, jl)
+    end
+    return nothing
+end
+
+function _rowsums_shards!(work::RHS2Work, larges, g, M, counts, offsets)
+    fill!(work.sumP, 0); fill!(work.sumM, 0); fill!(work.sumZ, 0)
+    ns = length(counts)
+    nwork = 0
+    @inbounds for p in 1:ns
+        nwork += counts[p]
+    end
+    if _cpu_should_thread(nwork * M)
+        @inbounds for tid in 1:work.nt
+            fill!(work.locP[tid], 0)
+            fill!(work.locM[tid], 0)
+            fill!(work.locZ[tid], 0)
         end
+        for p in 1:ns
+            mloc = counts[p]; lo = offsets[p]; L = larges[p]
+            @threads :static for jl in 1:mloc
+                tid = threadid()
+                _rowsum_column!(work.locP[tid], work.locM[tid], work.locZ[tid],
+                                L, g, M, mloc, lo, jl)
+            end
+        end
+        @inbounds for tid in 1:work.nt
+            sp = work.locP[tid]; sm = work.locM[tid]; sz = work.locZ[tid]
+            for j in 1:M
+                work.sumP[j] += sp[j]
+                work.sumM[j] += sm[j]
+                work.sumZ[j] += sz[j]
+            end
+        end
+    else
+        for p in 1:ns
+            _local_rowsums_add!(work.sumP, work.sumM, work.sumZ, larges[p], g, M,
+                                counts[p], offsets[p])
+        end
+    end
+    return nothing
+end
+
+function _local_rowsums_add!(sumP, sumM, sumZ, large, g, M, mloc, lo)
+    @inbounds for jl in 1:mloc
+        _rowsum_column!(sumP, sumM, sumZ, large, g, M, mloc, lo, jl)
     end
     return nothing
 end
@@ -975,22 +1085,29 @@ function rhs2_small!(dsmall, small, sumP, sumM, sumZ, delta0, kappa_e, kappa_i,
     κt = kappa_e + kappa_i
     sq = sqrt(kappa_e)
     _small_cavity_derivs!(dsmall, small, g_b, M, delta0, κt, sq, Et)
-    @inbounds for j in 1:M
-        _small_bin_deriv!(dsmall, small, sumP, sumM, sumZ, j, g_b[j], delta_b[j],
-                          M, delta0, κt, sq, Et)
+    if _cpu_should_thread(M)
+        @threads :static for j in 1:M
+            _small_bin_deriv!(dsmall, small, sumP, sumM, sumZ, j, g_b[j], delta_b[j],
+                              M, delta0, κt, sq, Et)
+        end
+    else
+        @inbounds for j in 1:M
+            _small_bin_deriv!(dsmall, small, sumP, sumM, sumZ, j, g_b[j], delta_b[j],
+                              M, delta0, κt, sq, Et)
+        end
     end
     return nothing
 end
 
-function rhs2_large!(dlarge, large, small, delta_b, g_b, M, mloc, lo)
+function _large_column!(dlarge, large, small, delta_b, g_b, M, mloc, lo, jl)
     bs = M * mloc
     oSp = mg_off(M, 1); oSz = mg_off(M, 2)
     oadSp = mg_off(M, 3); oadSm = mg_off(M, 4); oadSz = mg_off(M, 5)
     a = small[1]
     ca = conj(a)
-    @inbounds for jl in 1:mloc
-        k = lo + jl
-        gk = g_b[k]; dk = delta_b[k]
+    k = lo + jl
+    gk = g_b[k]; dk = delta_b[k]
+    @inbounds begin
         Spk = small[oSp + k]; Szk = small[oSz + k]
         adSpk = small[oadSp + k]; adSmk = small[oadSm + k]; adSzk = small[oadSz + k]
         cSpk = conj(Spk); cadSmk = conj(adSmk); cadSzk = conj(adSzk)
@@ -1028,20 +1145,53 @@ function rhs2_large!(dlarge, large, small, delta_b, g_b, M, mloc, lo)
     return nothing
 end
 
-"""Production 2nd-order RHS: one small eval + sharded large. CPU or GPU arrays."""
+function rhs2_large!(dlarge, large, small, delta_b, g_b, M, mloc, lo)
+    if _cpu_should_thread(mloc * M)
+        @threads :static for jl in 1:mloc
+            _large_column!(dlarge, large, small, delta_b, g_b, M, mloc, lo, jl)
+        end
+    else
+        @inbounds for jl in 1:mloc
+            _large_column!(dlarge, large, small, delta_b, g_b, M, mloc, lo, jl)
+        end
+    end
+    return nothing
+end
+
+"""Production 2nd-order RHS: one small eval + sharded large. No hot-path allocs."""
 function rhs2_sharded!(dsmall, dlarges, small, larges, counts, offsets,
                        delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
+    return rhs2_sharded!(dsmall, dlarges, small, larges, counts, offsets,
+                         delta0, kappa_e, kappa_i, delta_b, g_b, M, Et,
+                         rhs2_work(eltype(small), M))
+end
+
+function rhs2_sharded!(dsmall, dlarges, small, larges, counts, offsets,
+                       delta0, kappa_e, kappa_i, delta_b, g_b, M, Et,
+                       work::RHS2Work)
+    _rowsums_shards!(work, larges, g_b, M, counts, offsets)
+    rhs2_small!(dsmall, small, work.sumP, work.sumM, work.sumZ,
+                delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
     ns = length(counts)
-    T = eltype(small)
-    sumP = zeros(T, M); sumM = zeros(T, M); sumZ = zeros(T, M)
-    locP = zeros(T, M); locM = zeros(T, M); locZ = zeros(T, M)
-    for p in 1:ns
-        _local_rowsums!(locP, locM, locZ, larges[p], g_b, M, counts[p], offsets[p])
-        sumP .+= locP; sumM .+= locM; sumZ .+= locZ
+    thread_shards = ns >= 2 && _cpu_should_thread(ns)
+    if thread_shards
+        small_shards = true
+        @inbounds for p in 1:ns
+            if counts[p] * M >= 32
+                small_shards = false
+                break
+            end
+        end
+        thread_shards = small_shards
     end
-    rhs2_small!(dsmall, small, sumP, sumM, sumZ, delta0, kappa_e, kappa_i, delta_b, g_b, M, Et)
-    for p in 1:ns
-        rhs2_large!(dlarges[p], larges[p], small, delta_b, g_b, M, counts[p], offsets[p])
+    if thread_shards
+        @threads :static for p in 1:ns
+            rhs2_large!(dlarges[p], larges[p], small, delta_b, g_b, M, counts[p], offsets[p])
+        end
+    else
+        for p in 1:ns
+            rhs2_large!(dlarges[p], larges[p], small, delta_b, g_b, M, counts[p], offsets[p])
+        end
     end
     return nothing
 end
@@ -2431,22 +2581,57 @@ function solve_1st_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e
 end
 
 function _axpy_shards!(out_s, out_L, s, Ls, a, ks, kL)
-    out_s .= s .+ a .* ks
+    @inbounds for i in eachindex(out_s)
+        out_s[i] = s[i] + a * ks[i]
+    end
     @inbounds for p in eachindex(out_L)
-        out_L[p] .= Ls[p] .+ a .* kL[p]
+        out = out_L[p]; src = Ls[p]; kv = kL[p]
+        for i in eachindex(out)
+            out[i] = src[i] + a * kv[i]
+        end
     end
     return nothing
 end
 
-function _lincomb_shards!(out_s, out_L, s, Ls, a, ks, kL)
-    out_s .= s
-    @inbounds for i in eachindex(a)
-        out_s .+= a[i] .* ks[i]
+function _lincomb_shards!(out_s, out_L, s, Ls, coefs, ks, kL)
+    @inbounds for i in eachindex(out_s)
+        acc = s[i]
+        for c in eachindex(coefs)
+            acc += coefs[c] * ks[c][i]
+        end
+        out_s[i] = acc
     end
     @inbounds for p in eachindex(out_L)
-        out_L[p] .= Ls[p]
-        for i in eachindex(a)
-            out_L[p] .+= a[i] .* kL[i][p]
+        out = out_L[p]; src = Ls[p]
+        for i in eachindex(out)
+            acc = src[i]
+            for c in eachindex(coefs)
+                acc += coefs[c] * kL[c][p][i]
+            end
+            out[i] = acc
+        end
+    end
+    return nothing
+end
+
+function _lincomb_from_zero_shards!(out_s, out_L, coefs, ks, kL)
+    z = zero(eltype(out_s))
+    @inbounds for i in eachindex(out_s)
+        acc = z
+        for c in eachindex(coefs)
+            acc += coefs[c] * ks[c][i]
+        end
+        out_s[i] = acc
+    end
+    @inbounds for p in eachindex(out_L)
+        out = out_L[p]
+        zL = zero(eltype(out))
+        for i in eachindex(out)
+            acc = zL
+            for c in eachindex(coefs)
+                acc += coefs[c] * kL[c][p][i]
+            end
+            out[i] = acc
         end
     end
     return nothing
@@ -2460,6 +2645,7 @@ function integrate_order2_sharded!(small, larges, counts, offsets,
     t, tfinal = T(tspan[1]), T(tspan[2])
     tab = Tsit5Tab(T)
     ns = length(counts)
+    work = rhs2_work(eltype(small), M)
     kS = [zero(small) for _ in 1:6]
     kL = [[zero(larges[p]) for p in 1:ns] for _ in 1:6]
     yS = zero(small)
@@ -2469,7 +2655,7 @@ function integrate_order2_sharded!(small, larges, counts, offsets,
     eS = zero(small)
     eL = [zero(larges[p]) for p in 1:ns]
     function rhs_at!(dS, dL, s, L, tt)
-        rhs2_sharded!(dS, dL, s, L, counts, offsets, delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(tt))
+        rhs2_sharded!(dS, dL, s, L, counts, offsets, delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t(tt), work)
     end
     if dt0 > 0
         dt = T(dt0)
@@ -2505,7 +2691,7 @@ function integrate_order2_sharded!(small, larges, counts, offsets,
         _lincomb_shards!(yS, yL, small, larges, dt .* (tab.a61, tab.a62, tab.a63, tab.a64, tab.a65), kS[1:5], kL[1:5])
         rhs_at!(kS[6], kL[6], yS, yL, t + dt)
         _lincomb_shards!(u1S, u1L, small, larges, dt .* tab.b, kS, kL)
-        _lincomb_shards!(eS, eL, zero(small), [zero(L) for L in larges], dt .* tab.e, kS, kL)
+        _lincomb_from_zero_shards!(eS, eL, dt .* tab.e, kS, kL)
         EEst = _errnorm(small, u1S, eS, T(abstol), T(reltol))
         @inbounds for p in 1:ns
             EEst = max(EEst, _errnorm(larges[p], u1L[p], eL[p], T(abstol), T(reltol)))
@@ -2533,13 +2719,12 @@ function solve_2nd_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e
                          integrator=:tsit5, tsave=nothing, backend=:auto, nshards=nothing)
     M = Int(d.M)
     want_gpu = backend === :gpu || (backend === :auto && cuda_functional())
-    ns = nshards === nothing ? (want_gpu && cuda_functional() ? max(gpu_count(), 1) : 1) : Int(nshards)
-    ns = clamp(ns, 1, M)
-    small, larges, counts, offsets = build_u0_2nd_mgpu(M, d.Nj, kind, ns)
-    delta0, kappa_e, kappa_i = Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i)
-    delta_b = collect(Float64, d.delta_b)
-    g_b = collect(Float64, d.g_b)
     if want_gpu && cuda_functional()
+        ns = nshards === nothing ? max(gpu_count(), 1) : clamp(Int(nshards), 1, M)
+        small, larges, counts, offsets = build_u0_2nd_mgpu(M, d.Nj, kind, ns)
+        delta0, kappa_e, kappa_i = Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i)
+        delta_b = collect(Float64, d.delta_b)
+        g_b = collect(Float64, d.g_b)
         small, larges, nsteps, how = solve_2nd_gpu(
             small, larges, counts, offsets, delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, d.timespan;
             reltol=reltol, abstol=abstol, tsave=tsave)
@@ -2547,12 +2732,19 @@ function solve_2nd_order(d, E_of_t, kind::Symbol=:ground; reltol=1e-8, abstol=1e
         shards_to_dense!(u, small, larges, counts, offsets, M)
         return unpack_state_2nd_order_u(u, M), (backend=:gpu, collective=how, nsteps=nsteps, u_end=u)
     end
+    # CPU: nshards is a cache partition (default 1). Threads walk columns, not devices.
+    ns = resolve_cpu_nshards(M; nshards=nshards)
+    small, larges, counts, offsets = build_u0_2nd_mgpu(M, d.Nj, kind, ns)
+    delta0, kappa_e, kappa_i = Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i)
+    delta_b = collect(Float64, d.delta_b)
+    g_b = collect(Float64, d.g_b)
     small, larges, nsteps = integrate_order2_sharded!(
         small, larges, counts, offsets, delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t, d.timespan;
         reltol=reltol, abstol=abstol, tsave=tsave)
     u = zeros(ComplexF64, state_length_2nd_order(M))
     shards_to_dense!(u, small, larges, counts, offsets, M)
-    return unpack_state_2nd_order_u(u, M), (backend=:cpu, nshards=ns, nsteps=nsteps, u_end=u)
+    return unpack_state_2nd_order_u(u, M),
+           (backend=:cpu, nshards=ns, nthreads=_cpu_nthreads(), nsteps=nsteps, u_end=u)
 end
 
 function pulse_metrics_from_state(Sp, Sz, d)
