@@ -342,15 +342,11 @@ function run_sim_1st_order(
 
     CUDA.allowscalar(false)
 
-    sol_gpu = solve(
-        prob_gpu,
-        Tsit5();
+    sol_gpu = chimera_solve(
+        prob_gpu;
         reltol = CONFIG.reltol,
         abstol = CONFIG.abstol,
         callback = cb,
-        save_on = false,
-        save_everystep = false,
-        dense = false,
     )
 
     CUDA.synchronize()

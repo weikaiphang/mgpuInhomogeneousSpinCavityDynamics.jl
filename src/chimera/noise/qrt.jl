@@ -338,92 +338,17 @@ function _noise_qrt_rhs_gpu!(
     Sp_mean,
     Sz_mean,
 )
-    B = length(a_col)
-
-
-
-    delta_col = reshape(delta_b_gpu, :, 1)
-    g_col     = reshape(g_b_gpu, :, 1)
-
-
-
-
-
-    sum_g_Sm = vec(
-        sum(
-            g_col .* Sm_col;
-            dims = 1,
-        )
+    factorized_first_order_jacobian_action!(
+        da, dadag, dSp, dSm, dSz,
+        a_col, adag_col, Sp_col, Sm_col, Sz_col,
+        a_mean, Sp_mean, Sz_mean,
+        delta0_us, delta_b_gpu, g_b_gpu, kappa_t_us,
     )
-
-    sum_g_Sp = vec(
-        sum(
-            g_col .* Sp_col;
-            dims = 1,
-        )
-    )
-
-    da .= (
-        (
-            -kappa_t_us / 2 -
-            1im * delta0_us
-        ) .* a_col .-
-        1im .* sum_g_Sm
-    ) .* active_vec
-
-    dadag .= (
-        (
-            -kappa_t_us / 2 +
-            1im * delta0_us
-        ) .* adag_col .+
-        1im .* sum_g_Sp
-    ) .* active_vec
-
-
-
-
-
-    adag_mean = conj(a_mean)
-
-    a_row = reshape(
-        a_col,
-        1,
-        B,
-    )
-
-    adag_row = reshape(
-        adag_col,
-        1,
-        B,
-    )
-
-    dSp .= (
-        1im .* delta_col .* Sp_col .-
-        2im .* g_col .* (
-            adag_mean .* Sz_col .+
-            Sz_mean .* adag_row
-        )
-    ) .* active_row
-
-    dSm .= (
-        -1im .* delta_col .* Sm_col .+
-        2im .* g_col .* (
-            a_mean .* Sz_col .+
-            Sz_mean .* a_row
-        )
-    ) .* active_row
-
-    dSz .= (
-        -1im .* g_col .* (
-            a_mean .* Sp_col .+
-            Sp_mean .* a_row
-        ) .+
-        1im .* g_col .* (
-            adag_mean .* Sm_col .+
-            conj.(Sp_mean) .* adag_row
-        )
-    ) .* active_row
-
+    da .*= active_vec
+    dadag .*= active_vec
+    dSp .*= active_row
+    dSm .*= active_row
+    dSz .*= active_row
     return nothing
 end
 

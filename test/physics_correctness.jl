@@ -5,34 +5,38 @@ using CUDA
 using Distributions
 using FastGaussQuadrature
 
+if !@isdefined(_gauss_legendre_pts_golub_welsch)
+    include(joinpath(@__DIR__, "oracles", "golub_welsch.jl"))
+end
+
 if !@isdefined(state_length_2nd_order)
-    include(joinpath(@__DIR__, "..", "src", "state_layout_2nd_order.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "state_2nd.jl"))
 end
 if !@isdefined(_unknown_initial_condition)
-    include(joinpath(@__DIR__, "..", "src", "initial_conditions_1st_order.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "ics_1st.jl"))
 end
 if !@isdefined(product_SmSp_same)
-    include(joinpath(@__DIR__, "..", "src", "initial_conditions_2nd_order.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "ics_2nd.jl"))
 end
 if !@isdefined(rhs_2nd_order!)
-    include(joinpath(@__DIR__, "..", "src", "rhs_2nd_order.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "closure_2nd.jl"))
 end
 if !@isdefined(small_length)
-    include(joinpath(@__DIR__, "..", "src", "MGPUlayout.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "mgpu", "layout.jl"))
 end
 if !@isdefined(rhs_cpu!)
-    include(joinpath(@__DIR__, "..", "src", "MGPUrhs_cpu.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "mgpu", "rhs_cpu.jl"))
 end
 if !@isdefined(total_spin_number_from_cooperativity)
-    include(joinpath(@__DIR__, "..", "src", "frequency_inhomogeneity.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "frequency.jl"))
 end
 if !@isdefined(prepare_derived)
-    include(joinpath(@__DIR__, "..", "src", "coupling_inhomogeneity.jl"))
-    include(joinpath(@__DIR__, "..", "src", "ensemble.jl"))
-    include(joinpath(@__DIR__, "..", "src", "ensemble_quadrature.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "coupling.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "ensemble.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "quadrature.jl"))
 end
 if !@isdefined(_with_default_ensemble_method)
-    include(joinpath(@__DIR__, "..", "src", "simulation_api.jl"))
+    include(joinpath(@__DIR__, "..", "src", "chimera", "api.jl"))
 end
 if !@isdefined(QRT_CLOSURE_LEVEL)
     const QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian

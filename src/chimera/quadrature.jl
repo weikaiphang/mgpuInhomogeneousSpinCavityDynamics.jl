@@ -1,30 +1,20 @@
 
+# Ensemble quadrature owner: FastGaussQuadrature.jl (Hale & Townsend).
+# Production paths call `gausslegendre` only. Homemade Golub–Welsch lives in
+# test/oracles/golub_welsch.jl as an optional parity oracle.
 
-
-function _gauss_legendre_pts_golub_welsch(n::Integer)
-    n >= 1 || error("_gauss_legendre_pts: n must be >= 1")
-    n == 1 && return ([0.0], [2.0])
-    k = collect(1.0:(n - 1))
-    beta = k ./ sqrt.(4 .* k .^ 2 .- 1.0)
-    E = eigen(SymTridiagonal(zeros(Float64, n), beta))
-    x = E.values
-    w = 2.0 .* (E.vectors[1, :] .^ 2)
-    p = sortperm(x)
-    return x[p], w[p]
+function fgq_gausslegendre(n::Integer)
+    n >= 1 || error("fgq_gausslegendre: n must be >= 1")
+    x, w = gausslegendre(Int(n))
+    return collect(Float64.(x)), collect(Float64.(w))
 end
 
 function _gauss_legendre_pts(n::Integer)
-    n >= 1 || error("_gauss_legendre_pts: n must be >= 1")
-    if isdefined(@__MODULE__, :gausslegendre)
-        x, w = gausslegendre(Int(n))
-        return collect(Float64.(x)), collect(Float64.(w))
-    end
-    return _gauss_legendre_pts_golub_welsch(n)
+    return fgq_gausslegendre(n)
 end
 
-
 function _gauss_legendre_on(n::Integer, a::Real, b::Real)
-    x, w = _gauss_legendre_pts(n)
+    x, w = fgq_gausslegendre(n)
     half = 0.5 * (b - a)
     return half .* x .+ 0.5 * (a + b), half .* w
 end

@@ -84,13 +84,10 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     t0 = time_ns()
 
     sol_gpu = CUDA.allowscalar() do
-        solve(prob_gpu, Tsit5();
+        chimera_solve(prob_gpu;
             reltol = CONFIG.reltol,
             abstol = CONFIG.abstol,
             callback = cb,
-            save_on = false,
-            save_everystep = false,
-            dense = false,
         )
     end
 

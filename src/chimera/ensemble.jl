@@ -119,7 +119,7 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
     if _ens_plan.method === :quadrature
         @isdefined(prepare_derived_quadrature) || error(
             "prepare_derived: ensemble_method resolved to :quadrature but " *
-            "ensemble_quadrature.jl is not loaded -- include it next to ensemble.jl.")
+            "chimera/quadrature.jl is not loaded -- include it next to ensemble.jl.")
         return prepare_derived_quadrature(CONFIG; plan = _ens_plan)
     end
 

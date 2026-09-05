@@ -25,6 +25,9 @@ end
     return Base.mapreduce(identity, +, bc; dims = 1)
 end
 
+# Large-M backend of the QuantumCumulants 1st-order (factorized) mean-field
+# EOMs for H in eoms/hamiltonian.jl. SciML integrates this vector field.
+
 function rhs_1st_order!(du, u, p, t)
 
 

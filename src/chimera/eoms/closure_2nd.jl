@@ -1,7 +1,10 @@
 
-# Canonical 2nd-order cumulant RHS (monolith packing 3+9M+4M²).
-# `rhs_cpu!` is a thin wrapper around this function. MGPU device kernels
-# are a fused sharded replica, not a second equation set.
+# Large-M backend of the QuantumCumulants-derived 2nd-order cumulant closure
+# for the inhomogeneous Tavis–Cummings / Dicke ensemble (see
+# eoms/hamiltonian.jl and eoms/quantum_cumulants.jl). Same-bin moments live
+# in *_same; cross-block diagonals are unused (diag_mask = .!I). `rhs_cpu!`
+# wraps this function. MGPU kernels are a fused sharded replica, not a
+# second equation set.
 function rhs_2nd_order!(du, u, p, t)
     delta0, kappa_e, kappa_i, delta_b_gpu, g_b_gpu, M, diag_mask, E_of_t = p
 

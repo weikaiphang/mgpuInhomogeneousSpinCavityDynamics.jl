@@ -1,4 +1,5 @@
-
+# Production multi-GPU API. Row-sum exchange defaults to NCCL Allreduce
+# (device collectives). P2P then host are fallbacks only.
 
 function assemble_problem(M::Integer,
                           delta_b::AbstractVector,

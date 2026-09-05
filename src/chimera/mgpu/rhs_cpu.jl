@@ -6,7 +6,7 @@
 #
 # There is ONE 2nd-order RHS: `rhs_2nd_order!`. This function is a thin
 # wrapper so MGPU CPU checks cannot drift from the monolith. Device
-# kernels in MGPUkernels.jl remain the fused sharded replica.
+# kernels in chimera/mgpu/kernels.jl remain the fused sharded replica.
 function rhs_cpu!(du::AbstractVector{Complex{T}}, u::AbstractVector{Complex{T}},
                   delta0::T, kappa_e::T, kappa_i::T,
                   delta_b::AbstractVector{T}, g_b::AbstractVector{T},
