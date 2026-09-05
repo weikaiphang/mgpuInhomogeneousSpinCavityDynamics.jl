@@ -797,7 +797,7 @@ function prepare_derived(CONFIG; ensemble_method::Symbol=:config)
         g_1d, p_g, g_mean, g_std, g2_avg = _quad_coupling_bins(gcfg, M_g)
     else
         gk = _sym(gcfg.kind)
-        gk === :constant || error("histogram supports only :constant g; got kind=$(gk). Use :quadrature or :auto for quad-friendly g")
+        gk === :constant || error("histogram supports only :constant g; got kind=:$gk. Use :quadrature or :auto for quad-friendly g")
         g_1d, p_g, g_mean, g_std, g2_avg = _quad_coupling_bins(gcfg, 1)
     end
     M_g = length(g_1d)
