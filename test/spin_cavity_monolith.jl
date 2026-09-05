@@ -413,12 +413,12 @@ _bench_Et(t) = ComplexF64(0.1, 0.05)
     ack, _, _, ick = M.solve_1st_order(d1, _bench_Et, :equator; integrator=:ck45, backend=:cpu)
     @test i5.integrator === :tsit5
     @test ick.integrator === :ck45
-    @test a5 != ack || i5.nsteps != ick.nsteps
+    @test i5.nsteps != ick.nsteps
     _, info5 = M.solve_2nd_order(d1, _bench_Et, :equator; integrator=:tsit5, backend=:cpu)
     _, infock = M.solve_2nd_order(d1, _bench_Et, :equator; integrator=:ck45, backend=:cpu)
     @test info5.integrator === :tsit5
     @test infock.integrator === :ck45
-    @test info5.u_end ≉ infock.u_end rtol=1e-14 atol=0
+    @test info5.nsteps != infock.nsteps
     pulse, d, u, Ttotal = _tiny_pulse_problem()
     @test_throws ErrorException M.pulse_cost_grad_adjoint(
         u, pulse, d; integrator=:ck45, reltol=1e2, abstol=1e2, dt0=Ttotal)
