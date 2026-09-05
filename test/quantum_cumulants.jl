@@ -33,5 +33,9 @@ else
         @test length(eqsM2.states) >= 3
         @test CHIMERA_HAMILTONIAN.interaction == "sum_j g_j * (a * Sp_j + a' * Sm_j)"
         @test qc_available()
+        gen = read(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "generated", "tc_equations.txt"), String)
+        @test occursin("=== order 2, M=1 ===", gen)
+        @test occursin("⟨a' * σ₂₂⟩", gen)
+        @test occursin(string(eqs2), gen) || occursin("∂ₜ(⟨a⟩)", gen)
     end
 end

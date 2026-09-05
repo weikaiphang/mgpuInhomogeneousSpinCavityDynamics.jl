@@ -925,6 +925,53 @@ end
     end
 end
 
+@testset "hardware inventory (honest multi-GPU gate)" begin
+    ndev = try
+        CUDA.functional() ? length(collect(CUDA.devices())) : 0
+    catch
+        0
+    end
+    @test ndev >= 0
+    if ndev < 2
+        @test_skip "≥2 CUDA devices required for live NCCL Allreduce / P2P / CuArray MGPU RHS; this worker has $ndev"
+    end
+end
+
+@testset "QC order-2 M=1 image vs monolith vs CPU-sharded MGPU" begin
+    if !@isdefined(compare_qc_to_closure_2nd_M1)
+        include(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "quantum_cumulants.jl"))
+    end
+    err, du_qc, du_cl = compare_qc_to_closure_2nd_M1()
+    @test err < 1e-12
+    @test du_qc ≈ du_cl atol=1e-12
+    @test maximum(abs.(du_qc)) > 1e-8
+
+    M = 1
+    Nj = [1.0]
+    u = build_u0_2nd_order(M, Nj, :equator)
+    u[1] = 0.12 + 0.04im
+    u[2] = 0.03 + 0.01im
+    u[3] = 0.07
+    u[6] = 0.02 - 0.015im
+    u[7] = 0.011 + 0.02im
+    u[8] = -0.04 + 0.01im
+    delta0, ke, ki, Et = 0.3, 0.4, 0.1, 0.08
+    delta, g = [0.25], [0.15]
+    du_mono = _stress_monolith_rhs(u, delta, g, ke, ki, ComplexF64(Et), delta0)
+    du_cpu = zero(u)
+    rhs_cpu!(du_cpu, u, delta0, ke, ki, delta, g, ComplexF64(Et))
+    @test du_cpu ≈ du_mono rtol=1e-13 atol=1e-13
+
+    part = EnsemblePartition(M, 1)
+    du_shard = _stress_mgpu_rhs(u, delta, g, ComplexF64(Et), delta0, ke, ki, part, :none)
+    @test du_shard ≈ du_mono rtol=1e-12 atol=1e-12
+
+    u_qc = chimera_u_to_qc_2nd_M1(u)
+    du_qc2 = zero(u_qc)
+    qc_rhs_2nd_M1_image!(du_qc2, u_qc, (delta0, ke + ki, delta[1], g[1], sqrt(ke) * Et), 0.0)
+    @test du_qc2 ≈ chimera_du_to_qc_2nd_M1(du_mono, u) atol=1e-12
+end
+
 @testset "GPU↔CPU 2nd-order RHS parity" begin
     gpu_ok = false
     try
