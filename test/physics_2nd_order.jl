@@ -6,6 +6,8 @@ for (pred, rel) in (
     (!isdefined(@__MODULE__, :small_length), "MGPUlayout.jl"),
     (!isdefined(@__MODULE__, :rhs_cpu!), "MGPUrhs_cpu.jl"),
     (!isdefined(@__MODULE__, :rhs_2nd_order!), "rhs_2nd_order.jl"),
+    (!isdefined(@__MODULE__, :Tsit5Tableau), "MGPUtableaus.jl"),
+    (!isdefined(@__MODULE__, :Solver2Workspace), "solver_2nd_workspace.jl"),
     (!isdefined(@__MODULE__, :build_u0_cpu_2nd_order), "initial_conditions_2nd_order.jl"),
     (!isdefined(@__MODULE__, :_with_default_ensemble_method), "simulation_api.jl"),
     (!isdefined(@__MODULE__, :build_constant_coupling_bins), "coupling_inhomogeneity.jl"),
@@ -383,3 +385,54 @@ end
     alloc = @allocated rhs_cpu!(du_s, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
     @test alloc == 0
 end
+
+@testset "solver/integrator persistent workspace" begin
+    M = 8
+    Nt = 6
+    Nj = fill(12.0, M)
+    u0 = build_u0_cpu_2nd_order(M, Nj, :ground)
+    ws = Solver2Workspace(Float64, M, Nt; stages = true)
+    attach_u0!(ws, u0)
+    @test length(ws.u) == state_length_2nd_order(M)
+    @test length(ws.host) == 3 + 5M
+
+    record_save2!(ws, ws.u, 1)
+    record_save2!(ws, ws.u, 1)
+    alloc_rec = @allocated record_save2!(ws, ws.u, 1)
+    @test alloc_rec == 0
+    @test ws.a[1] ≈ 0 atol = 1e-15
+    @test ws.n[1] ≈ 0 atol = 1e-15
+    @test real.(ws.Sz[:, 1]) ≈ -Nj ./ 2 atol = 1e-14
+
+    delta_b = Float64[0.05 * (j - 4) for j in 1:M]
+    g_b = fill(0.4, M)
+    p = (0.0, 1.5, 0.25, delta_b, g_b, M, nothing, Returns(0.0im), ws.rhs)
+    atol = 1e-8
+    rtol = 1e-8
+    _cpu_rhs!(ws, ws.k1, ws.u, p, 0.0)
+    tsit5_cpu_step!(ws, p, 0.0, 1e-4, atol, rtol)
+    _cpu_rhs!(ws, ws.k1, ws.u, p, 0.0)
+    alloc_step = @allocated tsit5_cpu_step!(ws, p, 0.0, 1e-4, atol, rtol)
+    @test alloc_step == 0
+
+    attach_u0!(ws, u0)
+    tsave = collect(range(0.0, 0.05; length = Nt))
+    stats = solve_cpu_2nd!(ws, p, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    @test ws.saved[] == Nt
+    @test stats.naccept >= Nt - 1
+    @test maximum(abs, ws.a) < 1e-12
+    @test maximum(abs, ws.n) < 1e-12
+    for k in 1:Nt
+        @test real.(ws.Sz[:, k]) ≈ -Nj ./ 2 atol = 1e-12
+    end
+
+    # Two workspaces, same IC / drive → bit-identical trajectory.
+    ws_b = Solver2Workspace(Float64, M, Nt; stages = true)
+    attach_u0!(ws_b, u0)
+    solve_cpu_2nd!(ws_b, p, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
+    @test ws.a == ws_b.a
+    @test ws.n == ws_b.n
+    @test ws.Sz == ws_b.Sz
+    @test ws.u == ws_b.u
+end
+

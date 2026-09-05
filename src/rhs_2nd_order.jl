@@ -24,7 +24,9 @@ end
 @inline function _rowsum_same_plus_cross!(sumg, same, cross, g, diag_mask)
     diag_mask === nothing && error("diag_mask is required for monolith row-sums")
     # CPU: GEMV + O(M) diag correction (no M×M temporary).
-    # GPU: keep (cross .* diag_mask) — no scalar indexing.
+    # GPU: keep (cross .* diag_mask) — no scalar indexing. Later CuArray port
+    # can use the same GEMV + diag correction (no M×M mask alloc); not required
+    # this tip and not claimed done.
     if cross isa Array
         mul!(sumg, cross, g)
         @inbounds for j in eachindex(sumg)
@@ -35,6 +37,28 @@ end
         @. sumg = same * g + sumg
     end
     return nothing
+end
+
+@inline function _sum_workspace(v)
+    if v isa Array
+        s = zero(eltype(v))
+        @inbounds for i in eachindex(v)
+            s += v[i]
+        end
+        return s
+    end
+    return sum(v)
+end
+
+@inline function _sum_conj_workspace(v)
+    if v isa Array
+        s = zero(eltype(v))
+        @inbounds for i in eachindex(v)
+            s += conj(v[i])
+        end
+        return s
+    end
+    return sum(conj, v)
 end
 
 function rhs_2nd_order!(du, u, p, t)
@@ -82,14 +106,14 @@ function _rhs_2nd_order_mulpath!(du, u, p, t)
     @. ws.g_adSp = g_b_gpu * adSp
     @. ws.g_adSm = g_b_gpu * adSm
 
-    du[IDX2_a] = sqrt(κe) * E_t - 1im * delta0 * a - 1im * sum(ws.gconjSp) - 0.5 * κt * a
+    du[IDX2_a] = sqrt(κe) * E_t - 1im * delta0 * a - 1im * _sum_workspace(ws.gconjSp) - 0.5 * κt * a
 
     @. dSp = 1im * delta_b_gpu * Sp - 2im * g_b_gpu * adSz
     @. dSz = -1im * g_b_gpu * conj(adSm) + 1im * g_b_gpu * adSm
 
-    du[IDX2_ad_ad] = 2im * delta0 * ad_ad + 2im * sum(ws.g_adSp) - κt * ad_ad +
+    du[IDX2_ad_ad] = 2im * delta0 * ad_ad + 2im * _sum_workspace(ws.g_adSp) - κt * ad_ad +
                      2 * sqrt(κe) * conj(a) * conj(E_t)
-    du[IDX2_ad_a] = 1im * sum(conj, ws.g_adSm) - 1im * sum(ws.g_adSm) - κt * ad_a +
+    du[IDX2_ad_a] = 1im * _sum_conj_workspace(ws.g_adSm) - 1im * _sum_workspace(ws.g_adSm) - κt * ad_a +
                     sqrt(κe) * E_t * conj(a) + sqrt(κe) * conj(E_t) * a
 
     _rowsum_same_plus_cross!(ws.sumgSpSp, SpSp_same, SpSp_cross, g_b_gpu, diag_mask)

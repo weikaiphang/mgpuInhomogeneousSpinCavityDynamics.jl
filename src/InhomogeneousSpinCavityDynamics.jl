@@ -51,12 +51,13 @@ include("pulse_report.jl")
 include("state_layout_2nd_order.jl")
 include("initial_conditions_2nd_order.jl")
 include("rhs_2nd_order.jl")
+include("MGPUtableaus.jl")
+include("solver_2nd_workspace.jl")
 include("solver_2nd_order.jl")
 
 include("MGPUlayout.jl")
 include("MGPUdevices.jl")
 include("MGPUkernels.jl")
-include("MGPUtableaus.jl")
 include("MGPUproblem.jl")
 include("MGPUintegrator.jl")
 include("MGPUinitial_conditions.jl")
@@ -76,6 +77,7 @@ export run_sim_2nd_order
 export build_u0_cpu_2nd_order
 export rhs_2nd_order!
 export rhs_cpu!
+export Solver2Workspace, solve_cpu_2nd!, record_save2!, tsit5_cpu_step!, attach_u0!
 
 export mgpu_run
 export mgpu_run_simulation

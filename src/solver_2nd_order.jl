@@ -1,5 +1,21 @@
 
-function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=true)
+function _cuda_2nd_functional()
+    try
+        return CUDA.functional()
+    catch
+        return false
+    end
+end
+
+function _want_gpu_2nd(backend::Symbol)
+    backend === :cpu && return false
+    backend === :gpu && return true
+    backend === :auto && return _cuda_2nd_functional()
+    error("backend must be :auto, :cpu, or :gpu; got $(backend).")
+end
+
+function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
+                           clean_gpu=true, backend::Symbol=:auto)
     SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, :second_order)
     CONFIG = build_full_config(SIM_SETTING, SYSTEM_CONFIG)
 
@@ -16,6 +32,70 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     E_of_t = build_E_of_t(PULSE_CONFIG)
 
     initial_condition = get_initial_condition(CONFIG)
+    use_gpu = _want_gpu_2nd(backend)
+
+    t_saved = d.t_save
+    E_of_t_arr = Vector{ComplexF64}(undef, Nt)
+    @inbounds for i in 1:Nt
+        E_of_t_arr[i] = E_of_t(t_saved[i])
+    end
+
+    if !use_gpu
+        u0 = build_u0_cpu_2nd_order(M, d.Nj, initial_condition)
+        ws = Solver2Workspace(Float64, M, Nt; stages = true)
+        attach_u0!(ws, u0)
+        p = (
+            d.delta0,
+            d.kappa_e,
+            d.kappa_i,
+            Float64.(d.delta_b),
+            Float64.(d.g_b),
+            M,
+            nothing,
+            E_of_t,
+            ws.rhs,
+        )
+        t0 = time_ns()
+        stats = solve_cpu_2nd!(ws, p, d.timespan[1], d.timespan[2], t_saved;
+                               reltol = CONFIG.reltol, abstol = CONFIG.abstol)
+        elapsed_seconds = (time_ns() - t0) / 1e9
+        println("Callback saved $(ws.saved[]) / $Nt requested time points")
+        ws.saved[] == Nt || error(
+            "Callback saved $(ws.saved[]) points, but expected $Nt."
+        )
+        println("Time taken: $elapsed_seconds seconds")
+        println("  accepted steps : $(stats.naccept)")
+        println("  rejected steps : $(stats.nreject)")
+        println("  RHS evaluations: $(stats.nrhs)")
+
+        data = (
+            SIM_SETTING = SIM_SETTING,
+            SYSTEM_CONFIG = SYSTEM_CONFIG,
+            PULSE_CONFIG = PULSE_CONFIG,
+            t_saved = t_saved,
+            a_sol = ws.a,
+            n_sol = ws.n,
+            adad_sol = ws.adad,
+            Sp_sol = ws.Sp,
+            Sz_sol = ws.Sz,
+            adSp_sol = ws.adSp,
+            adSm_sol = ws.adSm,
+            adSz_sol = ws.adSz,
+            E_of_t_arr = E_of_t_arr,
+            delta_b_1d = d.delta_b_1d,
+            g_b_1d = d.g_b_1d,
+            Nj_2d = d.Nj_2d,
+            N_total = d.N_total,
+            elapsed_seconds = elapsed_seconds,
+            solver_stats = stats,
+            backend = :cpu,
+        )
+        filename = CONFIG.saved_file_name
+        save_run_data(filename, data)
+        println("Saving to: ", filename)
+        return data
+    end
+
     u0_gpu = build_u0_gpu_2nd_order(M, d.Nj, initial_condition)
 
     delta_b_gpu = CuArray(Float64.(d.delta_b))
@@ -23,6 +103,7 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     diag_mask   = make_diag_mask(M)
 
     rhs_ws = _rhs2_workspace(u0_gpu, M)
+    save_ws = Solver2Workspace(Float64, M, Nt; stages = false)
     p_gpu = (
         d.delta0,
         d.kappa_e,
@@ -41,45 +122,11 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     cb = nothing
 
     try
-
-
-
-
-    a_save    = Vector{ComplexF64}(undef, Nt)
-    adad_save = Vector{ComplexF64}(undef, Nt)
-    n_save    = Vector{Float64}(undef, Nt)
-
-    Sp_save = Matrix{ComplexF64}(undef, M, Nt)
-    Sz_save = Matrix{ComplexF64}(undef, M, Nt)
-
-    adSp_save = Matrix{ComplexF64}(undef, M, Nt)
-    adSm_save = Matrix{ComplexF64}(undef, M, Nt)
-    adSz_save = Matrix{ComplexF64}(undef, M, Nt)
-
-    range_Sp = IDX2_Sp_start : IDX2_Sp_start + M - 1
-    range_Sz = idx2_Sz_start(M) : idx2_Sz_start(M) + M - 1
-
-    range_adSp = idx2_adSp_start(M) : idx2_adSp_start(M) + M - 1
-    range_adSm = idx2_adSm_start(M) : idx2_adSm_start(M) + M - 1
-    range_adSz = idx2_adSz_start(M) : idx2_adSz_start(M) + M - 1
-
     kref = Ref(0)
 
     function affect!(integrator)
         kref[] += 1
-        k = kref[]
-        u = integrator.u
-
-        a_save[k]    = Array(@view u[IDX2_a:IDX2_a])[1]
-        adad_save[k] = Array(@view u[IDX2_ad_ad:IDX2_ad_ad])[1]
-        n_save[k]    = real(Array(@view u[IDX2_ad_a:IDX2_ad_a])[1])
-
-        Sp_save[:, k] .= Array(@view u[range_Sp])
-        Sz_save[:, k] .= Array(@view u[range_Sz])
-
-        adSp_save[:, k] .= Array(@view u[range_adSp])
-        adSm_save[:, k] .= Array(@view u[range_adSm])
-        adSz_save[:, k] .= Array(@view u[range_adSz])
+        record_save2!(save_ws, integrator.u, kref[])
     end
 
     cb = PresetTimeCallback(d.t_save, affect!; save_positions=(false, false))
@@ -87,7 +134,7 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     t0 = time_ns()
 
     CUDA.allowscalar(false)
-    sol_gpu = solve(prob_gpu, Tsit5();
+    integrator = init(prob_gpu, Tsit5();
         reltol = CONFIG.reltol,
         abstol = CONFIG.abstol,
         callback = cb,
@@ -95,6 +142,8 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
         save_everystep = false,
         dense = false,
     )
+    solve!(integrator)
+    sol_gpu = integrator.sol
     CUDA.synchronize()
 
     elapsed_seconds = (time_ns() - t0) / 1e9
@@ -106,14 +155,6 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
     println("Time taken: $elapsed_seconds seconds")
 
-
-
-
-
-    t_saved = d.t_save
-
-    E_of_t_arr = [E_of_t(t) for t in t_saved]
-
     data = (
         SIM_SETTING = SIM_SETTING,
         SYSTEM_CONFIG = SYSTEM_CONFIG,
@@ -121,16 +162,16 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
         t_saved = t_saved,
 
-        a_sol = a_save,
-        n_sol = n_save,
-        adad_sol = adad_save,
+        a_sol = save_ws.a,
+        n_sol = save_ws.n,
+        adad_sol = save_ws.adad,
 
-        Sp_sol = Sp_save,
-        Sz_sol = Sz_save,
+        Sp_sol = save_ws.Sp,
+        Sz_sol = save_ws.Sz,
 
-        adSp_sol = adSp_save,
-        adSm_sol = adSm_save,
-        adSz_sol = adSz_save,
+        adSp_sol = save_ws.adSp,
+        adSm_sol = save_ws.adSm,
+        adSz_sol = save_ws.adSz,
 
         E_of_t_arr = E_of_t_arr,
 
@@ -140,6 +181,7 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
         N_total = d.N_total,
         elapsed_seconds = elapsed_seconds,
+        backend = :gpu,
     )
 
     filename = CONFIG.saved_file_name

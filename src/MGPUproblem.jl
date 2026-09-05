@@ -22,6 +22,7 @@ mutable struct Shard{T}
     gsums::CuVector{Complex{T}}
     normpart::CuVector{T}
     normout::CuVector{T}
+    normhost::Vector{T}
     ev::CuEvent
 
     nthreads_cross::Int
@@ -128,6 +129,7 @@ function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T
             CUDA.zeros(Complex{T}, 3),
             CUDA.zeros(T, nbn),
             CUDA.zeros(T, 1),
+            zeros(T, 1),
             CuEvent(CUDA.EVENT_DISABLE_TIMING),
             nthreads, nchunk, chunk_len, nbs, nbv, nbn,
             nccl_send, nccl_recv,
@@ -395,7 +397,8 @@ function gather_norm(prob::MGPUProblem{T}) where {T}
     for s in prob.shards
         CUDA.device!(s.dev)
         CUDA.synchronize(s.stream)
-        total += Array(s.normout)[1]
+        copyto!(s.normhost, s.normout)
+        total += s.normhost[1]
     end
     return sqrt(total / global_state_length(prob.M))
 end
