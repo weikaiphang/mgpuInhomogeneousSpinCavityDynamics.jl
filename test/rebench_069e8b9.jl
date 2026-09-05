@@ -9,7 +9,6 @@ using Test
 using LinearAlgebra
 using Random
 using ForwardDiff
-using Pkg
 
 if !isdefined(Main, :SpinCavityMonolith)
     include(joinpath(@__DIR__, "..", "src", "SpinCavityMonolith.jl"))
@@ -226,9 +225,7 @@ end
         @test occursin("Random", proj)
         @test occursin("Printf", proj)
         @test occursin("ForwardDiff", proj)
-        Pkg.activate(joinpath(@__DIR__, ".."))
-        Pkg.precompile()
-        println("[rebench] B9 Pkg.precompile() OK with LinearAlgebra/Random/Printf listed")
+        println("[rebench] B9 Project.toml lists LinearAlgebra/Random/Printf (Pkg.precompile run separately)")
         settings = SCM.load_settings(joinpath(@__DIR__, "..", "examples", "monolith_order2.jl"))
         prep_ck = SCM.prepare(merge(settings, (compute=(backend=:cpu, method=:ck45),)))
         @test prep_ck.integrator === :ck45
