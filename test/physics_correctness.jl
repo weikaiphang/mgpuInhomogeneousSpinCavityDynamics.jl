@@ -942,6 +942,7 @@ end
         (3, PHYS_NJ, :ground),
         (3, PHYS_NJ, :equator),
         (3, PHYS_NJ, :weak),
+        (3, PHYS_NJ, :inverted),
         (1, [5.0], :ground),
         (5, [1.0, 2.0, 0.5, 8.0, 3.0], :equator),
         (7, collect(1.0:7.0), :weak),
@@ -973,10 +974,103 @@ end
         mask = ComplexF64.(.!Matrix(I, M, M))
         p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
         part = EnsemblePartition(M, min(3, M))
-        du = zero(u)
-        rhs_2nd_order_sharded!(du, u, p, 0.0, part, :host)
-        @test du ≈ du_mono rtol=1e-11 atol=1e-11
+        for mode in (:nccl, :p2p, :host)
+            du = zero(u)
+            rhs_2nd_order_sharded!(du, u, p, 0.0, part, mode)
+            @test du ≈ du_mono rtol=1e-11 atol=1e-11
+        end
     end
+end
+
+function _parity_residuals(du_sharded, du_mono)
+    diff = du_sharded .- du_mono
+    max_abs = maximum(abs.(diff))
+    scale = max.(abs.(du_mono), abs.(du_sharded), 1e-30)
+    max_rel = maximum(abs.(diff) ./ scale)
+    return max_abs, max_rel
+end
+
+# PRIMARY CHEW: production `rhs_2nd_order_sharded!` ≡ monolith `rhs_2nd_order!`.
+# Reports max abs/rel residuals over IC kinds, uneven partitions, and backends.
+@testset "PRIMARY chew: sharded RHS residual table vs monolith" begin
+    rows = NamedTuple[]
+    cases = (
+        (3, PHYS_NJ, :ground),
+        (3, PHYS_NJ, :equator),
+        (3, PHYS_NJ, :weak),
+        (3, PHYS_NJ, :inverted),
+        (3, PHYS_NJ, :weak_inverted),
+        (1, [5.0], :ground),
+        (5, [1.0, 2.0, 0.5, 8.0, 3.0], :equator),
+        (5, [1.0, 2.0, 0.5, 8.0, 3.0], :inverted),
+        (7, collect(1.0:7.0), :weak),
+        (8, fill(2.0, 8), :ground),
+        (11, collect(range(0.5, 6.0; length=11)), :equator),
+    )
+    for (M, Nj, kind) in cases
+        delta, g, ke, ki, Et, delta0 = _stress_phys_p(M, Nj)
+        u = build_u0_2nd_order(M, Nj, kind)
+        du_mono = _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+        mask = ComplexF64.(.!Matrix(I, M, M))
+        p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
+        shard_counts = unique(filter(ns -> 1 <= ns <= M, (1, 2, 3, 5, M)))
+        for ns in shard_counts
+            part = EnsemblePartition(M, ns)
+            uneven = maximum(part.counts) != minimum(part.counts)
+            modes = ns == 1 ? (:none,) : (:nccl, :p2p, :host)
+            for mode in modes
+                du = zero(u)
+                rhs_2nd_order_sharded!(du, u, p, 0.0, part, mode)
+                max_abs, max_rel = _parity_residuals(du, du_mono)
+                push!(rows, (kind=kind, M=M, ns=ns, mode=mode, uneven=uneven,
+                             max_abs=max_abs, max_rel=max_rel))
+                @test all(isfinite, du)
+                @test max_abs < 1e-12
+                @test max_rel < 1e-12 || max_abs < 1e-14
+            end
+        end
+    end
+
+    rng = MersenneTwister(8190)
+    for M in (3, 5, 8, 11)
+        delta, g, ke, ki, Et, delta0 = _stress_phys_p(M, ones(M))
+        u = randn(rng, ComplexF64, state_length_2nd_order(M))
+        du_mono = _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+        mask = ComplexF64.(.!Matrix(I, M, M))
+        p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
+        @test maximum(abs.(du_mono)) > 1e-8
+        for ns in unique(filter(n -> 1 <= n <= M, (1, 2, 3, 5, M)))
+            part = EnsemblePartition(M, ns)
+            uneven = maximum(part.counts) != minimum(part.counts)
+            modes = ns == 1 ? (:none,) : (:nccl, :p2p, :host)
+            for mode in modes
+                du = zero(u)
+                rhs_2nd_order_sharded!(du, u, p, 0.0, part, mode)
+                max_abs, max_rel = _parity_residuals(du, du_mono)
+                push!(rows, (kind=:random, M=M, ns=ns, mode=mode, uneven=uneven,
+                             max_abs=max_abs, max_rel=max_rel))
+                @test all(isfinite, du)
+                @test max_abs < 1e-11
+                @test max_rel < 1e-11 || max_abs < 1e-14
+            end
+        end
+    end
+
+    worst_abs = maximum(r.max_abs for r in rows)
+    worst_rel = maximum(r.max_rel for r in rows)
+    n_uneven = count(r -> r.uneven, rows)
+    kinds = sort(unique(String(r.kind) for r in rows))
+    println("PRIMARY chew residuals: n=$(length(rows)) kinds=$(kinds) uneven_rows=$n_uneven")
+    println("  max_abs=$(worst_abs)  max_rel=$(worst_rel)")
+    for kind in (:ground, :equator, :weak, :inverted, :weak_inverted, :random)
+        sub = filter(r -> r.kind === kind, rows)
+        isempty(sub) && continue
+        println("  $(kind): max_abs=$(maximum(r.max_abs for r in sub)) max_rel=$(maximum(r.max_rel for r in sub)) n=$(length(sub))")
+    end
+    @test n_uneven > 0
+    @test worst_abs < 1e-11
+    @test worst_rel < 1e-11 || worst_abs < 1e-14
+    @test Set(r.kind for r in rows) >= Set((:ground, :equator, :weak, :inverted, :random))
 end
 
 @testset "GPU↔CPU 2nd-order RHS parity" begin
