@@ -908,8 +908,8 @@ end
     )
     for (M, Nj, kind, delta0, ke, ki, Et) in edges
         u = build_u0_2nd_order(M, Nj, kind)
-        delta = collect(range(-2π * 1e5, 2π * 1e5; length=M))
-        g = collect(range(2π * 50, 2π * 150; length=M))
+        delta = M == 1 ? [0.0] : collect(range(-2π * 1e5, 2π * 1e5; length=M))
+        g = M == 1 ? [2π * 100.0] : collect(range(2π * 50, 2π * 150; length=M))
         mask = ComplexF64.(.!Matrix(I, M, M))
         p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
         du2 = zero(u)
