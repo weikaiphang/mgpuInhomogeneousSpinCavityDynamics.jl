@@ -1,0 +1,69 @@
+{
+  "mode": "forward",
+  "sim": {
+    "simulation_order": "first_order",
+    "M_delta": 16,
+    "M_g": 1,
+    "initial_condition": "ground",
+    "Ttotal": 1e-4,
+    "Nt_save": 51,
+    "reltol": 1e-8,
+    "abstol": 1e-8,
+    "ensemble_method": "auto",
+    "saved_file_name": "data/monolith_forward.json.jld2"
+  },
+  "system": {
+    "C_ens": 0.6,
+    "delta0": 0.0,
+    "kappa_e": 6283185.307179586,
+    "kappa_i": 0.0,
+    "freq_inhomogeneity": {
+      "kind": "lorentzian",
+      "FWHM": 6283185.307179586,
+      "span_gamma": 2.5,
+      "renormalize": false
+    },
+    "g_inhomogeneity": {
+      "kind": "constant",
+      "g_value": 628.3185307179587
+    }
+  },
+  "pulse": [
+    {
+      "kind": "wurst",
+      "t_center": 5e-5,
+      "duration": 5e-5,
+      "amp": 7905.694150420949,
+      "bandwidth": 31415926.53589793,
+      "n": 20.0,
+      "omega0": 0.0,
+      "chirp_sign": 1.0,
+      "phase0": 0.0,
+      "edge_frac": 0.0001
+    }
+  ],
+  "bspline": {
+    "k": 1,
+    "n_coeff_A": 4,
+    "n_coeff_f": 4,
+    "degree": 3,
+    "taper_frac": 0.1
+  },
+  "optimizer": {
+    "num_epochs": 5,
+    "learning_rate": 0.05,
+    "w_time": 0.15,
+    "w_power": 0.05,
+    "w_tmax": 1.0,
+    "target_F": 1.0,
+    "I_min": 0.85,
+    "kappa_I": 50.0,
+    "S_min": 0.85,
+    "kappa_S": 50.0,
+    "track": "weak"
+  },
+  "compute": {
+    "backend": "auto",
+    "integrator": "tsit5"
+  }
+}
