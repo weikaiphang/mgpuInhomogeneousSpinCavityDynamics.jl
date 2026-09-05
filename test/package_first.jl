@@ -118,3 +118,28 @@ end
     @test choose_rowsum_exchange(4; have_nccl=false, nunique_devices=4, nccl_ok=false, p2p_ok=false) === :host
     @test choose_rowsum_exchange(1; have_nccl=true, nunique_devices=1, nccl_ok=true, p2p_ok=true) === :none
 end
+
+@testset "mgpu is relocated NIH, not a QC/SciML multi-GPU backend" begin
+    mgpu = joinpath(@__DIR__, "..", "src", "chimera", "mgpu")
+    blobs = Dict(f => read(joinpath(mgpu, f), String) for f in readdir(mgpu) if endswith(f, ".jl"))
+    allsrc = join(values(blobs), "\n")
+    @test !occursin("OrdinaryDiffEq", allsrc)
+    @test !occursin("QuantumCumulants", allsrc)
+    @test !occursin("chimera_solve", allsrc)
+    @test !occursin("ODEProblem", allsrc)
+    @test !occursin("DiffEqGPU", allsrc)
+    @test occursin("cross_rhs_kernel!", blobs["kernels.jl"])
+    @test occursin("small_rhs_kernel!", blobs["kernels.jl"])
+    @test occursin("function Tsit5Tableau", blobs["tableaus.jl"])
+    @test occursin("function solve_mgpu!", blobs["integrator.jl"])
+    @test occursin("NCCL.Allreduce!", blobs["problem.jl"])
+    @test occursin("exchange_rowsums_p2p!", blobs["problem.jl"])
+    @test occursin("return run_sim_1st_order", blobs["solver.jl"])
+    @test occursin("solve_mgpu!", blobs["solver.jl"])
+    @test count("NCCL.Allreduce!", blobs["problem.jl"]) == 2
+    sciml = read(joinpath(@__DIR__, "..", "src", "chimera", "integrate", "sciml.jl"), String)
+    @test occursin("custom MGPU Tsit5/CK45", sciml)
+    @test CHIMERA_INTEGRATOR === :sciml_ordinarydiffeq
+    eoms = read(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "closure_2nd.jl"), String)
+    @test occursin("fused sharded replica", eoms)
+end
