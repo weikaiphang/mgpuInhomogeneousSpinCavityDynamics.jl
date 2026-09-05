@@ -1840,6 +1840,11 @@ function _stage!(shards, stage::Int, a_eval::ComplexF64, tstage::Float64,
         _launch_kernel(s, _reduce_complex!, s.src1, s.partial, s.nblocks;
                        threads=GPU_THREADS, blocks=1)
     end
+    # Multi-shard cavity source: each shard writes a device scalar
+    # `src1`, then this path host-reduces (`copyto!` + CPU sum).
+    # This is the 1st-order accel stack, not the MGPU* NCCL Allreduce
+    # used for 2nd-order row-sums. A device Allreduce of one complex
+    # would be possible but is not wired here.
     _for_each_shard(shards) do s
         _sync_shard(s)
         copyto!(s.src_h, s.src1)
@@ -2178,6 +2183,9 @@ function _run_gpu_stepper!(shards, sys, drive, ens, cache, plan, a0, frame, acti
                                         initial_condition, tspan, saveat, reltol, abstol, maxiters,
                                         save_states)
     end
+    # Multi-shard: cavity amplitude lives on the host and the per-stage
+    # source is host-reduced in `_stage!`. Single-GPU uses
+    # `_run_gpu_stepper_devcav!` (device cavity).
     _run_gpu_stepper_hostcav!(shards, sys, drive, ens, cache, plan, a0, frame, active,
                               initial_condition, tspan, saveat, reltol, abstol, maxiters,
                               save_states)

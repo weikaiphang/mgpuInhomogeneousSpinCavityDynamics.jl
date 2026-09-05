@@ -300,15 +300,23 @@ function _noise_make_mode_window(
 end
 
 
-# Linearized quantum regression theorem (QRT).
+# QRT closure level (postprocessor only; not the 2nd-order dynamics).
 #
-# Seeds are connected 2nd-order moments from the saved trajectory
-# (n-|⟨a⟩|², ⟨a†S⁺⟩-⟨a†⟩⟨S⁺⟩, …). Their two-time drift is the Jacobian of
-# the 1st-order Tavis–Cummings mean-field equations evaluated on that
-# trajectory — the standard linearized QRT / quantum regression
-# approximation (Gardiner & Zoller; Plankensteiner et al., QuantumCumulants).
-# A Jacobian of the full 2nd-order cumulant RHS would be a different,
-# much larger postprocessor and is intentionally not used here.
+# :factorized_first_order_jacobian
+#   Seeds are connected 2nd-order moments from the saved trajectory
+#   (n-|⟨a⟩|², ⟨a†S⁺⟩-⟨a†⟩⟨S⁺⟩, …). Their two-time drift is the Jacobian
+#   of the 1st-order (factorized / mean-field) Tavis–Cummings equations
+#   evaluated on that trajectory — the standard linearized QRT /
+#   quantum regression approximation (Gardiner & Zoller; Plankensteiner
+#   et al., QuantumCumulants.jl).
+#
+# This is NOT a linearization of the full 2nd-order cumulant RHS. A
+# Jacobian of that larger vector would be a different postprocessor and
+# is intentionally not used here.
+if !@isdefined(QRT_CLOSURE_LEVEL)
+    const QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian
+end
+
 function _noise_qrt_rhs_gpu!(
     da,
     dadag,

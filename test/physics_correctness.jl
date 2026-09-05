@@ -1,5 +1,6 @@
 using Test
 using LinearAlgebra
+using Random
 using CUDA
 using Distributions
 using FastGaussQuadrature
@@ -32,6 +33,9 @@ if !@isdefined(prepare_derived)
 end
 if !@isdefined(_with_default_ensemble_method)
     include(joinpath(@__DIR__, "..", "src", "simulation_api.jl"))
+end
+if !@isdefined(QRT_CLOSURE_LEVEL)
+    const QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian
 end
 
 const PHYS_M = 3
@@ -203,6 +207,87 @@ end
     g = Float64[2π * 100, 2π * 90, 2π * 110]
     rhs_cpu!(du, u_cpu, 0.0, 2π * 1e6, 0.0, delta, g, 0.0 + 0.0im)
     @test maximum(abs.(du)) < 1e-12
+end
+
+function _phys_rhs_pair(u; ke=2π * 1e6, ki=2π * 1e5, Et=0.25 + 0.1im)
+    M = PHYS_M
+    delta = Float64[0.0, 2π * 5e4, -2π * 5e4]
+    g = Float64[2π * 100, 2π * 90, 2π * 110]
+    mask = ComplexF64.(.!Matrix(I, M, M))
+    p = (0.0, ke, ki, delta, g, M, mask, t -> Et)
+    du2 = zero(u)
+    rhs_2nd_order!(du2, u, p, 1e-6)
+    du_cpu = zero(u)
+    rhs_cpu!(du_cpu, u, 0.0, ke, ki, delta, g, Et)
+    return du2, du_cpu
+end
+
+@testset "one 2nd-order RHS: rhs_cpu! matches rhs_2nd_order!" begin
+    for kind in (:ground, :equator, :weak, :inverted)
+        u = build_u0_2nd_order(PHYS_M, PHYS_NJ, kind)
+        du2, du_cpu = _phys_rhs_pair(u)
+        @test du_cpu ≈ du2 rtol=1e-13 atol=1e-13
+    end
+
+    rng = MersenneTwister(2710)
+    u_rand = randn(rng, ComplexF64, state_length_2nd_order(PHYS_M))
+    du2, du_cpu = _phys_rhs_pair(u_rand)
+    @test du_cpu ≈ du2 rtol=1e-12 atol=1e-12
+    @test maximum(abs.(du2)) > 1e-8
+end
+
+@testset "truncated Lorentzian C_eff vs claimed C_ens" begin
+    C = 0.6
+    freq = (kind=:lorentzian, FWHM=2π * 1e6, span_gamma=2.5, renormalize=false)
+    _, pδ = _quad_frequency_nodes(freq, 64)
+    p_g = [1.0]
+    info = truncation_cooperativity(C, pδ, p_g)
+    @test info.sum_p_delta ≈ 2 * atan(2.5) / π rtol=1e-12
+    @test info.sum_p_g ≈ 1.0
+    @test info.C_ens ≈ C
+    @test info.C_eff ≈ C * info.sum_p_delta
+    @test info.C_eff < C
+
+    printed = sprint() do io
+        redirect_stdout(io) do
+            maybe_print_truncation_cooperativity(C, pδ, p_g, freq)
+        end
+    end
+    @test occursin("∑p_δ", printed)
+    @test occursin("effective C", printed)
+    @test occursin("claimed C_ens", printed)
+    @test occursin(string(info.C_eff), printed) || occursin("0.4", printed)
+
+    silent = sprint() do io
+        redirect_stdout(io) do
+            maybe_print_truncation_cooperativity(
+                C, pδ, p_g, merge(freq, (renormalize=true,)))
+        end
+    end
+    @test isempty(silent)
+
+    cfg = (
+        C_ens = C,
+        M_delta = 8,
+        M_g = 1,
+        kappa_e = 2π * 1e6,
+        kappa_i = 0.0,
+        delta0 = 0.0,
+        Ttotal = 1e-6,
+        Nt_save = 3,
+        freq_inhomogeneity = freq,
+        g_inhomogeneity = (kind=:constant, g_value=2π * 100.0),
+        ensemble_method = :quadrature,
+    )
+    d = prepare_derived(cfg; ensemble_method=:quadrature)
+    @test d.C_eff ≈ C * d.sum_p_delta * d.sum_p_g
+    @test d.C_eff < d.C_ens
+    @test d.sum_p_delta ≈ info.sum_p_delta rtol=1e-10
+end
+
+@testset "QRT closure level is the factorized 1st-order Jacobian" begin
+    @test QRT_CLOSURE_LEVEL === :factorized_first_order_jacobian
+    @test QRT_CLOSURE_LEVEL !== :full_second_order_jacobian
 end
 
 if isdefined(Main, :CUDA) || isdefined(@__MODULE__, :CUDA)

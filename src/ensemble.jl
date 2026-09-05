@@ -188,6 +188,8 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
     )
 
     println("Total spin number N = $N")
+    _trunc = truncation_cooperativity(C_ens, p_delta, p_g)
+    maybe_print_truncation_cooperativity(C_ens, p_delta, p_g, freq_cfg)
 
 
 
@@ -221,6 +223,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
 
     return (
         C_ens = C_ens,
+        C_eff = _trunc.C_eff,
+        sum_p_delta = _trunc.sum_p_delta,
+        sum_p_g = _trunc.sum_p_g,
 
         M_delta = M_delta,
         M_g = M_g,

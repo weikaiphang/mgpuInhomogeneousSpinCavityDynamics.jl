@@ -28,7 +28,9 @@ correctness tests in `test/physics_correctness.jl` run on CPU.
 * Cavity damping \(-(\kappa_e+\kappa_i)/2\); drive \(+\sqrt{\kappa_e} E(t)\)
 * \(a_\mathrm{out} = E - \sqrt{\kappa_e}\langle a\rangle\)
 * Lorentzian \(N = C_\mathrm{ens}\,\kappa\,\mathrm{FWHM}/(4\langle g^2\rangle)\); Gaussian peak-matched with \(\sqrt{\pi\ln 2}\)
-* `renormalize` defaults to `false` (truncated mass kept)
+* `renormalize` defaults to `false` on frequency bins (truncated mass kept). Truncated Lorentzian runs print \(\sum p_\delta\) and \(C_\mathrm{eff}\) vs claimed \(C_\mathrm{ens}\).
+* QRT noise uses a **factorized 1st-order Jacobian** (`QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian`), not a linearization of the full 2nd-order RHS.
+* Production multi-GPU is the package `MGPU*` path. `src/sim_2nd_multi_gpu_opt.jl` is a standalone script (drops \(\kappa_i\); inverted IC) and is not the reference API.
 
 ## Installation
 

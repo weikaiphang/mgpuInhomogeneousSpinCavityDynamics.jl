@@ -1,4 +1,20 @@
 
+# NOT the package multi-GPU API.
+#
+# This file is a standalone NCCL research script. Do not treat it as the
+# reference integrator or as a second public solver.
+#
+# Intentional differences vs the InhomogeneousSpinCavityDynamics MGPU*
+# path (MGPUproblem / MGPUsolver / exchange_rowsums!):
+#   - cavity damping uses κt = κe only (κᵢ is dropped)
+#   - initial condition is hard-coded inverted (Sz = +Nj/2, vacuum cavity)
+#   - layout / sharding / pulse wiring are local to this script
+#
+# Production multi-GPU integration is `mgpu_run_simulation` and the
+# MGPU* modules. The first-order accel path
+# (`accel_solver_1st_order.jl`) is a third stack: multi-shard cavity
+# source is host-reduced, not NCCL Allreduced.
+
 using CUDA
 CUDA.set_runtime_version!(v"12.4")
 

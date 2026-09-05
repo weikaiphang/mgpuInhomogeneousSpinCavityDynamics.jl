@@ -10,8 +10,17 @@ verified correctness bugs, (2) replace NIH numerics with research-grade
 packages where they are the best fit, and (3) move multi-GPU reductions off
 the host.
 
+**Lineage.** `nude-quad` @ `42f1d3a628c09fe8f06f3f21c5c9ddc957a8e7e0` is a
+comment/docstring-stripped replica of `quadrature` @
+`4af1f5d220b256fcf3967c39f12acc2095c33dfd` (no logic changes vs that
+parent). Chimera prefers logic parity with `quadrature` except for
+intentional improvements and physics fixes. Package name remains
+`InhomogeneousSpinCavityDynamics`.
+
 There is **no Volkov–Zon solver** and no analytical Volkov–Zon oracle. That
-name does not correspond to a validation method used here.
+name does not correspond to a validation method used here. The README
+claim of a `volkov_zon.jl` file on the nude-quad tip is dropped, not
+restored.
 
 ## Conventions (unchanged)
 
@@ -63,23 +72,32 @@ helpers above.
 - Accel `g2_avg` for a truncated Gaussian uses the truncated second moment
   on \([\max(0,\mu-\mathrm{span}\,\sigma),\,\mu+\mathrm{span}\,\sigma]\),
   not the infinite-support \(\mu^2+\sigma^2\).
-- `renormalize` defaults to `false`: keep truncated histogram/quadrature
-  mass. \(C_\mathrm{ens}\to N\) still uses the analytic FWHM formula, so
-  `N_total = N * sum(p)` unless renormalize is enabled.
+- `renormalize` defaults to `false` on frequency bins: keep truncated
+  histogram/quadrature mass. \(C_\mathrm{ens}\to N\) still uses the
+  analytic FWHM formula, so `N_total = N * sum(p)` unless renormalize is
+  enabled. When the frequency law is a **truncated Lorentzian** with
+  `renormalize=false`, `prepare_derived` / `prepare_derived_quadrature`
+  print \(\sum p_\delta\), \(\sum p_g\), and
+  \(C_\mathrm{eff}=C_\mathrm{ens}\sum p_\delta\sum p_g\) versus the
+  claimed \(C_\mathrm{ens}\). Both returns also carry `C_eff`,
+  `sum_p_delta`, and `sum_p_g`.
+- There is **one** 2nd-order RHS: `rhs_2nd_order!`. `rhs_cpu!` is a thin
+  wrapper on the same monolith packing. MGPU device kernels are the
+  fused sharded replica.
 
 ## QRT postprocessing (intentional approximation)
 
-`src/noise.jl` seeds **connected** second moments from the saved trajectory
-(\(n-|\langle a\rangle|^2\), \(\langle a^\dagger S^+\rangle-\langle a^\dagger\rangle\langle S^+\rangle\), …)
-and evolves two-time correlators with the **Jacobian of the first-order**
-Tavis–Cummings mean-field equations.
+| Symbol | Meaning |
+| --- | --- |
+| `QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian` | Two-time correlators evolve with the **Jacobian of the first-order (factorized / mean-field)** Tavis–Cummings equations. Connected 2nd-order moments from the saved trajectory seed the initial condition. |
+| *not implemented* | Jacobian of the **full 2nd-order** cumulant vector. Different, much larger postprocessor. |
 
-That is the standard linearized quantum regression theorem (Gardiner &
-Zoller, *Quantum Noise*; Plankensteiner et al., QuantumCumulants.jl,
+`src/noise.jl` seeds connected second moments
+(\(n-|\langle a\rangle|^2\), \(\langle a^\dagger S^+\rangle-\langle a^\dagger\rangle\langle S^+\rangle\), …)
+and applies the factorized first-order Jacobian (Gardiner & Zoller,
+*Quantum Noise*; Plankensteiner et al., QuantumCumulants.jl,
 [Quantum 6, 617 (2022)](https://doi.org/10.22331/q-2022-03-21-617)).
-A Jacobian of the full second-order cumulant vector would be a different,
-much larger postprocessor. Chimera documents this hybrid and does not
-silently replace it.
+Chimera documents this hybrid and does not silently replace it.
 
 ## Packages chosen
 
@@ -107,7 +125,17 @@ silently replace it.
 | CUDA-Q | Circuit / QPU programming model, not cavity-QED cumulant PDEs. |
 | mpi4py | Process-level MPI. Intra-node multi-GPU is NCCL’s job; we already have NCCL.jl. |
 
-## Multi-GPU design
+## Three multi-GPU stacks
+
+These are **not** interchangeable APIs.
+
+| Stack | Role | Reduction | Treat as reference? |
+| --- | --- | --- | --- |
+| Package `MGPU*` (`MGPUproblem`, `MGPUsolver`, `mgpu_run_simulation`) | Production 2nd-order multi-GPU | `exchange_rowsums!`: NCCL Allreduce of \(3M\) complex row-sums, then CUDA P2P, then pinned-host fallback | **Yes** |
+| `src/sim_2nd_multi_gpu_opt.jl` | Standalone NCCL research script | Its own NCCL send/recv | **No.** Drops \(\kappa_i\) (\(\kappa_t=\kappa_e\)); hard-coded inverted IC. Banner at file top. |
+| `src/accel_solver_1st_order.jl` | 1st-order accel stepper | Single-GPU: device cavity (`_run_gpu_stepper_devcav!`). Multi-shard: **host-reduces** the cavity source in `_stage!` (`copyto!(s.src_h, s.src1)` then CPU sum) | Separate 1st-order path; not the 2nd-order MGPU API |
+
+## Multi-GPU design (package `MGPU*`)
 
 Logical 2nd-order state: length \(3+9M+4M^2\).
 
@@ -154,8 +182,9 @@ julia --project=. scripts/bench_rowsum_exchange.jl
 
 Physics tests cover vacuum+ground RHS ≈ 0, `SmSp_same ≈ Nj`,
 `SmSp+2Sz ≈ 0` on ground, product-state equator/weak ICs, quadrature mass,
-\(C_\mathrm{ens}\) formulas, layout lengths, and GPU↔CPU RHS parity when
-CUDA is functional.
+\(C_\mathrm{ens}\) / truncated-\(C_\mathrm{eff}\) reporting, one 2nd-order
+RHS (`rhs_cpu!` vs `rhs_2nd_order!` on ground/equator/weak/random),
+layout lengths, and GPU↔CPU RHS parity when CUDA is functional.
 
 ## Out of scope
 

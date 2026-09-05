@@ -125,6 +125,32 @@ function maybe_renormalize_frequency_probs!(p_delta, freq_inhomogeneity)
 end
 
 
+# Claimed C_ens is converted to N via the analytic FWHM formula (infinite
+# support). Truncated bins keep mass ∑p_δ ∑p_g < 1 when renormalize=false,
+# so the realized cooperativity is C_eff = C_ens * ∑p_δ * ∑p_g.
+function truncation_cooperativity(C_ens, p_delta, p_g=nothing)
+    sδ = sum(p_delta)
+    sg = p_g === nothing ? 1.0 : sum(p_g)
+    return (
+        sum_p_delta = float(sδ),
+        sum_p_g = float(sg),
+        C_ens = float(C_ens),
+        C_eff = float(C_ens) * float(sδ) * float(sg),
+    )
+end
+
+function maybe_print_truncation_cooperativity(C_ens, p_delta, p_g, freq_inhomogeneity)
+    kind = hasproperty(freq_inhomogeneity, :kind) ? freq_inhomogeneity.kind : :unknown
+    kind === :lorentzian || return nothing
+    renormalize_frequency_probs_enabled(freq_inhomogeneity) && return nothing
+    info = truncation_cooperativity(C_ens, p_delta, p_g)
+    println("[ensemble] truncated Lorentzian (renormalize=false): ∑p_δ = $(info.sum_p_delta)")
+    println("[ensemble] ∑p_g = $(info.sum_p_g)")
+    println("[ensemble] effective C = $(info.C_eff)  vs claimed C_ens = $(info.C_ens)")
+    return info
+end
+
+
 
 function total_spin_number_from_cooperativity(
     C_ens,

@@ -152,6 +152,8 @@ function prepare_derived_quadrature(CONFIG; plan = nothing)
 
     N = total_spin_number_from_cooperativity(C_ens, kappa_t, g2_avg, freq_cfg)
     println("Total spin number N = $N")
+    _trunc = truncation_cooperativity(C_ens, p_delta, p_g)
+    maybe_print_truncation_cooperativity(C_ens, p_delta, p_g, freq_cfg)
 
 
     Nj, delta_b, g_b, N_total, Nj_2d = build_2d_bins(N, delta_b_1d, p_delta, g_b_1d, p_g)
@@ -166,6 +168,9 @@ function prepare_derived_quadrature(CONFIG; plan = nothing)
 
     return (
         C_ens = C_ens,
+        C_eff = _trunc.C_eff,
+        sum_p_delta = _trunc.sum_p_delta,
+        sum_p_g = _trunc.sum_p_g,
 
         M_delta = M_delta,
         M_g = M_g,

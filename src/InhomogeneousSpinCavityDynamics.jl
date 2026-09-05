@@ -20,6 +20,11 @@ catch
     false
 end
 
+# QRT postprocessor closure: factorized 1st-order Jacobian, not a
+# linearization of the full 2nd-order cumulant RHS. See src/noise.jl
+# and docs/CHIMERA.md.
+const QRT_CLOSURE_LEVEL = :factorized_first_order_jacobian
+
 include("config.jl")
 include("frequency_inhomogeneity.jl")
 include("coupling_inhomogeneity.jl")
@@ -94,6 +99,8 @@ export plot_E_of_t
 
 export build_full_config, prepare_derived
 export prepare_derived_quadrature, ensemble_method_for, resolve_ensemble_method
+export truncation_cooperativity, maybe_print_truncation_cooperativity
+export QRT_CLOSURE_LEVEL
 export make_clamped_knots, bspline_basis, bspline_eval, bspline_area, bspline_antiderivative
 export CompositePulse, n_params, decode, initial_guess, total_area, pulse_duration
 export points_per_segment_for_budget
