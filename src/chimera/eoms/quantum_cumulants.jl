@@ -128,8 +128,8 @@ function solve_qc_sciml_1st_M1(;
     p_cl = (Δ0, κe, κi, [δ], [g], 1, t -> ComplexF64(E))
     prob_qc = chimera_ode_problem(qc_rhs_1st_M1!, copy(u0), tspan, p_qc)
     prob_cl = chimera_ode_problem(rhs_1st_order!, copy(u0), tspan, p_cl)
-    sol_qc = solve(prob_qc, Tsit5(); reltol=reltol, abstol=abstol, save_everystep=false)
-    sol_cl = solve(prob_cl, Tsit5(); reltol=reltol, abstol=abstol, save_everystep=false)
+    sol_qc = solve(prob_qc, OrdinaryDiffEq.Tsit5(); reltol=reltol, abstol=abstol, save_everystep=false)
+    sol_cl = solve(prob_cl, OrdinaryDiffEq.Tsit5(); reltol=reltol, abstol=abstol, save_everystep=false)
     return sol_qc, sol_cl
 end
 

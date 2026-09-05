@@ -59,7 +59,7 @@ function compare_oracle_to_cumulant_1st(;
         push!(saved, integrator.u[1])
     end
     cb = PresetTimeCallback(collect(tlist), affect!; save_positions=(false, false))
-    sol = solve(prob, Tsit5(); reltol=reltol, abstol=abstol, callback=cb,
+    sol = solve(prob, OrdinaryDiffEq.Tsit5(); reltol=reltol, abstol=abstol, callback=cb,
                 save_on=false, save_everystep=false, dense=false)
     a_c = saved
     length(a_c) == length(exact.a) || error("oracle / cumulant save-length mismatch")

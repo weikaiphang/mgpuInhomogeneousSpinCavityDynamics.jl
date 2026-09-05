@@ -32,8 +32,8 @@ function factorized_first_order_jacobian_action!(
     sum_g_Sm = vec(sum(g_col .* Sm_col; dims=1))
     sum_g_Sp = vec(sum(g_col .* Sp_col; dims=1))
 
-    da .= ((-kappa_t / 2 - 1im * delta0) .* a_col) .- (1im .* sum_g_Sm)
-    dadag .= ((-kappa_t / 2 + 1im * delta0) .* adag_col) .+ (1im .* sum_g_Sp)
+    da .= ((-kappa_t / 2 - 1im * delta0) .* a_col) .- (1im .* reshape(sum_g_Sm, size(a_col)))
+    dadag .= ((-kappa_t / 2 + 1im * delta0) .* adag_col) .+ (1im .* reshape(sum_g_Sp, size(adag_col)))
 
     adag_mean = conj(a_mean)
     a_row = reshape(a_col, 1, :)

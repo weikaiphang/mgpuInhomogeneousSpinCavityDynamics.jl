@@ -82,15 +82,16 @@ end
 
 @testset "QRT Jacobian is the factorized 1st-order EOM" begin
     @test QRT_CLOSURE_LEVEL === :factorized_first_order_jacobian
-    a = fill(0.1 + 0.0im, 1, 2)
+    M, B = 2, 3
+    a = fill(0.1 + 0.0im, B)
     ad = conj.(a)
-    Sp = fill(0.02 + 0.01im, 2, 2)
+    Sp = fill(0.02 + 0.01im, M, B)
     Sm = conj.(Sp)
-    Sz = fill(-0.4 + 0.0im, 2, 2)
+    Sz = fill(-0.4 + 0.0im, M, B)
     da = similar(a); dad = similar(ad); dSp = similar(Sp); dSm = similar(Sm); dSz = similar(Sz)
     factorized_first_order_jacobian_action!(
         da, dad, dSp, dSm, dSz, a, ad, Sp, Sm, Sz,
-        0.1 + 0.0im, [0.02 + 0.01im, 0.02 + 0.01im], [-0.4, -0.4],
+        0.1 + 0.0im, fill(0.02 + 0.01im, M), fill(-0.4, M),
         0.3, [0.1, -0.1], [0.2, 0.25], 0.5,
     )
     @test all(isfinite, da)

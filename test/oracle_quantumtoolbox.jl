@@ -1,4 +1,7 @@
 using Test
+using OrdinaryDiffEq
+using DifferentialEquations
+using DiffEqCallbacks
 
 const _QT_OK = try
     @eval using QuantumToolbox
