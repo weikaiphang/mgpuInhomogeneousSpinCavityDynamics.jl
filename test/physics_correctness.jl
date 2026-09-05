@@ -870,6 +870,35 @@ end
     end
 end
 
+@testset "cross-block diagonal is excluded from monolith row-sums" begin
+    M = 3
+    rng = MersenneTwister(7)
+    u = randn(rng, ComplexF64, state_length_2nd_order(M))
+    st = unpack_state_2nd_order_u(u, M)
+    @test maximum(abs.(diag(st[13]))) > 0
+    @test maximum(abs.(diag(st[15]))) > 0
+
+    delta, g, ke, ki, Et, delta0 = _stress_phys_p(M, ones(M))
+    du_dirty = _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+    du_shard = _stress_mgpu_rhs(u, delta, g, Et, delta0, ke, ki,
+                               EnsemblePartition(M, 2), :host)
+    @test du_dirty ≈ du_shard rtol=1e-12 atol=1e-12
+
+    u_z = copy(u)
+    nsmall = small_length(M)
+    for off in (0, M * M, 2 * M * M, 3 * M * M)
+        mat = reshape(@view(u_z[nsmall + off + 1:nsmall + off + M * M]), M, M)
+        for j in 1:M
+            mat[j, j] = 0
+        end
+    end
+    du_zero = _stress_monolith_rhs(u_z, delta, g, ke, ki, Et, delta0)
+    @test du_dirty ≈ du_zero rtol=1e-13 atol=1e-13
+
+    leak = (st[13] * g) .- ((st[13] .* ComplexF64.(.!Matrix(I, M, M))) * g)
+    @test maximum(abs.(leak)) > 1e-8
+end
+
 @testset "rhs_cpu! vs rhs_2nd_order! numerical edges" begin
     edges = (
         (1, [1.0], :ground, 0.0, 2π * 1e6, 0.0, 0.0 + 0.0im),
