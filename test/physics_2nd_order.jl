@@ -799,6 +799,12 @@ end
     amp_rms = arp_drive_amplitude(ke, kt, g2g, Ω)
     amp_mean = arp_amp_scale(ke, kt, gm) * Ω
     @test amp_rms < amp_mean
+    # Same ⟨g²⟩ moment as N / C_eff — not leftover g_mean².
+    freq = (kind = :lorentzian, FWHM = 2π * 1e6, span_gamma = 2.5, renormalize = false)
+    N_g2 = total_spin_number_from_cooperativity(0.6, kt, g2g, freq)
+    N_mean2 = total_spin_number_from_cooperativity(0.6, kt, gm^2, freq)
+    @test N_g2 != N_mean2
+    @test amp_rms != arp_drive_amplitude(ke, kt, gm^2, Ω)
     @info "ARP Ω_rms vs mean-g amp" amp_rms amp_mean g_rms = coupling_rms(g2g) g_mean = gm
 end
 
@@ -818,7 +824,7 @@ end
                 path = joinpath(root, f)
                 txt = read(path, String)
                 occursin("g_inhomogeneity", txt) || continue
-                if !occursin("PAPER_G_RENORMALIZE", txt)
+                if !occursin(r"renormalize\s*=\s*PAPER_G_RENORMALIZE", txt)
                     push!(offenders, relpath(path, repo))
                 end
             end
@@ -831,15 +837,20 @@ end
 
     arp = read(joinpath(repo, "src", "composite_arp_pulses.jl"), String)
     @test occursin("coupling_rms", arp)
-    @test occursin("arp_drive_amplitude", arp)
-    @test occursin("g2_avg", arp)
+    @test occursin("arp_drive_amplitude(kappa_e, kappa_t, d.g2_avg", arp)
+    @test occursin("d.g2_avg", arp)
+    @test occursin("omega_convention=:rms_g2", arp)
+    # Mean-g-only amp is not the paper path (report may still log g_mean).
+    @test !occursin("kappa_t / (4 * g_scale", arp)
     @test !occursin("Float64(gi.g_value)", arp)
     @test !occursin("Float64(gi.mean)", arp)
-    @test !occursin("Float64(d.g_mean)", arp)
-    @test occursin("omega_convention=:rms_g2", arp)
+
+    ens = read(joinpath(repo, "src", "ensemble.jl"), String)
+    @test occursin("total_spin_number_from_cooperativity", ens)
+    @test occursin("g2_avg", ens)
 
     three = read(joinpath(repo, "scripts", "run_105_3arp_M20000.jl"), String)
-    @test occursin("arp_drive_amplitude", three)
+    @test occursin("arp_drive_amplitude(d.kappa_e, d.kappa_t, d.g2_avg", three)
     @test !occursin("d.g_mean * d.sqrt_kappa_e", three)
 end
 

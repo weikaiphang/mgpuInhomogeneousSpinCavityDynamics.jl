@@ -89,6 +89,7 @@ function generate_2n1_arp_pi_pulse(
         "default Rabi target pi*FWHM = $Omega_target is not positive; check d.freq_inhomogeneity.FWHM." :
         "Omega_max must be positive, got $Omega_target."
     )
+    # Same d.g2_avg that inverted N / built C_eff. Not d.g_mean.
     amp = arp_drive_amplitude(kappa_e, kappa_t, d.g2_avg, Omega_target)
     amp > 0 || error(
         "derived segment amplitude from Ω_rms(√⟨g²⟩) = $amp is not positive; " *

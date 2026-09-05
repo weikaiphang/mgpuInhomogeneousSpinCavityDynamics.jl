@@ -19,8 +19,11 @@ const PAPER_G_RENORMALIZE = false
 # RMS coupling for drive ↔ Rabi. Bin-wise
 #   Ω_j = 4 g_j √κ_e / κ_t · |E|
 # so Ω_rms = √⟨Ω_j²⟩ = 4 √⟨g²⟩ √κ_e / κ_t · |E|.
-# Targeting Ω(⟨g⟩) instead of Ω_rms can fake F≈0/1 when g is
-# inhomogeneous. Mean-g-only is not the paper ARP path.
+# ⟨g²⟩ is d.g2_avg from prepare_derived — the same moment that
+# inverts N from C_ens (total_spin_number_from_cooperativity) and
+# that C_eff honesty already prints. Targeting Ω(⟨g⟩) instead of
+# Ω_rms can fake F≈0/1 when g is inhomogeneous. Mean-g-only is
+# not the paper ARP path.
 function coupling_rms(g2_avg::Real)
     g2 = Float64(g2_avg)
     g2 > 0 || error("coupling_rms: g2_avg must be positive, got $g2_avg.")
