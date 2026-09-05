@@ -690,12 +690,14 @@ end
     u[IDX_a] = 0.2
     u[IDX_ad_a] = 0.25
     J = qrt_oracle_dense(u, 0.05, 1.0, 0.2, delta_b, g_b, 0.1im; ε=1e-7)
-    @test size(J) == (global_state_length(M), global_state_length(M))
+    nfull = global_state_length(M)
+    @test size(J.real) == (nfull, nfull)
+    @test size(J.imag) == (nfull, nfull)
     v = randn(ComplexF64, length(u))
     dg = similar(v)
     qrt_oracle_apply!(dg, v, u, 0.05, 1.0, 0.2, delta_b, g_b, 0.1im; ε=1e-7)
-    err = qrt_relabs_err(J * v, dg)
-    @info "QRT oracle dense J*v vs apply" abs = err.abs rel = err.rel n = size(J, 1)
+    err = qrt_relabs_err(qrt_oracle_dense_mul(J, v), dg)
+    @info "QRT oracle dense L(v) vs apply" abs = err.abs rel = err.rel n = nfull
     @test err.abs < 1e-8
     @test err.rel < 1e-6
 end

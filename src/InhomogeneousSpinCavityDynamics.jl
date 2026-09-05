@@ -153,6 +153,7 @@ export save_correlation_results
 
 export QRT_PRODUCT, QRT_ORACLE
 export qrt_star_rhs!, qrt_product_apply!, qrt_oracle_apply!, qrt_oracle_dense
+export qrt_oracle_dense_mul
 export qrt_relabs_err, qrt_pad_product_tangent
 export qrt_seed_adag_column!, qrt_seed_a_column!
 export qrt_pack_product_state!, QRTProductScratch

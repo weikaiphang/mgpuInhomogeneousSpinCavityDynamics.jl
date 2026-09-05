@@ -213,21 +213,32 @@ function qrt_oracle_apply!(dg::AbstractVector, g::AbstractVector, u_traj::Abstra
     return dg
 end
 
-# Dense full-J for small-M tests. Columns are J e_k via the oracle apply.
+# Dense full-J for small-M tests. The map is real-linear (RHS uses conj),
+# not ℂ-linear, so two column sets are stored:
+#   J.real[:,k] = L(e_k),  J.imag[:,k] = L(i e_k)
+#   L(x + i y) = J.real * x + J.imag * y
+# Use `qrt_oracle_dense_mul(J, v)`, not a single complex matvec.
 function qrt_oracle_dense(u_traj::AbstractVector, delta0, kappa_e, kappa_i,
                           delta_b, g_b, Et=0; ε::Float64=1e-7)
     n = length(u_traj)
-    J = Matrix{eltype(u_traj)}(undef, n, n)
+    Jr = Matrix{eltype(u_traj)}(undef, n, n)
+    Ji = Matrix{eltype(u_traj)}(undef, n, n)
     g = zeros(eltype(u_traj), n)
     dg = similar(g)
     @inbounds for k in 1:n
         fill!(g, 0)
         g[k] = 1
         qrt_oracle_apply!(dg, g, u_traj, delta0, kappa_e, kappa_i, delta_b, g_b, Et; ε=ε)
-        J[:, k] .= dg
+        Jr[:, k] .= dg
+        fill!(g, 0)
+        g[k] = im
+        qrt_oracle_apply!(dg, g, u_traj, delta0, kappa_e, kappa_i, delta_b, g_b, Et; ε=ε)
+        Ji[:, k] .= dg
     end
-    return J
+    return (real=Jr, imag=Ji)
 end
+
+qrt_oracle_dense_mul(J, v) = J.real * real(v) + J.imag * imag(v)
 
 function qrt_relabs_err(a, b)
     num = maximum(abs, a .- b)
