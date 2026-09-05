@@ -8,11 +8,17 @@ using FastGaussQuadrature
 using ForwardDiff
 using JLD2
 using LinearAlgebra
-using NCCL
 using Plots
 using Printf
 using QuadGK
 using Random
+
+const HAVE_NCCL = try
+    @eval using NCCL
+    true
+catch
+    false
+end
 
 include("config.jl")
 include("frequency_inhomogeneity.jl")

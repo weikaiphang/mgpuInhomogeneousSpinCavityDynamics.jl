@@ -67,7 +67,7 @@ end
 function _setup_rowsum_exchange(devs, ns::Int, verbose::Bool)
     ns <= 1 && return nothing, :none
 
-    if length(unique(devs)) == ns
+    if HAVE_NCCL && length(unique(devs)) == ns
         try
             comms = NCCL.Communicators(devs)
             verbose && println("Row-sum exchange: NCCL Allreduce (device-side, no host staging).")

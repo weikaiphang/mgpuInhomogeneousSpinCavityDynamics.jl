@@ -19,9 +19,6 @@ end
 if !@isdefined(small_length)
     include(joinpath(@__DIR__, "..", "src", "MGPUlayout.jl"))
 end
-if !@isdefined(small_block_initial)
-    include(joinpath(@__DIR__, "..", "src", "MGPUinitial_conditions.jl"))
-end
 if !@isdefined(rhs_cpu!)
     include(joinpath(@__DIR__, "..", "src", "MGPUrhs_cpu.jl"))
 end
@@ -42,7 +39,9 @@ const PHYS_NJ = [2.0, 4.0, 6.0]
 
 function _phys_unpack_same(u, M)
     st = unpack_state_2nd_order_u(u, M)
-    return st.Sp, st.Sz, st.SmSp_same, st.SzSz_same, st.SpSp_same, st.SzSp_same
+    Sp, Sz = st[4], st[5]
+    SpSp_same, SzSp_same, SmSp_same, SzSz_same = st[9], st[10], st[11], st[12]
+    return Sp, Sz, SmSp_same, SzSz_same, SpSp_same, SzSp_same
 end
 
 function _phys_rhs_ground(u, M, Nj)
@@ -119,17 +118,18 @@ end
     @test SmSp_wi ≈ product_SmSp_same.(PHYS_NJ, Sp_wi, Sz_wi)
 end
 
-@testset "MGPU small-block ICs match monolith product-state formulas" begin
+@testset "MGPU small-block prefix matches monolith product-state ICs" begin
     for kind in (:ground, :inverted, :equator, :weak, :weak_inverted)
         u = build_u0_2nd_order(PHYS_M, PHYS_NJ, kind)
-        small = small_block_initial(PHYS_M, PHYS_NJ, kind, Float64)
-        @test small[1:small_length(PHYS_M)] ≈ u[1:small_length(PHYS_M)]
+        @test length(u) >= small_length(PHYS_M)
+        Sp0, Sz0 = _spin_means_2nd_order(PHYS_NJ, kind)
+        @test u[small_range(PHYS_M, F_Sp)] ≈ ComplexF64.(Sp0)
+        @test u[small_range(PHYS_M, F_Sz)] ≈ ComplexF64.(Sz0)
+        @test u[small_range(PHYS_M, F_SmSp_s)] ≈
+            ComplexF64.(product_SmSp_same.(PHYS_NJ, Sp0, Sz0))
+        @test u[small_range(PHYS_M, F_SzSz_s)] ≈
+            ComplexF64.(product_SzSz_same.(PHYS_NJ, Sz0))
     end
-    small_g = small_block_initial(PHYS_M, PHYS_NJ, :ground, Float64)
-    smsp = small_g[small_range(PHYS_M, F_SmSp_s)]
-    sz = small_g[small_range(PHYS_M, F_Sz)]
-    @test real.(smsp) ≈ PHYS_NJ
-    @test smsp .+ 2 .* sz ≈ zero(smsp) atol=1e-14
 end
 
 @testset "C_ens → N conventions" begin
