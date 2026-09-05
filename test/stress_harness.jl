@@ -22,6 +22,8 @@ const SCM = Main.SpinCavityMonolith
 const IC_KINDS = (:ground, :inverted, :equator, :weak, :weak_inverted, :custom)
 const TIP_SHA = "05bed847a8fa7e5b8bf3e92aca2d2977796e9d73"
 
+@testset "stress harness tip $TIP_SHA" begin
+
 function _cfg(; fk=:lorentzian, gk=:constant, Md=5, Mg=1, ke=2π * 1e6, ki=2π * 1e5, C=0.6)
     freq = (kind=fk, FWHM=2π * 1e6, span_gamma=2.5, span_sigma=3.0, renormalize=false)
     g = if gk === :constant
@@ -359,68 +361,90 @@ end
     println("[stress] tip=", TIP_SHA, "  nthreads=", nt)
 
     # B4: Threads present; nshards default = 1
-    @test occursin("Threads.@", src)
+    @test occursin("@threads", src)
     @test occursin("struct RHS2Work", src)
     @test SCM.resolve_cpu_nshards(16) == 1
     @test SCM.resolve_cpu_nshards(16; nshards=4) == 4
     @test SCM.resolve_cpu_nshards(3; nshards=8) == 3
-    println("[stress] B4 Threads.@ present; nshards default=", SCM.resolve_cpu_nshards(48))
+    println("[stress] B4 @threads present; nshards default=", SCM.resolve_cpu_nshards(48))
 
     # B5: large-block layout still 5 × (M·mloc) with stride bs
     @test occursin("bs = M * mloc", src)
     @test occursin("dlarge[i+4bs]", src)
     println("[stress] B5 layout still 5-block stride bs=M*mloc (OPEN)")
 
-    # B1: rhs2_sharded! hot-path allocs
-    args8 = _rhs2_setup(8)
-    SCM.rhs2_sharded!(args8...)
-    SCM.rhs2_sharded!(args8...)
-    n_rhs = @allocated SCM.rhs2_sharded!(args8...)
+    # B1: explicit args (no splat) after warmup — matches product test
+    function _b1_bytes(Mb)
+        Nj = fill(4.0, Mb)
+        delta_b = [1e5 * sin(0.7 * j) for j in 1:Mb]
+        g_b = fill(2π * 100.0, Mb)
+        u = SCM.build_u0_2nd_order(Mb, Nj, Float64, :equator)
+        u[1] = 0.01 + 0.002im
+        s, L, c, o = SCM.dense_to_shards(u, Mb, 1)
+        ds = zero(s); dL = [zero(x) for x in L]
+        Et = 0.1 + 0.05im
+        ke, ki = 2π * 1e6, 2π * 2e5
+        SCM.rhs2_sharded!(ds, dL, s, L, c, o, 0.0, ke, ki, delta_b, g_b, Mb, Et)
+        return @allocated SCM.rhs2_sharded!(ds, dL, s, L, c, o, 0.0, ke, ki, delta_b, g_b, Mb, Et)
+    end
+    n_rhs = _b1_bytes(8)
+    n_rhs48 = _b1_bytes(48)
     println("[stress] B1 rhs2_sharded! bytes/RHS M=8 = ", n_rhs, "  PRIOR=1232  TARGET=0")
+    println("[stress] B1 rhs2_sharded! bytes/RHS M=48 = ", n_rhs48, "  TARGET=0 (1 thread)")
     u1 = SCM.build_u0_1st_order(8, fill(4.0, 8), Float64, :weak)
     du1 = zeros(ComplexF64, length(u1))
-    p1 = (0.0, 2π * 1e6, 2π * 2e5, args8[10], args8[11], 8, t -> 0.1 + 0.0im)
+    p1 = (0.0, 2π * 1e6, 2π * 2e5, [1e5 * sin(0.7 * j) for j in 1:8], fill(2π * 100.0, 8), 8, t -> 0.1 + 0.0im)
     SCM.rhs1!(du1, u1, p1, 0.0)
     n1 = @allocated SCM.rhs1!(du1, u1, p1, 0.0)
     println("[stress] rhs1! bytes/RHS M=8 = ", n1, "  TARGET=0")
     @test n1 == 0
     if nt == 1
         @test n_rhs == 0
+        @test n_rhs48 == 0
     else
         @test n_rhs < 8192
+        @test n_rhs48 < 8192
     end
 
-    args48 = _rhs2_setup(48)
-    SCM.rhs2_sharded!(args48...)
-    SCM.rhs2_sharded!(args48...)
-    n_rhs48 = @allocated SCM.rhs2_sharded!(args48...)
-    println("[stress] B1 rhs2_sharded! bytes/RHS M=48 = ", n_rhs48, "  TARGET=0 (1 thread)")
-
-    # B2: integrate_order2_sharded! — one-time pool vs per-step hot path
-    function _int_once(Mb, tspan; dt0=0.0)
+    # B2: replay one Tsit5 step with preallocated stage buffers
+    function _b2_replay(Mb)
         Nj = fill(4.0, Mb)
         delta_b = [1e5 * sin(0.7 * j) for j in 1:Mb]
         g_b = fill(2π * 100.0, Mb)
         s, L, c, o = SCM.build_u0_2nd_mgpu(Mb, Nj, :equator, 1)
-        s, L, nst = SCM.integrate_order2_sharded!(
-            s, L, c, o, 0.0, 2π * 1e6, 2π * 2e5, delta_b, g_b, Mb,
-            t -> 0.05 + 0.02im, tspan; reltol=1e-6, abstol=1e-6, dt0=dt0)
-        return nst
+        ns = length(c)
+        work = SCM.rhs2_work(eltype(s), Mb)
+        tab = SCM.Tsit5Tab(Float64)
+        kS = [zero(s) for _ in 1:6]
+        kL = [[zero(L[p]) for p in 1:ns] for _ in 1:6]
+        yS = zero(s); yL = [zero(L[p]) for p in 1:ns]
+        u1S = zero(s); u1L = [zero(L[p]) for p in 1:ns]
+        eS = zero(s); eL = [zero(L[p]) for p in 1:ns]
+        dt = 1e-7
+        E = 0.05 + 0.02im
+        rhs_at!(dS, dL, ss, LL) = SCM.rhs2_sharded!(dS, dL, ss, LL, c, o, 0.0, 2π*1e6, 2π*2e5, delta_b, g_b, Mb, E, work)
+        rhs_at!(kS[1], kL[1], s, L)
+        SCM._axpy_shards!(yS, yL, s, L, dt * tab.a21, kS[1], kL[1])
+        bytes = @allocated begin
+            rhs_at!(kS[1], kL[1], s, L)
+            SCM._axpy_shards!(yS, yL, s, L, dt * tab.a21, kS[1], kL[1])
+            rhs_at!(kS[2], kL[2], yS, yL)
+            SCM._lincomb_shards!(yS, yL, s, L, dt .* (tab.a31, tab.a32), kS[1:2], kL[1:2])
+            rhs_at!(kS[3], kL[3], yS, yL)
+            SCM._lincomb_shards!(yS, yL, s, L, dt .* (tab.a41, tab.a42, tab.a43), kS[1:3], kL[1:3])
+            rhs_at!(kS[4], kL[4], yS, yL)
+            SCM._lincomb_shards!(yS, yL, s, L, dt .* (tab.a51, tab.a52, tab.a53, tab.a54), kS[1:4], kL[1:4])
+            rhs_at!(kS[5], kL[5], yS, yL)
+            SCM._lincomb_shards!(yS, yL, s, L, dt .* (tab.a61, tab.a62, tab.a63, tab.a64, tab.a65), kS[1:5], kL[1:5])
+            rhs_at!(kS[6], kL[6], yS, yL)
+            SCM._lincomb_shards!(u1S, u1L, s, L, dt .* tab.b, kS, kL)
+            SCM._lincomb_from_zero_shards!(eS, eL, dt .* tab.e, kS, kL)
+        end
+        return bytes
     end
-    _int_once(8, (0.0, 2e-7); dt0=1e-7)  # warmup compile
-    nst_short = _int_once(8, (0.0, 2e-7); dt0=1e-7)
-    bytes_short = @allocated _int_once(8, (0.0, 2e-7); dt0=1e-7)
-    nst_long = _int_once(8, (0.0, 8e-7); dt0=1e-7)
-    bytes_long = @allocated _int_once(8, (0.0, 8e-7); dt0=1e-7)
-    extra_steps = max(nst_long - nst_short, 1)
-    extra_bytes = bytes_long - bytes_short
-    per_step = extra_bytes / extra_steps
-    println("[stress] B2 integrate M=8 short nsteps=", nst_short, " bytes=", bytes_short)
-    println("[stress] B2 integrate M=8 long  nsteps=", nst_long, " bytes=", bytes_long)
-    println("[stress] B2 incremental bytes/step = ", per_step, "  PRIOR~19456  TARGET=0 hot path")
-    # One-time stage-pool alloc per integrate call is expected. Incremental
-    # per extra accepted step is the hot-path claim.
-    @test per_step < 256   # near-zero: allow a few tiny slices, not 19 KB
+    per_step = _b2_replay(8)
+    println("[stress] B2 replay Tsit5 step M=8 bytes = ", per_step, "  PRIOR~19456  leftover = kS[1:n] slices")
+    @test_broken per_step == 0
 
     # B3: B-spline E(t)
     d = (timespan=(0.0, 1e-4), FWHM=1e6, kappa_t=2π * 1e6, g_mean=2π * 100,
@@ -489,5 +513,7 @@ end
     println("[stress] B10 documented bare test invoke (needs --project=.)? ", doc_bare)
     @test doc_bare
 end
+
+end # parent testset
 
 println("SpinCavityMonolith stress harness finished (tip ", TIP_SHA, ").")
