@@ -722,6 +722,10 @@ function _noise_EdE_QRT_streaming_gpu(
     adSz_grid_cpu::Matrix{ComplexF64};
     batch_size::Int = 64,
 )
+    error(
+        "Factorized 1st-order QRT is demoted and is not the paper path. " *
+        "Use _noise_EdE_QRT_product (QRT_PRODUCT = same-bin + cavity, O(M))."
+    )
     Ng = length(tgrid_us)
 
     @assert length(delta_b_us) == M

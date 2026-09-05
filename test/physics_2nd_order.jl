@@ -716,4 +716,18 @@ end
     @test ga[IDX_a] ≈ conj(u[IDX_ad_ad]) - u[IDX_a]^2
 end
 
+@testset "paper noise/RASE path calls product QRT, not factorized 1st-order" begin
+    src = joinpath(@__DIR__, "..", "src")
+    noise = read(joinpath(src, "noise.jl"), String)
+    corr = read(joinpath(src, "correlations.jl"), String)
+    @test occursin("EdE = _noise_EdE_QRT_product", noise)
+    @test !occursin("EdE = _noise_EdE_QRT_streaming_gpu", noise)
+    @test occursin("jacobian     = QRT_PRODUCT", noise)
+    @test occursin("_fixed_point_scan_curves_product", corr)
+    @test occursin("_fixed_point_scan_curves_symmetric_product", corr)
+    @test !occursin("stepper! = _tsit5_step_one_gpu!", corr)
+    @test !occursin("stepper! = _rk4_step_one_gpu!", corr)
+    @test occursin("jacobian = QRT_PRODUCT", corr)
+end
+
 

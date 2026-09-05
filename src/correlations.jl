@@ -1044,6 +1044,10 @@ function _direct_gpu_curve(
     reltol::Float64 = 1e-8,
     abstol::Float64 = 1e-8,
 )
+    error(
+        "Factorized 1st-order QRT is demoted and is not the paper path. " *
+        "Use _direct_product_curve (QRT_PRODUCT = same-bin + cavity, O(M))."
+    )
     nscan = length(scan_indices)
 
     Cadaga = zeros(ComplexF64, nscan)
@@ -1168,6 +1172,10 @@ function _fixed_point_scan_curves_gpu(
     reltol::Float64 = 1e-8,
     abstol::Float64 = 1e-8,
 )
+    error(
+        "Factorized 1st-order QRT is demoted and is not the paper path. " *
+        "Use _fixed_point_scan_curves_product (QRT_PRODUCT)."
+    )
     nscan = length(scan_indices)
     nfix = length(fixed_indices)
 
@@ -1211,6 +1219,10 @@ function _fixed_point_scan_curves_symmetric_gpu(
     reltol::Float64 = 1e-8,
     abstol::Float64 = 1e-8,
 )
+    error(
+        "Factorized 1st-order QRT is demoted and is not the paper path. " *
+        "Use _fixed_point_scan_curves_symmetric_product (QRT_PRODUCT)."
+    )
     nscan = length(scan_indices)
     nfix = length(fixed_indices)
 
