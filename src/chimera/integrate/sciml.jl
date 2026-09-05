@@ -1,7 +1,7 @@
 # Time integration owner: DifferentialEquations.jl / OrdinaryDiffEq (SciML).
-# Single-device production path is Tsit5 via OrdinaryDiffEq.
-# The custom MGPU Tsit5/CK45 stepper is only the multi-GPU performance path
-# and must match this SciML trajectory within solver tolerances.
+# Production stepper is Tsit5 via OrdinaryDiffEq for single-device and
+# multi-GPU. Multi-GPU only shards correlators and NCCL-Allreduces the
+# 3M row-sums *inside* this same vector field — there is no homemade RK.
 
 const CHIMERA_SCIML_ALG = OrdinaryDiffEq.Tsit5
 const CHIMERA_INTEGRATOR = :sciml_ordinarydiffeq

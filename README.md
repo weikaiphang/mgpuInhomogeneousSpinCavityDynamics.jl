@@ -30,7 +30,7 @@ There is **no Volkov–Zon** solver.
 * 2nd-order cumulants, including same-bin and cross-bin correlators
 * Frequency and coupling inhomogeneity: Lorentzian / Gaussian / power-law \(g\), histogram or quadrature (tan–GL, GL+pdf, log-GL via FastGaussQuadrature)
 * Pulses, saved trajectories (`.jld2`), QRT noise from the factorized 1st-order Jacobian
-* SciML single-device path; sharded multi-GPU path (NCCL Allreduce for O(M) row-sums)
+* SciML Tsit5 for every trajectory; multi-GPU only shards correlators and NCCL-Allreduces the 3M row-sums inside that VF
 * PINN first-order datagen catalog (`src/datagen/`)
 
 ## Conventions

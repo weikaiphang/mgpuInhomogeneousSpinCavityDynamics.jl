@@ -1,4 +1,7 @@
 
+# Sharding + NCCL context. Not a stepper: OrdinaryDiffEq owns time.
+# Device shards hold local cross-block columns and the 3M row-sum buffer.
+
 mutable struct Shard{T}
     id::Int
     dev::CuDevice
@@ -6,60 +9,53 @@ mutable struct Shard{T}
 
     joff::Int
     mloc::Int
-    n::Int
-    nsmall::Int
-    lo::Int
 
-    delta_b::CuVector{T}
     g_b::CuVector{T}
-    Nj::CuVector{T}
-
-    regs::Vector{CuVector{Complex{T}}}
+    SpSp::CuVector{Complex{T}}
+    SmSp::CuVector{Complex{T}}
+    SzSp::CuVector{Complex{T}}
 
     rowsum::Vector{CuVector{Complex{T}}}
     part::CuVector{Complex{T}}
-    gsums::CuVector{Complex{T}}
-    normpart::CuVector{T}
-    normout::CuVector{T}
     ev::CuEvent
 
     nthreads_cross::Int
     nchunk::Int
     chunk_len::Int
-    nblocks_small::Int
-    nblocks_vec::Int
-    nblocks_norm::Int
 end
 
 
-struct MGPUProblem{T,F}
+mutable struct MGPUProblem{T,F}
     M::Int
     part::EnsemblePartition
     shards::Vector{Shard{T}}
     exec::Executor
-    nreg::Int
 
     delta0::T
     kappa_e::T
-    kappa_t::T
-    sqrt_ke::T
+    kappa_i::T
     E_of_t::F
+    delta_b::Vector{T}
+    g_b::Vector{T}
 
-    atol::T
-    rtol::T
-
-    rowparity::Base.RefValue{Int}
-    nrhs::Base.RefValue{Int}
     hostbuf::Vector{Complex{T}}
     comms::Any
     exchange::Symbol
+    nrhs::Base.RefValue{Int}
 end
 
-nshards(prob::MGPUProblem) = length(prob.shards)
+nshards(prob::MGPUProblem) = nshards(prob.part)
+
+function cuda_available()
+    try
+        return CUDA.functional()
+    catch
+        return false
+    end
+end
 
 
-
-function launch_config(dev::CuDevice, M::Int, mloc::Int, n::Int)
+function launch_config(dev::CuDevice, M::Int, mloc::Int)
     CUDA.device!(dev)
     nsm = CUDA.attribute(dev, CUDA.DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
 
@@ -73,16 +69,11 @@ function launch_config(dev::CuDevice, M::Int, mloc::Int, n::Int)
     chunk_len = cld(M, nchunk)
     nchunk = cld(M, chunk_len)
 
-    nblocks_small = cld(M, 256)
-    nblocks_vec   = min(cld(n, 256), 32 * nsm)
-    nblocks_norm  = min(cld(n, 256), 8 * nsm)
-
-    return nthreads, nchunk, chunk_len, nblocks_small, nblocks_vec, nblocks_norm
+    return nthreads, nchunk, chunk_len
 end
 
 
-
-function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T}
+function build_shards(::Type{T}, M, part, devs, g_b) where {T}
     ns = length(devs)
     shards = Vector{Shard{T}}(undef, ns)
 
@@ -92,25 +83,20 @@ function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T
 
         mloc = part.counts[p]
         joff = part.offsets[p]
-        nsmall = small_length(M)
-        n = shard_length(M, mloc)
-
-        nthreads, nchunk, chunk_len, nbs, nbv, nbn = launch_config(dev, M, mloc, n)
-
-        regs = [CUDA.zeros(Complex{T}, n) for _ in 1:nreg]
+        nthreads, nchunk, chunk_len = launch_config(dev, M, mloc)
+        nloc = M * mloc
 
         shards[p] = Shard{T}(
             p, dev, CuStream(),
-            joff, mloc, n, nsmall, nsmall,
-            CuArray(T.(delta_b)), CuArray(T.(g_b)), CuArray(T.(Nj)),
-            regs,
+            joff, mloc,
+            CuArray(T.(g_b)),
+            CUDA.zeros(Complex{T}, nloc),
+            CUDA.zeros(Complex{T}, nloc),
+            CUDA.zeros(Complex{T}, nloc),
             [CUDA.zeros(Complex{T}, 3M), CUDA.zeros(Complex{T}, 3M)],
             CUDA.zeros(Complex{T}, 3 * nchunk * mloc),
-            CUDA.zeros(Complex{T}, 3),
-            CUDA.zeros(T, nbn),
-            CUDA.zeros(T, 1),
             CuEvent(CUDA.EVENT_DISABLE_TIMING),
-            nthreads, nchunk, chunk_len, nbs, nbv, nbn,
+            nthreads, nchunk, chunk_len,
         )
     end
 
@@ -118,9 +104,9 @@ function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T
 end
 
 function free_shards!(shards)
+    isempty(shards) && return nothing
     for s in shards
         CUDA.device!(s.dev)
-        empty!(s.regs)
         empty!(s.rowsum)
     end
     GC.gc()
@@ -128,50 +114,6 @@ function free_shards!(shards)
         CUDA.device!(d)
         CUDA.reclaim()
     end
-    return nothing
-end
-
-
-
-function rhs!(prob::MGPUProblem{T}, iu::Int, idu::Int, t::Real) where {T}
-    shards = prob.shards
-    ns = length(shards)
-    M = prob.M
-
-    Et = Complex{T}(prob.E_of_t(t))
-
-    par = prob.rowparity[]
-    prob.rowparity[] = 1 - par
-    rb(s) = s.rowsum[par + 1]
-
-    prob.nrhs[] += 1
-
-    each_shard(shards, prob.exec) do s
-        u  = s.regs[iu]
-        du = s.regs[idu]
-        st = s.stream
-
-        @cuda threads=256 blocks=1 stream=st global_sums_kernel!(
-            s.gsums, u, s.g_b, M)
-
-        @cuda threads=s.nthreads_cross blocks=(s.nchunk, s.mloc) stream=st cross_rhs_kernel!(
-            du, u, s.part, s.delta_b, s.g_b,
-            M, s.mloc, s.joff, s.lo, s.chunk_len, s.nchunk)
-
-        @cuda threads=256 blocks=s.nblocks_vec stream=st fill_kernel!(
-            rb(s), zero(eltype(rb(s))), length(rb(s)))
-        @cuda threads=256 blocks=cld(s.mloc, 256) stream=st rowsum_finalize_kernel!(
-            rb(s), s.part, s.mloc, s.nchunk, s.joff)
-    end
-
-    ns > 1 && exchange_rowsums!(prob, rb)
-
-    each_shard(shards, prob.exec) do s
-        @cuda threads=256 blocks=s.nblocks_small stream=s.stream small_rhs_kernel!(
-            s.regs[idu], s.regs[iu], rb(s), s.gsums, s.delta_b, s.g_b,
-            Et, prob.delta0, prob.kappa_t, prob.sqrt_ke, M)
-    end
-
     return nothing
 end
 
@@ -243,116 +185,69 @@ function exchange_rowsums_host!(prob::MGPUProblem{T}, rb) where {T}
 end
 
 
+function device_cross_rowsums!(prob::MGPUProblem{T}, u) where {T}
+    shards = prob.shards
+    M = prob.M
+    par = 0
+    rb(s) = s.rowsum[par + 1]
 
-
-function combine!(prob::MGPUProblem{T}, iout::Int, ibase::Int, iks, coeffs,
-                  dt::T; n::Symbol = :full) where {T}
-    ks_idx = Tuple(iks)
-    cs = Tuple(T.(coeffs))
-    each_shard(prob.shards, prob.exec) do s
-        len = n === :full ? s.n : save_prefix_length(prob.M)
-        ks = map(i -> s.regs[i], ks_idx)
-        @cuda threads=256 blocks=s.nblocks_vec stream=s.stream combine_kernel!(
-            s.regs[iout], s.regs[ibase], ks, cs, dt, len)
-    end
-    return nothing
-end
-
-function copy_register!(prob::MGPUProblem, idst::Int, isrc::Int)
-    each_shard(prob.shards, prob.exec) do s
-        copyto!(s.regs[idst], s.regs[isrc])
-    end
-    return nothing
-end
-
-function swap_registers!(prob::MGPUProblem, i::Int, j::Int)
-    for s in prob.shards
-        s.regs[i], s.regs[j] = s.regs[j], s.regs[i]
-    end
-    return nothing
-end
-
-function fill_register!(prob::MGPUProblem{T}, i::Int, v) where {T}
-    val = Complex{T}(v)
-    each_shard(prob.shards, prob.exec) do s
-        @cuda threads=256 blocks=s.nblocks_vec stream=s.stream fill_kernel!(
-            s.regs[i], val, s.n)
-    end
-    return nothing
-end
-
-function sync_shards!(prob::MGPUProblem)
-    each_shard(prob.shards, prob.exec) do s
-        CUDA.synchronize(s.stream)
-    end
-    return nothing
-end
-
-
-function error_norm(prob::MGPUProblem{T}, iuprev::Int, iu::Int, iks, es,
-                    dt::T) where {T}
-    ks_idx = Tuple(iks)
-    cs = Tuple(T.(es))
-
-    each_shard(prob.shards, prob.exec) do s
-        istart = s.id == 1 ? 1 : s.nsmall + 1
-        sa, sb = szspt_range(s)
-        ks = map(i -> s.regs[i], ks_idx)
-        @cuda threads=256 blocks=s.nblocks_norm stream=s.stream errnorm_kernel!(
-            s.normpart, s.regs[iuprev], s.regs[iu], ks, cs, dt,
-            prob.atol, prob.rtol, istart, s.n, sa, sb)
-        @cuda threads=256 blocks=1 stream=s.stream sum_partials_kernel!(
-            s.normout, s.normpart, s.nblocks_norm)
+    each_shard(shards, prob.exec) do s
+        scatter_cross_columns!(s, u, M)
+        st = s.stream
+        @cuda threads=256 blocks=1 stream=st fill_kernel!(
+            rb(s), zero(eltype(rb(s))), length(rb(s)))
+        @cuda threads=s.nthreads_cross blocks=(s.nchunk, s.mloc) stream=st rowsum_partial_kernel!(
+            s.part, s.SpSp, s.SmSp, s.SzSp, s.g_b,
+            M, s.mloc, s.joff, s.chunk_len, s.nchunk)
+        @cuda threads=256 blocks=cld(s.mloc, 256) stream=st rowsum_finalize_kernel!(
+            rb(s), s.part, s.mloc, s.nchunk, s.joff)
     end
 
-    return gather_norm(prob)
-end
+    length(shards) > 1 && exchange_rowsums!(prob, rb)
 
-
-function diff_norm(prob::MGPUProblem{T}, ix::Int, iy::Int, iref::Int) where {T}
-    each_shard(prob.shards, prob.exec) do s
-        istart = s.id == 1 ? 1 : s.nsmall + 1
-        sa, sb = szspt_range(s)
-        y = iy == 0 ? nothing : s.regs[iy]
-        @cuda threads=256 blocks=s.nblocks_norm stream=s.stream diffnorm_kernel!(
-            s.normpart, s.regs[ix], y, s.regs[iref],
-            prob.atol, prob.rtol, istart, s.n, sa, sb)
-        @cuda threads=256 blocks=1 stream=s.stream sum_partials_kernel!(
-            s.normout, s.normpart, s.nblocks_norm)
-    end
-    return gather_norm(prob)
-end
-
-function szspt_range(s::Shard)
-    bs = s.nsmall == 0 ? 0 : (s.n - s.nsmall) ÷ NBLOCK
-
-    a = s.lo + 2 * bs + 1
-    b = s.lo + 3 * bs
-    return a, b
-end
-
-function gather_norm(prob::MGPUProblem{T}) where {T}
-    if prob.exchange === :nccl && prob.comms !== nothing && length(prob.shards) > 1
-        return gather_norm_nccl(prob)
-    end
-    total = zero(T)
-    for s in prob.shards
-        CUDA.device!(s.dev)
-        CUDA.synchronize(s.stream)
-        total += Array(s.normout)[1]
-    end
-    return sqrt(total / global_state_length(prob.M))
-end
-
-function gather_norm_nccl(prob::MGPUProblem{T}) where {T}
-    NCCL.group() do
-        for (s, comm) in zip(prob.shards, prob.comms)
-            CUDA.device!(s.dev)
-            NCCL.Allreduce!(s.normout, +, comm; stream = s.stream)
-        end
-    end
-    s1 = prob.shards[1]
+    s1 = shards[1]
     CUDA.device!(s1.dev)
     CUDA.synchronize(s1.stream)
-    return sqrt(Array(s1.normout)[1] / global_state_length(prob.M))
+    host = Vector{Complex{T}}(undef, 3M)
+    copyto!(host, rb(s1))
+    return unpack_rowsums_3M(host, M)
+end
+
+
+# SciML signature. One VF: injected NCCL/P2P/host row-sums into rhs_2nd_order!.
+function rhs_2nd_order_mgpu!(du, u, prob::MGPUProblem, t)
+    prob.nrhs[] += 1
+    M = prob.M
+    C = eltype(u)
+    mask = C.(.!Matrix{Bool}(I, M, M))
+    p = (prob.delta0, prob.kappa_e, prob.kappa_i, prob.delta_b, prob.g_b,
+         M, mask, prob.E_of_t)
+    if nshards(prob) == 1
+        if u isa CuArray
+            CUDA.device!(first(CUDA.devices()))
+            p = (prob.delta0, prob.kappa_e, prob.kappa_i,
+                 CuArray(prob.delta_b), CuArray(prob.g_b), M,
+                 CuArray(mask), prob.E_of_t)
+        end
+        rhs_2nd_order!(du, u, p, t)
+        return nothing
+    end
+    if isempty(prob.shards) || !cuda_available()
+        mode = prob.exchange
+        mode === :nccl || mode === :p2p || mode === :host || (mode = :host)
+        rhs_2nd_order_sharded!(du, u, p, t, prob.part, mode)
+        return nothing
+    end
+    rsP, rsM, rsZ = device_cross_rowsums!(prob, u)
+    if u isa CuArray
+        CUDA.device!(prob.shards[1].dev)
+        rsP, rsM, rsZ = CuArray(C.(rsP)), CuArray(C.(rsM)), CuArray(C.(rsZ))
+        mask = CuArray(mask)
+        p = (prob.delta0, prob.kappa_e, prob.kappa_i,
+             CuArray(prob.delta_b), CuArray(prob.g_b), M, mask, prob.E_of_t)
+    else
+        rsP, rsM, rsZ = C.(rsP), C.(rsM), C.(rsZ)
+    end
+    rhs_2nd_order!(du, u, p, t, (rsP, rsM, rsZ))
+    return nothing
 end

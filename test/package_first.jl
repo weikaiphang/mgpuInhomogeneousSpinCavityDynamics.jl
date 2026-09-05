@@ -118,3 +118,35 @@ end
     @test choose_rowsum_exchange(4; have_nccl=false, nunique_devices=4, nccl_ok=false, p2p_ok=false) === :host
     @test choose_rowsum_exchange(1; have_nccl=true, nunique_devices=1, nccl_ok=true, p2p_ok=true) === :none
 end
+
+@testset "homemade MGPU stepper is gone; SciML owns time" begin
+    mgpu = joinpath(@__DIR__, "..", "src", "chimera", "mgpu")
+    @test !isfile(joinpath(mgpu, "integrator.jl"))
+    @test !isfile(joinpath(mgpu, "tableaus.jl"))
+    blobs = Dict(f => read(joinpath(mgpu, f), String) for f in readdir(mgpu) if endswith(f, ".jl"))
+    allsrc = join(values(blobs), "\n")
+    @test !occursin("Tsit5Tableau", allsrc)
+    @test !occursin("CK45Tableau", allsrc)
+    @test !occursin("function solve_mgpu!", allsrc)
+    @test !occursin("function tsit5_step!", allsrc)
+    @test !occursin("function ck45_step!", allsrc)
+    @test !occursin("cross_rhs_kernel!", allsrc)
+    @test !occursin("small_rhs_kernel!", allsrc)
+    @test !occursin("combine_kernel!", allsrc)
+    @test !occursin("lowstorage_kernel!", allsrc)
+    @test occursin("NCCL.Allreduce!", blobs["problem.jl"])
+    @test occursin("exchange_rowsums_p2p!", blobs["problem.jl"])
+    @test occursin("rhs_2nd_order_mgpu!", blobs["problem.jl"])
+    @test occursin("rowsum_partial_kernel!", blobs["kernels.jl"])
+    @test occursin("chimera_solve", blobs["solver.jl"])
+    @test occursin("chimera_ode_problem", blobs["solver.jl"])
+    @test occursin("return run_sim_1st_order", blobs["solver.jl"])
+    @test count("NCCL.Allreduce!", blobs["problem.jl"]) == 1
+    @test CHIMERA_INTEGRATOR === :sciml_ordinarydiffeq
+    sciml = read(joinpath(@__DIR__, "..", "src", "chimera", "integrate", "sciml.jl"), String)
+    @test occursin("OrdinaryDiffEq", sciml)
+    @test !occursin("custom MGPU Tsit5/CK45", sciml)
+    eoms = read(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "closure_2nd.jl"), String)
+    @test occursin("injected_cross_rowsums", eoms)
+    @test !occursin("fused sharded replica", eoms)
+end

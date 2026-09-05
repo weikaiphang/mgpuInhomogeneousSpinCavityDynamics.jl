@@ -1,5 +1,4 @@
 
-
 struct ObservableStore{T}
     M::Int
     Nt::Int
@@ -35,14 +34,10 @@ function ObservableStore(::Type{T}, M::Int, Nt::Int; save_spins::Bool = true) wh
 end
 
 
-function record!(store::ObservableStore{T}, prob::MGPUProblem{T}, ireg::Int,
-                 k::Int, t::Real) where {T}
-    s = prob.shards[1]
-    CUDA.device!(s.dev)
-    CUDA.synchronize(s.stream)
-
+function record!(store::ObservableStore{T}, u, k::Int, t::Real) where {T}
     npref = length(store.host)
-    copyto!(store.host, 1, s.regs[ireg], 1, npref)
+    src = u isa CuArray ? Array(@view u[1:npref]) : @view u[1:npref]
+    copyto!(store.host, src)
 
     M = store.M
     h = store.host

@@ -3,9 +3,11 @@
 # for the inhomogeneous Tavis–Cummings / Dicke ensemble (see
 # eoms/hamiltonian.jl and eoms/quantum_cumulants.jl). Same-bin moments live
 # in *_same; cross-block diagonals are unused (diag_mask = .!I). `rhs_cpu!`
-# wraps this function. MGPU kernels are a fused sharded replica, not a
-# second equation set.
-function rhs_2nd_order!(du, u, p, t)
+# wraps this function. Multi-GPU evaluates this same VF: shard the large
+# correlators, Allreduce the 3M cross row-sums, then apply these equations.
+# `injected_cross_rowsums` is (sum_k≠j g_k SpSp_jk, SmSp_jk, SzSp_jk) when
+# the caller already assembled those sums (CPU shards or NCCL).
+function rhs_2nd_order!(du, u, p, t, injected_cross_rowsums=nothing)
     delta0, kappa_e, kappa_i, delta_b_gpu, g_b_gpu, M, diag_mask, E_of_t = p
 
     (
@@ -48,11 +50,18 @@ function rhs_2nd_order!(du, u, p, t)
 
 
     # Same-bin moments live in *_same, not on the cross-block diagonal
-    # (diag_mask = .!I). The MGPU kernels skip k == j in the row-sum;
-    # the monolith must do the same or custom / random states diverge.
-    sumgSpSp_jk = SpSp_same .* g_b_gpu .+ (SpSp_cross .* diag_mask) * g_b_gpu
-    sumgSmSp_jk = SmSp_same .* g_b_gpu .+ (SmSp_cross .* diag_mask) * g_b_gpu
-    sumgSzSp_jk = SzSp_same .* g_b_gpu .+ (SzSp_cross .* diag_mask) * g_b_gpu
+    # (diag_mask = .!I). Sharded / NCCL callers inject the 3M cross
+    # row-sums; the monolith computes the same (Cross .* diag_mask) * g.
+    if injected_cross_rowsums === nothing
+        sumgSpSp_jk = SpSp_same .* g_b_gpu .+ (SpSp_cross .* diag_mask) * g_b_gpu
+        sumgSmSp_jk = SmSp_same .* g_b_gpu .+ (SmSp_cross .* diag_mask) * g_b_gpu
+        sumgSzSp_jk = SzSp_same .* g_b_gpu .+ (SzSp_cross .* diag_mask) * g_b_gpu
+    else
+        rsP, rsM, rsZ = injected_cross_rowsums
+        sumgSpSp_jk = SpSp_same .* g_b_gpu .+ rsP
+        sumgSmSp_jk = SmSp_same .* g_b_gpu .+ rsM
+        sumgSzSp_jk = SzSp_same .* g_b_gpu .+ rsZ
+    end
 
     dadSp .= (
     1im * delta0 .* adSp .+ 1im .* delta_b_gpu .* adSp .+ 1im .* sumgSpSp_jk
