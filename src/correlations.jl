@@ -46,6 +46,9 @@ struct CorrelationWorkspace
     g_b_us::Vector{Float64}
 
     delta0_us::Float64
+
+    # Bin occupations for H1 same-bin reconstruction on the product QRT path.
+    Nj::Vector{Float64}
 end
 
 
@@ -208,6 +211,9 @@ function _validate_workspace(workspace::CorrelationWorkspace)
     length(workspace.kappa_t_full_us) == Nt || error(
         "kappa_t array has the wrong length.",
     )
+    length(workspace.Nj) == M || error(
+        "Nj has length $(length(workspace.Nj)); expected $M.",
+    )
 
     return nothing
 end
@@ -268,19 +274,18 @@ function load_correlation_workspace(input_file::AbstractString)
             "$M_spin ensemble rows.",
         )
 
-        if _has_value(source, :Nj_2d)
+        Nj = if _has_value(source, :Nj_2d)
             Nj_2d = _get_value(source, :Nj_2d)
-
             size(Nj_2d) == (M_delta, M_g) || error(
                 "Nj_2d has size $(size(Nj_2d)); expected " *
                 "($M_delta, $M_g).",
             )
+            vec(Float64.(Nj_2d))
+        elseif _has_value(source, :Nj)
+            vec(Float64.(_get_value(source, :Nj)))
+        else
+            qrt_estimate_Nj(Sp_sol, Sz_sol)
         end
-
-
-
-
-
 
         delta_b_us = repeat(
             delta_b_1d_us;
@@ -311,6 +316,14 @@ function load_correlation_workspace(input_file::AbstractString)
             "Flattened g_b has length $(length(g_b_us)); " *
             "expected $M.",
         )
+
+        Nj = if _has_value(source, :Nj)
+            vec(Float64.(_get_value(source, :Nj)))
+        elseif _has_value(source, :Nj_2d)
+            vec(Float64.(_get_value(source, :Nj_2d)))
+        else
+            qrt_estimate_Nj(Sp_sol, Sz_sol)
+        end
     end
 
     println(
@@ -348,6 +361,7 @@ function load_correlation_workspace(input_file::AbstractString)
         delta_b_us,
         g_b_us,
         delta0_us,
+        Nj,
     )
 
     _validate_workspace(workspace)
@@ -512,8 +526,8 @@ function _build_g0_adag_column_cpu(
 end
 
 
-# Factorized 1st-order QRT Jacobian about the stored means (not the
-# 2nd-order cumulant Jacobian). See also `_build_g0_adag_column_cpu`.
+# Unused. Factorized 1st-order QRT Jacobian (⟨a† Sᶻ⟩ ≈ ⟨a†⟩⟨Sᶻ⟩).
+# Product path is `_direct_product_curve` / `qrt_product_apply!`.
 function _qrt_rhs_one_gpu!(
     dSp,
     dSm,
@@ -807,6 +821,217 @@ function _tsit5_step_one_gpu!(
 end
 
 
+function _qrt_pack_workspace!(u, workspace::CorrelationWorkspace, k::Int)
+    qrt_pack_product_state!(
+        u,
+        workspace.a_sol[k],
+        workspace.adad_sol[k],
+        real(workspace.n_sol[k]),
+        view(workspace.Sp_sol, :, k),
+        view(workspace.Sz_sol, :, k),
+        view(workspace.adSp_sol, :, k),
+        view(workspace.adSm_sol, :, k),
+        view(workspace.adSz_sol, :, k),
+        workspace.Nj,
+    )
+    return u
+end
+
+function _qrt_kappa_ei(workspace::CorrelationWorkspace, k::Int)
+    ke = workspace.kappa_e_full_us[k]
+    kt = workspace.kappa_t_full_us[k]
+    return ke, max(kt - ke, 0.0)
+end
+
+# Product-path QRT curve: same-bin + cavity 2nd-order, O(M).
+# Two columns: ⟨· a†⟩ → ⟨a(t) a†(t0)⟩ and ⟨· a⟩ → ⟨a†(t) a†(t0)⟩ via conj.
+function _direct_product_curve(
+    jfix::Int,
+    scan_indices::Vector{Int},
+    workspace::CorrelationWorkspace;
+    stepper::Symbol = :rk4,
+    reltol::Float64 = 1e-8,
+    abstol::Float64 = 1e-8,
+)
+    nscan = length(scan_indices)
+    Cadaga = zeros(ComplexF64, nscan)
+    Cadagadag = zeros(ComplexF64, nscan)
+    Cxx = zeros(ComplexF64, nscan)
+    Cpp = zeros(ComplexF64, nscan)
+
+    later_positions = findall(
+        position -> scan_indices[position] >= jfix,
+        eachindex(scan_indices),
+    )
+    isempty(later_positions) && return Cxx, Cpp, Cadaga, Cadagadag
+
+    M = workspace.M
+    scratch = QRTProductScratch(Float64, M)
+    ufix = scratch.u1
+    _qrt_pack_workspace!(ufix, workspace, jfix)
+    g_adag = zeros(ComplexF64, small_length(M))
+    g_a = zeros(ComplexF64, small_length(M))
+    qrt_seed_adag_column!(g_adag, ufix, M)
+    qrt_seed_a_column!(g_a, ufix, M)
+
+    save_positions = later_positions
+    save_indices = scan_indices[save_positions]
+    pointer = 1
+    last_needed = save_indices[end]
+
+    sqrt_kappa_fixed = sqrt(workspace.kappa_e_full_us[jfix])
+    adag_fixed = conj(workspace.a_sol[jfix])
+    a_fixed = workspace.a_sol[jfix]
+
+    function _record!(output_position)
+        jscan = scan_indices[output_position]
+        prefactor = sqrt_kappa_fixed * sqrt(workspace.kappa_e_full_us[jscan])
+        Cadaga[output_position] = prefactor * (
+            g_adag[IDX_a] + adag_fixed * workspace.a_sol[jscan]
+        )
+        Cadagadag[output_position] = prefactor * (
+            conj(g_a[IDX_a]) + adag_fixed * conj(workspace.a_sol[jscan])
+        )
+        aa = Cadaga[output_position]
+        aaqq = Cadagadag[output_position]
+        Cxx[output_position] = (aaqq + conj(aaqq) + aa + conj(aa)) / 4
+        Cpp[output_position] = (-aaqq - conj(aaqq) + aa + conj(aa)) / 4
+        return nothing
+    end
+
+    while pointer <= length(save_indices) && save_indices[pointer] == jfix
+        _record!(save_positions[pointer])
+        pointer += 1
+    end
+
+    Et = 0.0im
+    for k in jfix:(last_needed - 1)
+        dt = workspace.times_us[k + 1] - workspace.times_us[k]
+        ke, ki = _qrt_kappa_ei(workspace, k)
+        _qrt_pack_workspace!(scratch.u1, workspace, k)
+        _qrt_pack_workspace!(scratch.u2, workspace, k + 1)
+        @. scratch.umid = 0.5 * (scratch.u1 + scratch.u2)
+        if stepper === :tsit5
+            qrt_tsit5_product_step!(
+                g_adag, scratch.u1, scratch.u2, dt,
+                workspace.delta0_us, ke, ki,
+                workspace.delta_b_us, workspace.g_b_us, Et;
+                reltol = reltol, abstol = abstol,
+            )
+            qrt_tsit5_product_step!(
+                g_a, scratch.u1, scratch.u2, dt,
+                workspace.delta0_us, ke, ki,
+                workspace.delta_b_us, workspace.g_b_us, Et;
+                reltol = reltol, abstol = abstol,
+            )
+        else
+            qrt_rk4_product_step!(
+                g_adag, scratch.u1, scratch.umid, scratch.u2, dt,
+                workspace.delta0_us, ke, ki,
+                workspace.delta_b_us, workspace.g_b_us, Et, scratch,
+            )
+            qrt_rk4_product_step!(
+                g_a, scratch.u1, scratch.umid, scratch.u2, dt,
+                workspace.delta0_us, ke, ki,
+                workspace.delta_b_us, workspace.g_b_us, Et, scratch,
+            )
+        end
+
+        while pointer <= length(save_indices) && save_indices[pointer] == k + 1
+            _record!(save_positions[pointer])
+            pointer += 1
+        end
+    end
+
+    return Cxx, Cpp, Cadaga, Cadagadag
+end
+
+function _fixed_point_scan_curves_product(
+    fixed_indices::Vector{Int},
+    scan_indices::Vector{Int},
+    workspace::CorrelationWorkspace;
+    stepper::Symbol = :rk4,
+    reltol::Float64 = 1e-8,
+    abstol::Float64 = 1e-8,
+)
+    nscan = length(scan_indices)
+    nfix = length(fixed_indices)
+    Cadaga_matrix = zeros(ComplexF64, nscan, nfix)
+    Cadagadag_matrix = zeros(ComplexF64, nscan, nfix)
+    Cxx_matrix = zeros(ComplexF64, nscan, nfix)
+    Cpp_matrix = zeros(ComplexF64, nscan, nfix)
+
+    for (column, jfix) in enumerate(fixed_indices)
+        Cxx, Cpp, Cadaga, Cadagadag = _direct_product_curve(
+            jfix, scan_indices, workspace;
+            stepper = stepper, reltol = reltol, abstol = abstol,
+        )
+        Cxx_matrix[:, column] .= Cxx
+        Cpp_matrix[:, column] .= Cpp
+        Cadaga_matrix[:, column] .= Cadaga
+        Cadagadag_matrix[:, column] .= Cadagadag
+    end
+    return Cxx_matrix, Cpp_matrix, Cadaga_matrix, Cadagadag_matrix
+end
+
+function _fixed_point_scan_curves_symmetric_product(
+    fixed_indices::Vector{Int},
+    scan_indices::Vector{Int},
+    workspace::CorrelationWorkspace;
+    stepper::Symbol = :rk4,
+    reltol::Float64 = 1e-8,
+    abstol::Float64 = 1e-8,
+)
+    nscan = length(scan_indices)
+    nfix = length(fixed_indices)
+    Cadaga_matrix = zeros(ComplexF64, nscan, nfix)
+    Cadagadag_matrix = zeros(ComplexF64, nscan, nfix)
+    Cxx_matrix = zeros(ComplexF64, nscan, nfix)
+    Cpp_matrix = zeros(ComplexF64, nscan, nfix)
+
+    for (column, jfix) in enumerate(fixed_indices)
+        Cxx, Cpp, Cadaga, Cadagadag = _direct_product_curve(
+            jfix, scan_indices, workspace;
+            stepper = stepper, reltol = reltol, abstol = abstol,
+        )
+        Cxx_matrix[:, column] .= Cxx
+        Cpp_matrix[:, column] .= Cpp
+        Cadaga_matrix[:, column] .= Cadaga
+        Cadagadag_matrix[:, column] .= Cadagadag
+
+        earlier_positions = findall(
+            position -> scan_indices[position] < jfix,
+            eachindex(scan_indices),
+        )
+        for output_position in earlier_positions
+            jscan = scan_indices[output_position]
+            _, _, Cadaga_forward, Cadagadag_forward = _direct_product_curve(
+                jscan, [jfix], workspace;
+                stepper = stepper, reltol = reltol, abstol = abstol,
+            )
+            prefactor = sqrt(
+                workspace.kappa_e_full_us[jscan] *
+                workspace.kappa_e_full_us[jfix],
+            )
+            corr_forward_adag_a = Cadaga_forward[1] / prefactor
+            corr_forward_adag_adag = Cadagadag_forward[1] / prefactor
+            Cadaga_matrix[output_position, column] =
+                prefactor * conj(corr_forward_adag_a)
+            Cadagadag_matrix[output_position, column] =
+                prefactor * corr_forward_adag_adag
+            aa = Cadaga_matrix[output_position, column]
+            aaqq = Cadagadag_matrix[output_position, column]
+            Cxx_matrix[output_position, column] =
+                (aaqq + conj(aaqq) + aa + conj(aa)) / 4
+            Cpp_matrix[output_position, column] =
+                (-aaqq - conj(aaqq) + aa + conj(aa)) / 4
+        end
+    end
+    return Cxx_matrix, Cpp_matrix, Cadaga_matrix, Cadagadag_matrix
+end
+
+
+# Unused. Factorized 1st-order GPU QRT (not the product path).
 function _direct_gpu_curve(
     jfix::Int,
     scan_indices::Vector{Int},
@@ -1070,8 +1295,6 @@ function compute_ase_rase_correlations_gpu(
     verbose::Bool = true,
 )
     _validate_settings(settings)
-    CUDA.functional() || error("CUDA is not functional on this system.")
-    CUDA.allowscalar(false)
 
     indices = _build_correlation_indices(
         workspace,
@@ -1079,86 +1302,60 @@ function compute_ase_rase_correlations_gpu(
         verbose = verbose,
     )
 
-    Sp_gpu = nothing
-    Sz_gpu = nothing
-    delta_gpu = nothing
-    g_gpu = nothing
-
-    try
-        Sp_gpu = CuArray(workspace.Sp_sol)
-        Sz_gpu = CuArray(workspace.Sz_sol)
-        delta_gpu = CuArray(workspace.delta_b_us)
-        g_gpu = CuArray(workspace.g_b_us)
-
     verbose && println(
-        "Running ASE-RASE correlations with adaptive Tsit5 ...",
+        "Running ASE-RASE correlations with product QRT (",
+        QRT_PRODUCT, ", Tsit5) ...",
     )
 
-    CUDA.synchronize()
     start_AR = time_ns()
 
     Cxx_AR, Cpp_AR, Cadaga_AR, Cadagadag_AR =
-        _fixed_point_scan_curves_gpu(
+        _fixed_point_scan_curves_product(
             indices.IA_fixed,
             indices.IR_scan,
-            workspace,
-            delta_gpu,
-            g_gpu,
-            Sp_gpu,
-            Sz_gpu;
-            stepper! = _tsit5_step_one_gpu!,
+            workspace;
+            stepper = :tsit5,
             reltol = settings.reltol,
             abstol = settings.abstol,
         )
 
-    CUDA.synchronize()
     time_AR = (time_ns() - start_AR) / 1e9
 
     verbose && println(
-        "Running ASE-ASE correlations with fixed-step RK4 ...",
+        "Running ASE-ASE correlations with product QRT RK4 ...",
     )
 
     start_AA = time_ns()
 
     Cxx_AA, Cpp_AA, Cadaga_AA, Cadagadag_AA =
-        _fixed_point_scan_curves_symmetric_gpu(
+        _fixed_point_scan_curves_symmetric_product(
             indices.IA_fixed,
             indices.IA_scan,
-            workspace,
-            delta_gpu,
-            g_gpu,
-            Sp_gpu,
-            Sz_gpu;
-            stepper! = _rk4_step_one_gpu!,
+            workspace;
+            stepper = :rk4,
         )
 
-    CUDA.synchronize()
     time_AA = (time_ns() - start_AA) / 1e9
 
     verbose && println(
-        "Running RASE-RASE correlations with fixed-step RK4 ...",
+        "Running RASE-RASE correlations with product QRT RK4 ...",
     )
 
     start_RR = time_ns()
 
     Cxx_RR, Cpp_RR, Cadaga_RR, Cadagadag_RR =
-        _fixed_point_scan_curves_symmetric_gpu(
+        _fixed_point_scan_curves_symmetric_product(
             indices.IR_fixed,
             indices.IR_scan,
-            workspace,
-            delta_gpu,
-            g_gpu,
-            Sp_gpu,
-            Sz_gpu;
-            stepper! = _rk4_step_one_gpu!,
+            workspace;
+            stepper = :rk4,
         )
 
-    CUDA.synchronize()
     time_RR = (time_ns() - start_RR) / 1e9
 
     total_time = time_AR + time_AA + time_RR
 
-    verbose && println("Finished all GPU correlation calculations.")
+    verbose && println("Finished product-path QRT correlations (CPU, O(M) star).")
     verbose && println("ASE-RASE time : $time_AR seconds")
     verbose && println("ASE-ASE time  : $time_AA seconds")
     verbose && println("RASE-RASE time: $time_RR seconds")
@@ -1190,6 +1387,7 @@ function compute_ase_rase_correlations_gpu(
             ASE_RASE = :Tsit5,
             ASE_ASE = :RK4,
             RASE_RASE = :RK4,
+            jacobian = QRT_PRODUCT,
         ),
 
         timings = (
@@ -1233,15 +1431,7 @@ function compute_ase_rase_correlations_gpu(
         ),
     )
 
-        return result
-    finally
-        Sp_gpu = nothing
-        Sz_gpu = nothing
-        delta_gpu = nothing
-        g_gpu = nothing
-        GC.gc(false)
-        CUDA.reclaim()
-    end
+    return result
 end
 
 

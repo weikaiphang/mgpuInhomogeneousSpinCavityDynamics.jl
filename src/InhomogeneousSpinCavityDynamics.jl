@@ -64,6 +64,7 @@ include("MGPUinitial_conditions.jl")
 include("MGPUobservables.jl")
 include("MGPUstate_io.jl")
 include("MGPUrhs_cpu.jl")
+include("qrt_jacobian.jl")
 
 include("noise.jl")
 include("correlations.jl")
@@ -149,5 +150,11 @@ export CorrelationWorkspace
 export load_correlation_workspace
 export compute_ase_rase_correlations_gpu
 export save_correlation_results
+
+export QRT_PRODUCT, QRT_ORACLE
+export qrt_star_rhs!, qrt_product_apply!, qrt_oracle_apply!, qrt_oracle_dense
+export qrt_relabs_err, qrt_pad_product_tangent
+export qrt_seed_adag_column!, qrt_seed_a_column!
+export qrt_pack_product_state!, QRTProductScratch
 
 end

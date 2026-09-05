@@ -9,6 +9,7 @@ for (pred, rel) in (
     (!isdefined(@__MODULE__, :Tsit5Tableau), "MGPUtableaus.jl"),
     (!isdefined(@__MODULE__, :Solver2Workspace), "solver_2nd_workspace.jl"),
     (!isdefined(@__MODULE__, :build_u0_cpu_2nd_order), "initial_conditions_2nd_order.jl"),
+    (!isdefined(@__MODULE__, :qrt_product_apply!), "qrt_jacobian.jl"),
     (!isdefined(@__MODULE__, :_with_default_ensemble_method), "simulation_api.jl"),
     (!isdefined(@__MODULE__, :build_constant_coupling_bins), "coupling_inhomogeneity.jl"),
     (!isdefined(@__MODULE__, :total_spin_number_from_cooperativity), "frequency_inhomogeneity.jl"),
@@ -580,6 +581,137 @@ end
     attach_u0!(ws_t, u0)
     alloc_e2e5 = @allocated solve_cpu_2nd!(ws_t, pt, 0.0, 0.05, tsave; reltol = 1e-8, abstol = 1e-8)
     @test alloc_e2e5 == 0
+end
+
+# ---------------------------------------------------------------------------
+# QRT Jacobian (Niels): product = same-bin + cavity (O(M)); full-J is
+# a small-M oracle only. Factorized 1st-order is not the product path.
+# ---------------------------------------------------------------------------
+@testset "QRT star RHS matches rhs_cpu! when cross = 0" begin
+    Random.seed!(11)
+    M = 3
+    Nj = fill(8.0, M)
+    delta_b = [-0.4, 0.1, 0.35]
+    g_b = [0.12, 0.18, 0.09]
+    Et = 0.2 + 0.05im
+    u = build_u0_cpu_2nd_order(M, Nj, :equator)
+    n = small_length(M)
+    u[n+1:end] .= 0
+    u[IDX_a] = 0.3 - 0.1im
+    u[IDX_ad_ad] = 0.05 + 0.02im
+    u[IDX_ad_a] = 0.4
+    for j in 1:M
+        u[small_offset(M, F_adSp) + j] = 0.02 * j + 0.01im
+        u[small_offset(M, F_adSm) + j] = 0.015 * j - 0.02im
+        u[small_offset(M, F_adSz) + j] = -0.03 * j
+    end
+    du_s = zeros(ComplexF64, n)
+    du_f = zeros(ComplexF64, global_state_length(M))
+    qrt_star_rhs!(du_s, view(u, 1:n), 0.1, 1.5, 0.25, delta_b, g_b, Et)
+    rhs_cpu!(du_f, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
+    err = qrt_relabs_err(du_s, view(du_f, 1:n))
+    @info "QRT star vs rhs_cpu! (cross=0)" abs = err.abs rel = err.rel
+    @test err.abs < 1e-12
+    @test err.rel < 1e-12
+end
+
+@testset "QRT star RHS differs from rhs_cpu! when cross ≠ 0" begin
+    M = 3
+    Nj = fill(8.0, M)
+    delta_b = [-0.4, 0.1, 0.35]
+    g_b = [0.12, 0.18, 0.09]
+    Et = 0.2 + 0.05im
+    u = build_u0_cpu_2nd_order(M, Nj, :equator)
+    n = small_length(M)
+    @test any(!iszero, u[n+1:end])
+    du_s = zeros(ComplexF64, n)
+    du_f = zeros(ComplexF64, global_state_length(M))
+    qrt_star_rhs!(du_s, view(u, 1:n), 0.1, 1.5, 0.25, delta_b, g_b, Et)
+    rhs_cpu!(du_f, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
+    err = qrt_relabs_err(du_s, view(du_f, 1:n))
+    @info "QRT star vs rhs_cpu! (cross≠0, expected differ)" abs = err.abs rel = err.rel
+    @test err.abs > 1e-8
+end
+
+@testset "QRT product J vs full-J oracle (v_cross = 0)" begin
+    Random.seed!(12)
+    for (M, ic, Et) in ((2, :equator, 0.0im), (3, :weak, 0.15 + 0.05im))
+        Nj = fill(6.0, M)
+        delta_b = collect(range(-0.3, 0.3; length=M))
+        g_b = fill(0.14, M)
+        u = build_u0_cpu_2nd_order(M, Nj, ic)
+        n = small_length(M)
+        u[IDX_a] = 0.25 + 0.1im
+        u[IDX_ad_ad] = 0.04
+        u[IDX_ad_a] = 0.3
+        g_s = randn(ComplexF64, n)
+        g_f = qrt_pad_product_tangent(g_s, M)
+        dg_s = similar(g_s)
+        dg_f = similar(g_f)
+        qrt_product_apply!(dg_s, g_s, u, 0.08, 1.2, 0.3, delta_b, g_b, Et; ε=1e-7)
+        qrt_oracle_apply!(dg_f, g_f, u, 0.08, 1.2, 0.3, delta_b, g_b, Et; ε=1e-7)
+        err = qrt_relabs_err(dg_s, view(dg_f, 1:n))
+        @info "QRT product vs oracle (v_cross=0)" M ic abs = err.abs rel = err.rel
+        @test err.abs < 1e-8
+        @test err.rel < 1e-6
+        @test QRT_PRODUCT === :star_samebin_cavity
+        @test QRT_ORACLE === :full_dense
+        @test qrt_product_length(M) == n
+        @test qrt_oracle_length(M) == global_state_length(M)
+    end
+end
+
+@testset "QRT product ≠ oracle when tangent has cross" begin
+    Random.seed!(13)
+    M = 2
+    Nj = fill(6.0, M)
+    delta_b = [-0.2, 0.25]
+    g_b = [0.11, 0.16]
+    u = build_u0_cpu_2nd_order(M, Nj, :equator)
+    n = small_length(M)
+    g_f = randn(ComplexF64, global_state_length(M))
+    g_s = g_f[1:n]
+    dg_s = similar(g_s)
+    dg_f = similar(g_f)
+    qrt_product_apply!(dg_s, g_s, u, 0.0, 1.5, 0.25, delta_b, g_b, 0.0im; ε=1e-7)
+    qrt_oracle_apply!(dg_f, g_f, u, 0.0, 1.5, 0.25, delta_b, g_b, 0.0im; ε=1e-7)
+    err = qrt_relabs_err(dg_s, view(dg_f, 1:n))
+    @info "QRT product vs oracle (v_cross≠0, expected differ)" abs = err.abs rel = err.rel
+    @test err.abs > 1e-8
+end
+
+@testset "QRT oracle dense J*v vs apply" begin
+    Random.seed!(14)
+    M = 2
+    Nj = fill(5.0, M)
+    delta_b = [-0.15, 0.2]
+    g_b = [0.1, 0.13]
+    u = build_u0_cpu_2nd_order(M, Nj, :weak)
+    u[IDX_a] = 0.2
+    u[IDX_ad_a] = 0.25
+    J = qrt_oracle_dense(u, 0.05, 1.0, 0.2, delta_b, g_b, 0.1im; ε=1e-7)
+    @test size(J) == (global_state_length(M), global_state_length(M))
+    v = randn(ComplexF64, length(u))
+    dg = similar(v)
+    qrt_oracle_apply!(dg, v, u, 0.05, 1.0, 0.2, delta_b, g_b, 0.1im; ε=1e-7)
+    err = qrt_relabs_err(J * v, dg)
+    @info "QRT oracle dense J*v vs apply" abs = err.abs rel = err.rel n = size(J, 1)
+    @test err.abs < 1e-8
+    @test err.rel < 1e-6
+end
+
+@testset "QRT adag seed has bosonic +1" begin
+    M = 2
+    Nj = fill(4.0, M)
+    u = build_u0_cpu_2nd_order(M, Nj, :ground)
+    u[IDX_a] = 0.4 + 0.1im
+    u[IDX_ad_a] = 0.3
+    g = zeros(ComplexF64, small_length(M))
+    qrt_seed_adag_column!(g, view(u, 1:small_length(M)), M)
+    @test g[IDX_a] ≈ u[IDX_ad_a] - abs2(u[IDX_a]) + 1
+    ga = zeros(ComplexF64, small_length(M))
+    qrt_seed_a_column!(ga, view(u, 1:small_length(M)), M)
+    @test ga[IDX_a] ≈ conj(u[IDX_ad_ad]) - u[IDX_a]^2
 end
 
 

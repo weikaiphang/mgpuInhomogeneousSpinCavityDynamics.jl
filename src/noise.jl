@@ -29,6 +29,9 @@ struct NoiseSimulationData
     kappa_e_us::Float64
     kappa_i_us::Float64
     kappa_t_us::Float64
+
+    # Bin occupations for H1 same-bin reconstruction on the product QRT path.
+    Nj::Vector{Float64}
 end
 
 function _require_noise_fields(data)
@@ -107,6 +110,7 @@ function _validate_noise_data(d::NoiseSimulationData)
     issorted(d.times_us) || error("times_us must be sorted in increasing order.")
     d.kappa_e_us >= 0 || error("kappa_e must be non-negative.")
     d.kappa_i_us >= 0 || error("kappa_i must be non-negative.")
+    length(d.Nj) == d.M || error("length(Nj) must equal M.")
 
     return nothing
 end
@@ -155,6 +159,15 @@ function load_noise_data(
     kappa_i = Float64(data.SYSTEM_CONFIG.kappa_i)
     delta0  = Float64(data.SYSTEM_CONFIG.delta0)
 
+    Nj = if hasproperty(data, :Nj)
+        vec(Float64.(data.Nj))
+    elseif hasproperty(data, :Nj_2d)
+        vec(Float64.(data.Nj_2d))
+    else
+        qrt_estimate_Nj(Sp_sol, Sz_sol)
+    end
+    length(Nj) == M || error("Nj has length $(length(Nj)); expected M = $M.")
+
     d = NoiseSimulationData(
         String(file),
         times_us,
@@ -175,6 +188,7 @@ function load_noise_data(
         kappa_e * 1e-6,
         kappa_i * 1e-6,
         (kappa_e + kappa_i) * 1e-6,
+        Nj,
     )
 
     _validate_noise_data(d)
@@ -300,14 +314,10 @@ function _noise_make_mode_window(
 end
 
 
-# Quantum regression for output-mode noise uses the *factorized 1st-order*
-# Jacobian about the saved mean-field / 2nd-order-mean trajectory:
-#   δṠ⁺ = iΔ δS⁺ − 2ig (⟨a†⟩ δSᶻ + ⟨Sᶻ⟩ δa†)
-# and likewise for δa, δS⁻, δSᶻ. This is not the linearization of the
-# 2nd-order cumulant RHS (which would couple same-bin and cross moments).
-# A full 2nd-order Jacobian is O(M²) and is not used here.
-# Initial ⟨aa†⟩_c includes the bosonic +1; see _noise_mode_QRT_gpu_complex.
-function _noise_qrt_rhs_gpu!(
+# Unused. Factorized 1st-order Jacobian (⟨a† Sᶻ⟩ ≈ ⟨a†⟩⟨Sᶻ⟩). Kept only so
+# old GPU kernels still compile; the product path is `_noise_EdE_QRT_product`
+# (same-bin 2nd-order + cavity-mediated, O(M)). See `src/qrt_jacobian.jl`.
+function _noise_qrt_rhs_factorized_1st_gpu!(
     da,
     dadag,
     dSp,
@@ -452,7 +462,7 @@ function _noise_rk4_step_gpu!(
 
 
 
-    _noise_qrt_rhs_gpu!(
+    _noise_qrt_rhs_factorized_1st_gpu!(
         k1a,
         k1ad,
         k1Sp,
@@ -484,7 +494,7 @@ function _noise_rk4_step_gpu!(
 
 
 
-    _noise_qrt_rhs_gpu!(
+    _noise_qrt_rhs_factorized_1st_gpu!(
         k2a,
         k2ad,
         k2Sp,
@@ -516,7 +526,7 @@ function _noise_rk4_step_gpu!(
 
 
 
-    _noise_qrt_rhs_gpu!(
+    _noise_qrt_rhs_factorized_1st_gpu!(
         k3a,
         k3ad,
         k3Sp,
@@ -548,7 +558,7 @@ function _noise_rk4_step_gpu!(
 
 
 
-    _noise_qrt_rhs_gpu!(
+    _noise_qrt_rhs_factorized_1st_gpu!(
         k4a,
         k4ad,
         k4Sp,
@@ -610,6 +620,87 @@ function _noise_rk4_step_gpu!(
     )
 
     return nothing
+end
+
+
+# Product QRT: ġ = J_star(ū(t)) g on the 3+9M block. Same-bin + cavity
+# only (O(M) apply). Full dense J is the small-M oracle in qrt_jacobian.jl.
+function _noise_EdE_QRT_product(
+    tgrid_us::Vector{Float64},
+    v::Vector{Float64},
+    M::Int,
+    delta0_us::Float64,
+    delta_b_us::Vector{Float64},
+    g_b_us::Vector{Float64},
+    kappa_e_us::Float64,
+    kappa_i_us::Float64,
+    a_grid::Vector{ComplexF64},
+    n_grid::Vector{Float64},
+    adad_grid::Vector{ComplexF64},
+    Sp_grid::Matrix{ComplexF64},
+    Sz_grid::Matrix{Float64},
+    adSp_grid::Matrix{ComplexF64},
+    adSm_grid::Matrix{ComplexF64},
+    adSz_grid::Matrix{ComplexF64},
+    Nj::Vector{Float64},
+)
+    Ng = length(tgrid_us)
+    @assert length(delta_b_us) == M
+    @assert length(g_b_us) == M
+    @assert length(Nj) == M
+    @assert size(Sp_grid, 1) == M
+
+    scratch = QRTProductScratch(Float64, M)
+    g = zeros(ComplexF64, small_length(M))
+    u1 = scratch.u1
+    u2 = scratch.u2
+    umid = scratch.umid
+
+    total = sum((v .* v) .* n_grid)
+    println("Initial diagonal EdE contribution = ", total)
+    println("Product QRT path: ", QRT_PRODUCT, " (O(M) star, M = ", M, ")")
+
+    Et = 0.0im
+    @inbounds for j in 1:Ng
+        qrt_pack_product_state!(
+            u1,
+            a_grid[j], adad_grid[j], n_grid[j],
+            view(Sp_grid, :, j), view(Sz_grid, :, j),
+            view(adSp_grid, :, j), view(adSm_grid, :, j), view(adSz_grid, :, j),
+            Nj,
+        )
+        qrt_seed_adag_column!(g, u1, M)
+        adag_start = conj(a_grid[j])
+
+        for i in j:(Ng - 1)
+            h = tgrid_us[i + 1] - tgrid_us[i]
+            qrt_pack_product_state!(
+                u1,
+                a_grid[i], adad_grid[i], n_grid[i],
+                view(Sp_grid, :, i), view(Sz_grid, :, i),
+                view(adSp_grid, :, i), view(adSm_grid, :, i), view(adSz_grid, :, i),
+                Nj,
+            )
+            qrt_pack_product_state!(
+                u2,
+                a_grid[i + 1], adad_grid[i + 1], n_grid[i + 1],
+                view(Sp_grid, :, i + 1), view(Sz_grid, :, i + 1),
+                view(adSp_grid, :, i + 1), view(adSm_grid, :, i + 1),
+                view(adSz_grid, :, i + 1),
+                Nj,
+            )
+            @. umid = 0.5 * (u1 + u2)
+            qrt_rk4_product_step!(
+                g, u1, umid, u2, h,
+                delta0_us, kappa_e_us, kappa_i_us, delta_b_us, g_b_us, Et,
+                scratch,
+            )
+            corr = g[IDX_a] + adag_start * a_grid[i + 1]
+            total += 2 * v[i + 1] * v[j] * real(corr)
+        end
+    end
+
+    return total
 end
 
 
@@ -964,6 +1055,7 @@ function _noise_mode_QRT_gpu_complex(
     adSp_sol::AbstractMatrix{ComplexF64},
     adSm_sol::AbstractMatrix{ComplexF64},
     adSz_sol::AbstractMatrix{ComplexF64},
+    Nj::Vector{Float64},
     batch_size::Int = 64,
 )
     times_us = collect(
@@ -1054,14 +1146,15 @@ function _noise_mode_QRT_gpu_complex(
 
 
 
-    EdE = _noise_EdE_QRT_streaming_gpu(
+    EdE = _noise_EdE_QRT_product(
         tgrid,
         v,
         M,
         delta0_us,
         delta_b_us,
         g_b_us,
-        kappa_t_us,
+        kappa_e_us,
+        kappa_i_us,
         a_grid,
         n_grid,
         adad_grid,
@@ -1069,8 +1162,8 @@ function _noise_mode_QRT_gpu_complex(
         Sz_grid_cpu,
         adSp_grid_cpu,
         adSm_grid_cpu,
-        adSz_grid_cpu;
-        batch_size = batch_size,
+        adSz_grid_cpu,
+        Nj,
     )
 
 
@@ -1119,6 +1212,7 @@ function _noise_mode_QRT_gpu_complex(
         kappa_e_eff  = kappa_e_eff,
         kappa_e_us   = kappa_e_us,
         kappa_i_us   = kappa_i_us,
+        jacobian     = QRT_PRODUCT,
         kappa_t_us   = kappa_t_us,
         Ng           = length(tgrid),
         tgrid_us     = tgrid,
@@ -1129,6 +1223,8 @@ end
 
 
 
+# Product path: same-bin 2nd-order + cavity-mediated QRT (O(M) star).
+# Full dense J is the small-M oracle in qrt_jacobian.jl, not used here.
 function compute_output_mode_noise(
     d::NoiseSimulationData,
     center_us::Real,
@@ -1159,6 +1255,7 @@ function compute_output_mode_noise(
         adSp_sol = d.adSp_sol,
         adSm_sol = d.adSm_sol,
         adSz_sol = d.adSz_sol,
+        Nj = d.Nj,
         batch_size = batch_size,
     )
 
@@ -1229,6 +1326,7 @@ function print_noise_result(
     println("  |Emean|²              = ", result.mean_term)
     println("  norm_f                = ", result.norm_f)
     println("  Ng                    = ", result.Ng)
+    hasproperty(result, :jacobian) && println("  jacobian              = ", result.jacobian)
 
     return nothing
 end
