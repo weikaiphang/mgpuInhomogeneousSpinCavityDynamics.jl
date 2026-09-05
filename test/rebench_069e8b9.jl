@@ -116,7 +116,8 @@ end
         println("[rebench] B2 product `_rk6_order2!` CK45  bytes/step = ", a2c)
         @test a2 == 0
         @test a2c == 0
-        @test !occursin("kS[1:n]", src)
+        # Product killed the leftover; the phrase remains only in the comment.
+        @test occursin("no kS[1:n] slices", src)
         @test occursin("_lincomb_n!", src)
         @test !occursin("_lincomb_shards!", src)
 
