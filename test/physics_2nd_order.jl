@@ -48,6 +48,54 @@ function _check_same_bin_algebra(st, Nj)
     end
 end
 
+function _dirty_random_u(M; seed=2, dirty_diag=true)
+    Random.seed!(seed)
+    u = randn(ComplexF64, state_length_2nd_order(M))
+    st = unpack_state_2nd_order_u(u, M)
+    if dirty_diag
+        for j in 1:M
+            st.SpSp_cross[j, j] = 0.41 + 0.13im
+            st.SmSp_cross[j, j] = 0.29 - 0.21im
+            st.SzSp_cross[j, j] = -0.33 + 0.07im
+            st.SzSz_cross[j, j] = 0.17
+        end
+    else
+        for j in 1:M
+            st.SpSp_cross[j, j] = 0
+            st.SmSp_cross[j, j] = 0
+            st.SzSp_cross[j, j] = 0
+            st.SzSz_cross[j, j] = 0
+        end
+    end
+    return u
+end
+
+function _eval_three_rhs(u, delta_b, g_b, Et)
+    M = length(delta_b)
+    mask = make_diag_mask_cpu(M)
+    du_cpu = zero(u)
+    du_mul = zero(u)
+    du_ker = zero(u)
+    rhs_cpu!(du_cpu, u, 0.1, 1.5, 0.25, delta_b, g_b, Et)
+    ws = _rhs2_workspace(u, M)
+    p = (0.1, 1.5, 0.25, delta_b, g_b, M, mask, _ -> Et, ws)
+    _rhs_2nd_order_mulpath!(du_mul, u, p, 0.0)
+    rhs_kernel_replica!(du_ker, u, 0.1, 1.5, 0.25, delta_b, g_b, Et)
+    return du_cpu, du_mul, du_ker
+end
+
+function _assert_full_du_parity(du_a, du_b, M; atol=1e-12, label="")
+    @test du_a ≈ du_b atol = atol
+    sa = unpack_state_2nd_order_u(du_a, M)
+    sb = unpack_state_2nd_order_u(du_b, M)
+    for n in propertynames(sa)
+        da = getfield(sa, n)
+        db = getfield(sb, n)
+        @test da ≈ db atol = atol
+    end
+    return nothing
+end
+
 function _check_cross_mean_products(st, Nj)
     M = length(Nj)
     for k in 1:M, j in 1:M
@@ -197,29 +245,10 @@ end
     _rowsum_same_plus_cross!(ws_sum, st.SpSp_same, st.SpSp_cross, g_b, mask)
     @test ws_sum ≈ cpu_sum
 
-    du_cpu = zero(u)
-    du_mul = zero(u)
-    rhs_cpu!(du_cpu, u, 0.1, 1.5, 0.25, delta_b, g_b, Et)
-    ws = _rhs2_workspace(u, M)
-    p = (0.1, 1.5, 0.25, delta_b, g_b, M, mask, _ -> Et, ws)
-    _rhs_2nd_order_mulpath!(du_mul, u, p, 0.0)
+    du_cpu, du_mul, du_ker = _eval_three_rhs(u, delta_b, g_b, Et)
     sc = unpack_state_2nd_order_u(du_cpu, M)
-    sm = unpack_state_2nd_order_u(du_mul, M)
-    # Rowsums feed dadSp / dadSm / dadSz (and only those small fields).
-    # Some cross-block EOM terms already differ between mulpath and rhs_cpu!
-    # even with a clean unused diagonal; that is not this tip.
-    @test sc.a ≈ sm.a atol = 1e-12
-    @test sc.ad_ad ≈ sm.ad_ad atol = 1e-12
-    @test sc.ad_a ≈ sm.ad_a atol = 1e-12
-    @test sc.Sp ≈ sm.Sp atol = 1e-12
-    @test sc.Sz ≈ sm.Sz atol = 1e-12
-    @test sc.adSp ≈ sm.adSp atol = 1e-12
-    @test sc.adSm ≈ sm.adSm atol = 1e-12
-    @test sc.adSz ≈ sm.adSz atol = 1e-12
-    @test sc.SpSp_same ≈ sm.SpSp_same atol = 1e-12
-    @test sc.SzSp_same ≈ sm.SzSp_same atol = 1e-12
-    @test sc.SmSp_same ≈ sm.SmSp_same atol = 1e-12
-    @test sc.SzSz_same ≈ sm.SzSz_same atol = 1e-12
+    _assert_full_du_parity(du_cpu, du_mul, M)
+    _assert_full_du_parity(du_cpu, du_ker, M)
 
     # Unmasked mul! (the pre-fix formula) must disagree on dad* — this is
     # the test that 240/240 product-IC parity could not catch.
@@ -246,12 +275,35 @@ end
         ws_gpu = _rhs2_workspace(u_gpu, M)
         p_gpu = (0.1, 1.5, 0.25, δ_gpu, g_gpu, M, mask_gpu, _ -> Et, ws_gpu)
         rhs_2nd_order!(du_gpu, u_gpu, p_gpu, 0.0)
-        sg = unpack_state_2nd_order_u(Array(du_gpu), M)
-        @test sg.adSp ≈ sc.adSp atol = 1e-12
-        @test sg.adSm ≈ sc.adSm atol = 1e-12
-        @test sg.adSz ≈ sc.adSz atol = 1e-12
+        _assert_full_du_parity(du_cpu, Array(du_gpu), M)
     else
         @info "dirty-diag CuArray / multi-GPU integrate skipped: no NVIDIA GPU on this host"
+    end
+end
+
+@testset "full-du parity: mulpath ↔ rhs_cpu! ↔ kernel replica" begin
+    # Hard-fail: every named field, not only dad* / small block.
+    delta_b = Float64[0.4, -0.2, 0.1]
+    g_b = Float64[1.1, 0.9, 1.0]
+    Et = 0.3 + 0.2im
+    M = 3
+    Nj = [2.0, 3.0, 5.0]
+
+    u_dirty = _dirty_random_u(M; seed=2, dirty_diag=true)
+    du_cpu, du_mul, du_ker = _eval_three_rhs(u_dirty, delta_b, g_b, Et)
+    _assert_full_du_parity(du_cpu, du_mul, M)
+    _assert_full_du_parity(du_cpu, du_ker, M)
+
+    u_clean = _dirty_random_u(M; seed=3, dirty_diag=false)
+    du_cpu, du_mul, du_ker = _eval_three_rhs(u_clean, delta_b, g_b, Et)
+    _assert_full_du_parity(du_cpu, du_mul, M)
+    _assert_full_du_parity(du_cpu, du_ker, M)
+
+    for ic in (:ground, :inverted, :equator, :weak, :weak_inverted)
+        u = build_u0_cpu_2nd_order(M, Nj, ic)
+        du_cpu, du_mul, du_ker = _eval_three_rhs(u, delta_b, g_b, Et)
+        _assert_full_du_parity(du_cpu, du_mul, M)
+        _assert_full_du_parity(du_cpu, du_ker, M)
     end
 end
 

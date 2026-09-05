@@ -15,6 +15,8 @@ const F_SmSp_s = 8
 const F_SzSz_s = 9
 const NSMALLFIELD = 9
 
+# Cross blocks. B_SzSpT is a stored transpose of B_SzSp (SzSp[k,j]), not an
+# independent moment. Physics truth is the 4-matrix layout + SzSp[k,j].
 const B_SpSp  = 1
 const B_SzSp  = 2
 const B_SzSpT = 3

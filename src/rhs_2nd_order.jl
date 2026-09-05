@@ -144,11 +144,14 @@ function _rhs_2nd_order_mulpath!(du, u, p, t)
     adSm_row = reshape(adSm, 1, M)
     adSz_col = reshape(adSz, M, 1)
     adSz_row = reshape(adSz, 1, M)
+    # Hoist the matrix transpose. `@. transpose(SzSp)` becomes transpose.(scalars)
+    # (a no-op) and was the full-du leak vs rhs_cpu! / kernels (ZT = SzSp[k,j]).
+    SzSp_T = transpose(SzSp_cross)
 
     @. dSpSp_cross = diag_mask * (
         1im * (Δ_col + Δ_row) * SpSp_cross
         - 2im * G_col * (Sp_row * adSz_col + conj(a) * SzSp_cross + adSp_row * Sz_col - 2 * Sp_row * conj(a) * Sz_col)
-        - 2im * G_row * (Sp_col * adSz_row + conj(a) * transpose(SzSp_cross) + Sz_row * adSp_col - 2 * Sp_col * conj(a) * Sz_row)
+        - 2im * G_row * (Sp_col * adSz_row + conj(a) * SzSp_T + Sz_row * adSp_col - 2 * Sp_col * conj(a) * Sz_row)
     )
 
     @. dSzSp_cross = diag_mask * (
@@ -161,12 +164,12 @@ function _rhs_2nd_order_mulpath!(du, u, p, t)
     @. dSmSp_cross = diag_mask * (
         -1im * Δ_col * SmSp_cross + 1im * Δ_row * SmSp_cross
         + 2im * G_col * (conj(adSz_col) * Sp_row + conj(adSm_row) * Sz_col + a * SzSp_cross - 2 * Sp_row * a * Sz_col)
-        - 2im * G_row * (conj(a) * conj(transpose(SzSp_cross)) + Sz_row * adSm_col + conj(Sp_col) * adSz_row - 2 * conj(a) * Sz_row * conj(Sp_col))
+        - 2im * G_row * (conj(a) * conj(SzSp_T) + Sz_row * adSm_col + conj(Sp_col) * adSz_row - 2 * conj(a) * Sz_row * conj(Sp_col))
     )
 
     @. dSzSz_cross = diag_mask * (
-        -1im * G_col * (Sp_col * conj(adSz_row) + conj(adSm_col) * Sz_row + a * transpose(SzSp_cross) - 2 * Sp_col * Sz_row * a)
-        + 1im * G_col * (conj(a) * conj(transpose(SzSp_cross)) + Sz_row * adSm_col + conj(Sp_col) * adSz_row - 2 * conj(a) * Sz_row * conj(Sp_col))
+        -1im * G_col * (Sp_col * conj(adSz_row) + conj(adSm_col) * Sz_row + a * SzSp_T - 2 * Sp_col * Sz_row * a)
+        + 1im * G_col * (conj(a) * conj(SzSp_T) + Sz_row * adSm_col + conj(Sp_col) * adSz_row - 2 * conj(a) * Sz_row * conj(Sp_col))
         - 1im * G_row * (conj(adSz_col) * Sp_row + conj(adSm_row) * Sz_col + a * SzSp_cross - 2 * Sp_row * a * Sz_col)
         + 1im * G_row * (conj(SzSp_cross) * conj(a) + adSm_row * Sz_col + adSz_col * conj(Sp_row) - 2 * conj(a) * Sz_col * conj(Sp_row))
     )

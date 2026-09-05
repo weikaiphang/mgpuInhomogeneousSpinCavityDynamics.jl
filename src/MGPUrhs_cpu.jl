@@ -143,3 +143,120 @@ function rhs_cpu!(du::AbstractVector{Complex{T}}, u::AbstractVector{Complex{T}},
 
     return nothing
 end
+
+# CPU transcription of MGPUkernels.jl (muli(z) = i*z). SzSpT := SzSp[k,j].
+# One physics truth with rhs_cpu! / mulpath; this locks the device formulas
+# without requiring a GPU.
+@inline _muli_kernel(z) = Complex(-imag(z), real(z))
+
+function rhs_kernel_replica!(du::AbstractVector{Complex{T}}, u::AbstractVector{Complex{T}},
+                             delta0::T, kappa_e::T, kappa_i::T,
+                             delta_b::AbstractVector{T}, g_b::AbstractVector{T},
+                             Et::Complex{T}) where {T}
+    fill!(du, zero(Complex{T}))
+    M = length(delta_b)
+    kappa_t = kappa_e + kappa_i
+    sqrt_ke = sqrt(kappa_e)
+    half = T(1) / 2
+    a     = u[IDX_a]
+    ad_ad = u[IDX_ad_ad]
+    ad_a  = u[IDX_ad_a]
+    ca    = conj(a)
+    cEt   = conj(Et)
+
+    Sp   = @view u[small_range(M, F_Sp)]
+    Sz   = @view u[small_range(M, F_Sz)]
+    adSp = @view u[small_range(M, F_adSp)]
+    adSm = @view u[small_range(M, F_adSm)]
+    adSz = @view u[small_range(M, F_adSz)]
+    SpSp_s = @view u[small_range(M, F_SpSp_s)]
+    SzSp_s = @view u[small_range(M, F_SzSp_s)]
+    SmSp_s = @view u[small_range(M, F_SmSp_s)]
+    SzSz_s = @view u[small_range(M, F_SzSz_s)]
+    nsmall = small_length(M)
+    SpSp = reshape(@view(u[nsmall + 1           : nsmall + M*M]),     M, M)
+    SzSp = reshape(@view(u[nsmall + M*M + 1     : nsmall + 2M*M]),    M, M)
+    SmSp = reshape(@view(u[nsmall + 2M*M + 1    : nsmall + 3M*M]),    M, M)
+    SzSz = reshape(@view(u[nsmall + 3M*M + 1    : nsmall + 4M*M]),    M, M)
+
+    S1 = sum(g_b .* conj.(Sp))
+    S2 = sum(g_b .* adSp)
+    S3 = sum(g_b .* adSm)
+    du[IDX_a]     = sqrt_ke * Et - _muli_kernel(delta0 * a) - _muli_kernel(S1) - half * kappa_t * a
+    du[IDX_ad_ad] = 2 * _muli_kernel(delta0 * ad_ad) + 2 * _muli_kernel(S2) -
+                    kappa_t * ad_ad + 2 * sqrt_ke * ca * cEt
+    du[IDX_ad_a]  = _muli_kernel(conj(S3)) - _muli_kernel(S3) - kappa_t * ad_a +
+                    sqrt_ke * Et * ca + sqrt_ke * cEt * a
+
+    dSp   = @view du[small_range(M, F_Sp)]
+    dSz   = @view du[small_range(M, F_Sz)]
+    dadSp = @view du[small_range(M, F_adSp)]
+    dadSm = @view du[small_range(M, F_adSm)]
+    dadSz = @view du[small_range(M, F_adSz)]
+    dSpSp_s = @view du[small_range(M, F_SpSp_s)]
+    dSzSp_s = @view du[small_range(M, F_SzSp_s)]
+    dSmSp_s = @view du[small_range(M, F_SmSp_s)]
+    dSzSz_s = @view du[small_range(M, F_SzSz_s)]
+    dSpSp = reshape(@view(du[nsmall + 1          : nsmall + M*M]),    M, M)
+    dSzSp = reshape(@view(du[nsmall + M*M + 1    : nsmall + 2M*M]),   M, M)
+    dSmSp = reshape(@view(du[nsmall + 2M*M + 1   : nsmall + 3M*M]),   M, M)
+    dSzSz = reshape(@view(du[nsmall + 3M*M + 1   : nsmall + 4M*M]),   M, M)
+
+    @inbounds for j in 1:M
+        gj = g_b[j]; dj = delta_b[j]
+        Spj = Sp[j]; Szj = Sz[j]
+        adSpj = adSp[j]; adSmj = adSm[j]; adSzj = adSz[j]
+        cSpj = conj(Spj); cadSmj = conj(adSmj); cadSzj = conj(adSzj)
+        sumP = gj * SpSp_s[j]; sumM = gj * SmSp_s[j]; sumZ = gj * SzSp_s[j]
+        for k in 1:M
+            k == j && continue
+            gk = g_b[k]; dk = delta_b[k]
+            P = SpSp[j, k]; Z = SzSp[j, k]; ZT = SzSp[k, j]; Mm = SmSp[j, k]; ZZ = SzSz[j, k]
+            sumP += gk * P; sumM += gk * Mm; sumZ += gk * Z
+            Spk = Sp[k]; Szk = Sz[k]
+            adSpk = adSp[k]; adSmk = adSm[k]; adSzk = adSz[k]
+            cSpk = conj(Spk); cadSmk = conj(adSmk); cadSzk = conj(adSzk)
+
+            W  = Spk * adSzj + ca * Z  + adSpk * Szj - 2 * Spk * ca * Szj
+            Ws = Spj * adSzk + ca * ZT + adSpj * Szk - 2 * Spj * ca * Szk
+            dSpSp[j, k] = _muli_kernel((dj + dk) * P - 2 * gj * W - 2 * gk * Ws)
+
+            U1  = Spk * cadSmj + Spj * cadSmk + a * P - 2 * Spk * Spj * a
+            U2  = Spk * adSmj + ca * Mm + adSpk * cSpj - 2 * Spk * ca * cSpj
+            U3  = ZZ * ca + Szk * adSzj + Szj * adSzk - 2 * ca * Szk * Szj
+            dSzSp[j, k] = _muli_kernel(dk * Z - gj * U1 + gj * U2 - 2 * gk * U3)
+
+            Y1  = cadSzj * Spk + cadSmk * Szj + a * Z  - 2 * Spk * a * Szj
+            Y1s = cadSzk * Spj + cadSmj * Szk + a * ZT - 2 * Spj * a * Szk
+            Y2  = ca * conj(ZT) + Szk * adSmj + cSpj * adSzk - 2 * ca * Szk * cSpj
+            Y2s = ca * conj(Z)  + Szj * adSmk + cSpk * adSzj - 2 * ca * Szj * cSpk
+            dSmSp[j, k] = _muli_kernel((dk - dj) * Mm + 2 * gj * Y1 - 2 * gk * Y2)
+            dSzSz[j, k] = _muli_kernel(gj * (Y2 - Y1s) + gk * (Y2s - Y1))
+        end
+        dSpSp[j, j] = 0; dSzSp[j, j] = 0; dSmSp[j, j] = 0; dSzSz[j, j] = 0
+
+        dSp[j] = _muli_kernel(dj * Spj - 2 * gj * adSzj)
+        dSz[j] = _muli_kernel(gj * adSmj - gj * cadSmj)
+        dadSp[j] = _muli_kernel(delta0 * adSpj + dj * adSpj + sumP -
+                                2 * gj * (2 * ca * adSzj + ad_ad * Szj - 2 * ca * ca * Szj)) -
+                   half * kappa_t * adSpj + sqrt_ke * cEt * Spj
+        dadSm[j] = _muli_kernel(delta0 * adSmj - dj * adSmj + 2 * gj * Szj + sumM +
+                                2 * gj * (cadSzj * ca + a * adSzj + Szj * ad_a - 2 * ca * a * Szj)) -
+                   half * kappa_t * adSmj + sqrt_ke * cEt * cSpj
+        dadSz[j] = _muli_kernel(delta0 * adSzj + sumZ -
+                                gj * (Spj + Spj * ad_a + ca * cadSmj + a * adSpj - 2 * Spj * ca * a) +
+                                gj * (2 * ca * adSmj + ad_ad * cSpj - 2 * ca * ca * cSpj)) -
+                   half * kappa_t * adSzj + sqrt_ke * cEt * Szj
+        dSpSp_s[j] = _muli_kernel(2 * dj * SpSp_s[j] + 2 * gj * adSpj -
+                                  4 * gj * (Spj * adSzj + SzSp_s[j] * ca + adSpj * Szj - 2 * Spj * ca * Szj))
+        dSzSp_s[j] = _muli_kernel(dj * SzSp_s[j] -
+                                  gj * (2 * Spj * cadSmj + a * SpSp_s[j] - 2 * Spj * Spj * a) +
+                                  gj * (Spj * adSmj + ca * SmSp_s[j] + adSpj * cSpj - 2 * Spj * ca * cSpj) -
+                                  2 * gj * (SzSz_s[j] * ca + 2 * adSzj * Szj - 2 * ca * Szj * Szj))
+        Q1 = cadSzj * Spj + SzSp_s[j] * a + cadSmj * Szj - 2 * Spj * a * Szj
+        Q2 = ca * conj(SzSp_s[j]) + cSpj * adSzj + adSmj * Szj - 2 * ca * cSpj * Szj
+        dSmSp_s[j] = _muli_kernel(2 * gj * Q1 - 2 * gj * Q2)
+        dSzSz_s[j] = _muli_kernel(gj * cadSmj - gj * adSmj - 2 * gj * Q1 + 2 * gj * Q2)
+    end
+    return nothing
+end
