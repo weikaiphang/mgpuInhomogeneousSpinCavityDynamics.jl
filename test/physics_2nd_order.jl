@@ -787,12 +787,13 @@ end
     amp_c = arp_drive_amplitude(ke, kt, g2c, Ω)
     @test amp_c ≈ arp_amp_scale(ke, kt, coupling_rms(g2c)) * Ω
 
-    g_gauss = (
+    g_bins = [80.0, 120.0]
+    p_bins = [0.5, 0.5]
+    gm, _, g2g = weighted_g_stats_from_bins(g_bins, p_bins)
+    @test coupling_renormalize_enabled((
         kind = :gaussian, mean = 2π * 100, std = 2π * 20,
         span_sigma = 3.0, renormalize = PAPER_G_RENORMALIZE,
-    )
-    _, _, _, gm, _, g2g, info = build_gaussian_coupling_bins(g_gauss, 21)
-    @test info.renormalize === PAPER_G_RENORMALIZE
+    )) === PAPER_G_RENORMALIZE
     @test coupling_rms(g2g) > gm
     @test coupling_rms(g2g) ≈ sqrt(g2g)
     amp_rms = arp_drive_amplitude(ke, kt, g2g, Ω)
