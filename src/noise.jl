@@ -300,6 +300,13 @@ function _noise_make_mode_window(
 end
 
 
+# Quantum regression for output-mode noise uses the *factorized 1st-order*
+# Jacobian about the saved mean-field / 2nd-order-mean trajectory:
+#   δṠ⁺ = iΔ δS⁺ − 2ig (⟨a†⟩ δSᶻ + ⟨Sᶻ⟩ δa†)
+# and likewise for δa, δS⁻, δSᶻ. This is not the linearization of the
+# 2nd-order cumulant RHS (which would couple same-bin and cross moments).
+# A full 2nd-order Jacobian is O(M²) and is not used here.
+# Initial ⟨aa†⟩_c includes the bosonic +1; see _noise_mode_QRT_gpu_complex.
 function _noise_qrt_rhs_gpu!(
     da,
     dadag,
@@ -714,9 +721,10 @@ function _noise_EdE_QRT_streaming_gpu(
             a_mean    = a_grid[j]
             adag_mean = conj(a_mean)
 
+            # ⟨aa†⟩_c = ⟨a†a⟩ − |⟨a⟩|² + 1  (bosonic commutator; see QRT note)
             a0_cpu[c] =
                 n_grid[j] -
-                abs2(a_mean)
+                abs2(a_mean) + 1
 
             adag0_cpu[c] =
                 adad_grid[j] -

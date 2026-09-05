@@ -1,4 +1,9 @@
 
+# Standalone multi-GPU driver (not part of the package module).
+# The supported public 2nd-order multi-GPU API is
+# `mgpu_run_simulation` / `mgpu_run_sim_2nd_order` in MGPUsolver.jl.
+# This file must stay in lockstep with rhs_2nd_order! / rhs_cpu! / kernels
+# (κt = κe + κi; same 2nd-order moments).
 using CUDA
 CUDA.set_runtime_version!(v"12.4")
 
@@ -45,6 +50,7 @@ const USER = (
 
 
     ke0 = 2*pi*1e6,
+    ki0 = 0.0,
 
 
     alpha0    = 2.0e4,
@@ -94,7 +100,8 @@ Tpi    = USER.Tpi
 Tw     = USER.Tw
 
 ke0     = USER.ke0
-kappa_t = ke0
+ki0     = USER.ki0
+kappa_t = ke0 + ki0
 
 g2_avg = g_mean^2 + g_std^2
 N_spin = (C_ens) * (kappa_t * FWHM) / (4 * g2_avg)
@@ -223,6 +230,7 @@ const L_SzSz_x = L_SmSp_x[end]+1 : L_SmSp_x[end] + M_LOCAL*M
 
 
 kappa_e_of_t(t) = ke0
+kappa_i_of_t(t) = ki0
 g_gate_of_t(t)  = 1.0
 
 function E_of_t_num(t)
@@ -478,7 +486,7 @@ function local_rhs!(du_dst::CuVector{ComplexF64},
 
 
     κe_t = kappa_e_of_t(t)
-    κt_t = κe_t
+    κt_t = κe_t + kappa_i_of_t(t)
     g_t_loc  = gd.g_b_local .* g_gate_of_t(t)
     g_t_full = gd.g_b_full  .* g_gate_of_t(t)
     E_t  = E_of_t_num(t)

@@ -99,6 +99,19 @@ function resolve_ensemble_method(CONFIG, want::Symbol = :config)
     return plan
 end
 
+function _log_ensemble_truncation(p_delta, p_g, freq_cfg, g_cfg, C_ens)
+    pδ = sum(p_delta)
+    pg = sum(p_g)
+    freq_renorm = renormalize_frequency_probs_enabled(freq_cfg)
+    g_renorm = coupling_renormalize_enabled(g_cfg)
+    if !freq_renorm || !g_renorm
+        C_eff = C_ens * pδ * pg
+        println("[ensemble] ∑p_δ = $pδ, ∑p_g = $pg  (renormalize freq=$(freq_renorm), g=$(g_renorm))")
+        println("[ensemble] effective cooperativity C_eff = C_ens × ∑p_δ × ∑p_g = $C_eff")
+    end
+    return nothing
+end
+
 function _log_ensemble_choice(plan, M_delta_req, M_g_req, M_delta, M_g, M)
     if plan.method === :quadrature
         println("[ensemble] method = QUADRATURE  " *
@@ -126,7 +139,6 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
     C_ens   = CONFIG.C_ens
     M_delta = CONFIG.M_delta
     M_g     = CONFIG.M_g
-    M       = M_delta * M_g
 
     kappa_e = CONFIG.kappa_e
     kappa_i = CONFIG.kappa_i
@@ -176,6 +188,9 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
             M_g,
         )
 
+    M_g = length(g_b_1d)
+    M   = M_delta * M_g
+
 
 
 
@@ -217,7 +232,8 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
 
     Nt = length(t_save)
 
-    _log_ensemble_choice(_ens_plan, M_delta, M_g, M_delta, M_g, M)
+    _log_ensemble_choice(_ens_plan, CONFIG.M_delta, CONFIG.M_g, M_delta, M_g, M)
+    _log_ensemble_truncation(p_delta, p_g, freq_cfg, g_inhomogeneity, C_ens)
 
     return (
         C_ens = C_ens,

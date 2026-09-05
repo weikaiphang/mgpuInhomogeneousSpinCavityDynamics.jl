@@ -30,6 +30,9 @@ mutable struct Shard{T}
     nblocks_small::Int
     nblocks_vec::Int
     nblocks_norm::Int
+
+    nccl_send::Union{Nothing,CuVector{Complex{T}}}
+    nccl_recv::Union{Nothing,CuVector{Complex{T}}}
 end
 
 
@@ -60,6 +63,8 @@ struct MGPUProblem{T,F}
 
 
     hostbuf::Vector{Complex{T}}
+    comms::Any
+    peer_ok::Bool
 end
 
 nshards(prob::MGPUProblem) = length(prob.shards)
@@ -94,6 +99,9 @@ end
 function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T}
     ns = length(devs)
     shards = Vector{Shard{T}}(undef, ns)
+    maxmloc = maximum(part.counts)
+    equal = all(==(part.counts[1]), part.counts)
+    need_pad = ns > 1 && !equal
 
     for p in 1:ns
         dev = devs[p]
@@ -107,6 +115,8 @@ function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T
         nthreads, nchunk, chunk_len, nbs, nbv, nbn = launch_config(dev, M, mloc, n)
 
         regs = [CUDA.zeros(Complex{T}, n) for _ in 1:nreg]
+        nccl_send = need_pad ? CUDA.zeros(Complex{T}, 3 * maxmloc) : nothing
+        nccl_recv = need_pad ? CUDA.zeros(Complex{T}, 3 * maxmloc * ns) : nothing
 
         shards[p] = Shard{T}(
             p, dev, CuStream(),
@@ -120,6 +130,7 @@ function build_shards(::Type{T}, M, part, devs, delta_b, g_b, Nj, nreg) where {T
             CUDA.zeros(T, 1),
             CuEvent(CUDA.EVENT_DISABLE_TIMING),
             nthreads, nchunk, chunk_len, nbs, nbv, nbn,
+            nccl_send, nccl_recv,
         )
     end
 
@@ -155,6 +166,11 @@ function rhs!(prob::MGPUProblem{T}, iu::Int, idu::Int, t::Real) where {T}
 
     prob.nrhs[] += 1
 
+    # Small-state RHS and the three global cavity sums are O(M) and run on
+    # every shard. The small block is replicated in each shard register so
+    # the next RK stage can read it without an O(M) broadcast of 3+9M
+    # complexes, which is more expensive than the local kernels. Cross
+    # terms remain sharded; only the O(M) row-sum vector is exchanged.
     each_shard(shards, prob.exec) do s
         u  = s.regs[iu]
         du = s.regs[idu]
@@ -169,6 +185,7 @@ function rhs!(prob::MGPUProblem{T}, iu::Int, idu::Int, t::Real) where {T}
 
         @cuda threads=256 blocks=cld(s.mloc, 256) stream=st rowsum_finalize_kernel!(
             rb(s), s.part, s.mloc, s.nchunk, s.joff)
+        CUDA.record(s.ev, st)
     end
 
     ns > 1 && exchange_rowsums!(prob, rb)
@@ -185,14 +202,21 @@ end
 
 function exchange_rowsums!(prob::MGPUProblem{T}, rb) where {T}
     shards = prob.shards
+    length(shards) <= 1 && return nothing
+
+    if _nccl_allgather_rowsums!(prob, rb)
+        return nothing
+    elseif prob.peer_ok
+        _p2p_allgather_rowsums!(prob, rb)
+        return nothing
+    end
+
     M = prob.M
     host = prob.hostbuf
-
     for s in shards
         CUDA.device!(s.dev)
         CUDA.synchronize(s.stream)
     end
-
     for s in shards
         CUDA.device!(s.dev)
         off = 3 * s.joff
@@ -203,6 +227,73 @@ function exchange_rowsums!(prob::MGPUProblem{T}, rb) where {T}
         dst = rb(s)
         unsafe_copyto!(pointer(dst), pointer(host), 3M;
                        stream = s.stream, async = true)
+    end
+    return nothing
+end
+
+function _nccl_allgather_rowsums!(prob::MGPUProblem{T}, rb) where {T}
+    comms = prob.comms
+    comms === nothing && return false
+    shards = prob.shards
+    try
+        for s in shards
+            CUDA.device!(s.dev)
+            CUDA.synchronize(s.stream)
+        end
+        equal = all(s -> s.mloc == shards[1].mloc, shards)
+        NCCL.group() do
+            for (s, comm) in zip(shards, comms)
+                CUDA.device!(s.dev)
+                buf = rb(s)
+                if equal
+                    nloc = 3 * s.mloc
+                    send = view(buf, 3 * s.joff + 1 : 3 * s.joff + nloc)
+                    NCCL.Allgather!(send, buf, comm)
+                else
+                    s.nccl_send === nothing && error("padded NCCL buffers missing")
+                    nloc = 3 * s.mloc
+                    copyto!(s.nccl_send, 1, buf, 3 * s.joff + 1, nloc)
+                    NCCL.Allgather!(s.nccl_send, s.nccl_recv, comm)
+                end
+            end
+        end
+        if !equal
+            maxmloc = maximum(s -> s.mloc, shards)
+            stride = 3 * maxmloc
+            for dst in shards
+                CUDA.device!(dst.dev)
+                dbuf = rb(dst)
+                for src in shards
+                    off = 3 * src.joff
+                    nloc = 3 * src.mloc
+                    copyto!(dbuf, off + 1, dst.nccl_recv, (src.id - 1) * stride + 1, nloc)
+                end
+            end
+        end
+        return true
+    catch err
+        @debug "NCCL row-sum Allgather failed; trying P2P/host" err
+        return false
+    end
+end
+
+function _p2p_allgather_rowsums!(prob::MGPUProblem{T}, rb) where {T}
+    shards = prob.shards
+    for dst in shards
+        CUDA.device!(dst.dev)
+        dbuf = rb(dst)
+        for src in shards
+            src.id == dst.id && continue
+            CUDA.wait(dst.stream, src.ev)
+            off = 3 * src.joff
+            n = 3 * src.mloc
+            n == 0 && continue
+            sbuf = rb(src)
+            GC.@preserve dbuf sbuf begin
+                CUDA.unsafe_copyto!(pointer(dbuf, off + 1), pointer(sbuf, off + 1), n;
+                                    async = true, stream = dst.stream)
+            end
+        end
     end
     return nothing
 end

@@ -486,7 +486,12 @@ function _build_g0_adag_column_cpu(
     a0 = workspace.a_sol[j0]
     adag0 = conj(a0)
 
-    g_a = workspace.n_sol[j0] - abs2(a0)
+    # QRT column for ⟨· a†⟩. Connected bosonic seed:
+    #   ⟨aa†⟩_c = ⟨a†a⟩ − |⟨a⟩|² + 1
+    # The +1 is the [a, a†] = 1 commutator. Using ⟨a†a⟩_c alone would
+    # silently drop vacuum fluctuations in the anti-normally-ordered
+    # correlator. ⟨a†a†⟩_c has no extra +1 ([a†, a†] = 0).
+    g_a = workspace.n_sol[j0] - abs2(a0) + 1
     g_adag = workspace.adad_sol[j0] - adag0^2
 
     gSp = Vector{ComplexF64}(undef, M)
@@ -507,6 +512,8 @@ function _build_g0_adag_column_cpu(
 end
 
 
+# Factorized 1st-order QRT Jacobian about the stored means (not the
+# 2nd-order cumulant Jacobian). See also `_build_g0_adag_column_cpu`.
 function _qrt_rhs_one_gpu!(
     dSp,
     dSm,

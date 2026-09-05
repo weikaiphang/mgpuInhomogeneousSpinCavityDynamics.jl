@@ -407,10 +407,10 @@ function build_constant_coupling_bins(g_inhomogeneity, M_g)
 
 
     if M_g != 1
-        @warn """
-        kind = :constant uses one effective g bin.
-        Requested M_g = $M_g will be replaced by M_g = 1.
-        """
+        error("g_inhomogeneity.kind = :constant requires CONFIG.M_g = 1; " *
+              "got M_g = $M_g. A constant coupling has a single g node. " *
+              "Set M_g = 1 (prepare_derived also sets M_g = length(g_b_1d) " *
+              "after bin construction).")
     end
 
 

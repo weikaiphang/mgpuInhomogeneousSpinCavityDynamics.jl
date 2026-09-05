@@ -45,7 +45,7 @@ function unpack_state_2nd_order_u(u, M)
     SmSp_cross = reshape(@view(u[idx:idx+M*M-1]), M, M); idx += M*M
     SzSz_cross = reshape(@view(u[idx:idx+M*M-1]), M, M); idx += M*M
 
-    return (
+    return (;
         a, ad_ad, ad_a,
         Sp, Sz,
         adSp, adSm, adSz,
@@ -80,7 +80,7 @@ function unpack_state_2nd_order_du(du, M)
     dSmSp_cross = reshape(@view(du[idx:idx+M*M-1]), M, M); idx += M*M
     dSzSz_cross = reshape(@view(du[idx:idx+M*M-1]), M, M); idx += M*M
 
-    return (
+    return (;
         dSp, dSz,
         dadSp, dadSm, dadSz,
         dSpSp_same, dSzSp_same, dSmSp_same, dSzSz_same,

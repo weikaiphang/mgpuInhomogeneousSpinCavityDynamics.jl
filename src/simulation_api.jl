@@ -1,8 +1,13 @@
 function _with_default_ensemble_method(SIM_SETTING, order)
     hasproperty(SIM_SETTING, :ensemble_method) && return SIM_SETTING
-    order in (:first_order, :order1, :first, 1) || return SIM_SETTING
+    order in (:first_order, :order1, :first, 1,
+              :second_order, :order2, :second, 2) || return SIM_SETTING
     return merge(SIM_SETTING, (ensemble_method = :auto,))
 end
+
+# Public 2nd-order multi-GPU entry point is `mgpu_run_simulation` /
+# `mgpu_run_sim_2nd_order` (MGPU* stack). `src/sim_2nd_multi_gpu_opt.jl` is a
+# standalone driver, not part of this module.
 
 function run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=true)
     order = get_simulation_order(SIM_SETTING)

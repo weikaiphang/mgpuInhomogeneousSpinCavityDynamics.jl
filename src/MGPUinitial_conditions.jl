@@ -1,26 +1,21 @@
 
-
 function small_block_initial(M::Int, Nj::AbstractVector, kind::Symbol, ::Type{T}) where {T}
     u = zeros(Complex{T}, small_length(M))
 
-    if kind === :ground
-        Sz0 = -Nj ./ 2
-        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
-        u[small_range(M, F_SzSz_s)] .= Complex{T}.((Nj .^ 2) ./ 4)
-    elseif kind === :inverted
-        Sz0 = Nj ./ 2
-        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
-        u[small_range(M, F_SzSz_s)] .= Complex{T}.((Nj .^ 2) ./ 4)
-    elseif kind === :custom
-
-    elseif kind === :equator || kind === :weak || kind === :weak_inverted
+    if kind === :custom
+        return u
+    elseif kind === :ground || kind === :inverted ||
+           kind === :equator || kind === :weak || kind === :weak_inverted
         Sp0, Sz0 = _mgpu_spin_means(Nj, kind)
-        u[small_range(M, F_Sp)]     .= Complex{T}.(Sp0)
-        u[small_range(M, F_Sz)]     .= Complex{T}.(Sz0)
-        u[small_range(M, F_SpSp_s)] .= Complex{T}.(Sp0 .* Sp0)
-        u[small_range(M, F_SzSp_s)] .= Complex{T}.(Sz0 .* Sp0)
-        u[small_range(M, F_SmSp_s)] .= Complex{T}.(abs2.(Sp0))
-        u[small_range(M, F_SzSz_s)] .= Complex{T}.(Sz0 .* Sz0)
+        u[small_range(M, F_Sp)] .= Complex{T}.(Sp0)
+        u[small_range(M, F_Sz)] .= Complex{T}.(Sz0)
+        @inbounds for j in 1:M
+            SpSp, SzSp, SmSp, SzSz = _uncorrelated_same_moments(Sp0[j], Sz0[j], Nj[j])
+            u[small_offset(M, F_SpSp_s) + j] = Complex{T}(SpSp)
+            u[small_offset(M, F_SzSp_s) + j] = Complex{T}(SzSp)
+            u[small_offset(M, F_SmSp_s) + j] = Complex{T}(SmSp)
+            u[small_offset(M, F_SzSz_s) + j] = Complex{T}(SzSz)
+        end
     else
         _unknown_initial_condition(kind)
     end
@@ -29,10 +24,14 @@ function small_block_initial(M::Int, Nj::AbstractVector, kind::Symbol, ::Type{T}
 end
 
 function _mgpu_spin_means(Nj, kind::Symbol)
-    if kind === :equator
+    if kind === :ground
+        return zero.(Nj), .-Nj ./ 2
+    elseif kind === :inverted
+        return zero.(Nj), Nj ./ 2
+    elseif kind === :equator
         return Nj ./ 2, zero.(Nj)
     elseif kind === :weak
-        return _WEAK_SEED .* Nj ./ 2, -Nj ./ 2
+        return _WEAK_SEED .* Nj ./ 2, .-Nj ./ 2
     elseif kind === :weak_inverted
         return _WEAK_SEED .* Nj ./ 2, Nj ./ 2
     else
@@ -51,10 +50,6 @@ function set_initial_condition!(prob::MGPUProblem{T}, Nj::AbstractVector,
 
     each_shard(prob.shards, prob.exec) do s
         u = s.regs[1]
-
-
-
-
 
         CUDA.stream!(s.stream) do
             CUDA.fill!(u, zero(Complex{T}))
@@ -87,7 +82,6 @@ function set_initial_condition!(prob::MGPUProblem{T}, Nj::AbstractVector,
                     u, s.Nj, sp_scale, sz_scale, B_SzSpT, M, s.mloc, s.joff, s.lo)
             end
         end
-        CUDA.synchronize(s.stream)
     end
 
     return nothing

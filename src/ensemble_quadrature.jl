@@ -149,6 +149,7 @@ function prepare_derived_quadrature(CONFIG; plan = nothing)
 
     M = M_delta * M_g
     _log_ensemble_choice(plan, M_delta_req, M_g_req, M_delta, M_g, M)
+    _log_ensemble_truncation(p_delta, p_g, freq_cfg, g_inhomogeneity, C_ens)
 
 
     timespan = (0.0, CONFIG.Ttotal)

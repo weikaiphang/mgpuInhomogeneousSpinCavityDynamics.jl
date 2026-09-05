@@ -32,7 +32,7 @@ end
 
 
 Base.@kwdef struct SolverOptions{T}
-    integrator::Symbol = :tsit5
+    integrator::Symbol = :ck45
     save_mode::Symbol = :tstops
     reltol::T = T(1e-8)
     abstol::T = T(1e-8)

@@ -1,5 +1,6 @@
 
 function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=true)
+    SIM_SETTING = _with_default_ensemble_method(SIM_SETTING, :second_order)
     CONFIG = build_full_config(SIM_SETTING, SYSTEM_CONFIG)
 
     validate_config(CONFIG)
@@ -21,6 +22,7 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
     g_b_gpu     = CuArray(Float64.(d.g_b))
     diag_mask   = make_diag_mask(M)
 
+    rhs_ws = _rhs2_workspace(u0_gpu, M)
     p_gpu = (
         d.delta0,
         d.kappa_e,
@@ -30,6 +32,7 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
         M,
         diag_mask,
         E_of_t,
+        rhs_ws,
     )
 
     prob_gpu = ODEProblem(rhs_2nd_order!, u0_gpu, d.timespan, p_gpu)
@@ -83,23 +86,23 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu=t
 
     t0 = time_ns()
 
-    sol_gpu = CUDA.allowscalar() do
-        solve(prob_gpu, Tsit5();
-            reltol = CONFIG.reltol,
-            abstol = CONFIG.abstol,
-            callback = cb,
-            save_on = false,
-            save_everystep = false,
-            dense = false,
-        )
-    end
+    CUDA.allowscalar(false)
+    sol_gpu = solve(prob_gpu, Tsit5();
+        reltol = CONFIG.reltol,
+        abstol = CONFIG.abstol,
+        callback = cb,
+        save_on = false,
+        save_everystep = false,
+        dense = false,
+    )
+    CUDA.synchronize()
 
     elapsed_seconds = (time_ns() - t0) / 1e9
 
     println("Callback saved $(kref[]) / $Nt requested time points")
-    if kref[] != Nt
-        @warn "Callback did not save all requested time points" saved=kref[] expected=Nt
-    end
+    kref[] == Nt || error(
+        "Callback saved $(kref[]) points, but expected $Nt."
+    )
 
     println("Time taken: $elapsed_seconds seconds")
 

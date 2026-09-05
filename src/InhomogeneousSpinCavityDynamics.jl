@@ -7,6 +7,7 @@ using Distributions
 using ForwardDiff
 using JLD2
 using LinearAlgebra
+using NCCL
 using Plots
 using Printf
 using QuadGK
@@ -64,6 +65,9 @@ include("MGPUsolver.jl")
 export run_simulation
 export run_sim_1st_order
 export run_sim_2nd_order
+export build_u0_cpu_2nd_order
+export rhs_2nd_order!
+export rhs_cpu!
 
 export mgpu_run_simulation
 export mgpu_run_sim_2nd_order

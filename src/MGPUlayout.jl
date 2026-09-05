@@ -96,7 +96,7 @@ function shard_bytes(M::Integer, mloc::Integer, integrator::Symbol, ::Type{T}) w
 end
 
 
-function memory_report(M::Integer, ns::Integer; integrator::Symbol = :tsit5,
+function memory_report(M::Integer, ns::Integer; integrator::Symbol = :ck45,
                        T::Type = Float64)
     part = EnsemblePartition(M, ns)
     mloc = maximum(part.counts)
@@ -117,7 +117,7 @@ function memory_report(M::Integer, ns::Integer; integrator::Symbol = :tsit5,
 end
 
 
-function max_bins(bytes_per_gpu::Real, ns::Integer; integrator::Symbol = :tsit5,
+function max_bins(bytes_per_gpu::Real, ns::Integer; integrator::Symbol = :ck45,
                   T::Type = Float64, safety::Real = 0.85)
     budget = safety * bytes_per_gpu
     lo, hi = 1, 1
