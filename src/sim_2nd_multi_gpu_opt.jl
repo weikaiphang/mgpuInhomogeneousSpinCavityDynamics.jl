@@ -6,7 +6,8 @@
 #
 # Intentional differences vs the InhomogeneousSpinCavityDynamics MGPU*
 # path (MGPUproblem / MGPUsolver / exchange_rowsums!):
-#   - cavity damping uses κt = κe only (κᵢ is dropped)
+#   - cavity damping is κt = κe + κi. Set USER.ki0 (default 0 so old
+#     demos that used κt=κe still match). κᵢ is never silently dropped.
 #   - initial condition is hard-coded inverted (Sz = +Nj/2, vacuum cavity)
 #   - layout / sharding / pulse wiring are local to this script
 #
@@ -61,6 +62,7 @@ const USER = (
 
 
     ke0 = 2*pi*1e6,
+    ki0 = 0.0,   # explicit; κt = ke0 + ki0. Required so κᵢ is not erased.
 
 
     alpha0    = 2.0e4,
@@ -110,7 +112,12 @@ Tpi    = USER.Tpi
 Tw     = USER.Tw
 
 ke0     = USER.ke0
-kappa_t = ke0
+hasproperty(USER, :ki0) || error(
+    "USER.ki0 is required (set 0.0 to recover κt = κe). κᵢ is not silently dropped.")
+ki0     = USER.ki0
+kappa_i = ki0
+kappa_t = ke0 + kappa_i
+println("κe = $ke0  κi = $kappa_i  κt = κe+κi = $kappa_t")
 
 g2_avg = g_mean^2 + g_std^2
 N_spin = (C_ens) * (kappa_t * FWHM) / (4 * g2_avg)
@@ -494,7 +501,7 @@ function local_rhs!(du_dst::CuVector{ComplexF64},
 
 
     κe_t = kappa_e_of_t(t)
-    κt_t = κe_t
+    κt_t = κe_t + kappa_i
     g_t_loc  = gd.g_b_local .* g_gate_of_t(t)
     g_t_full = gd.g_b_full  .* g_gate_of_t(t)
     E_t  = E_of_t_num(t)

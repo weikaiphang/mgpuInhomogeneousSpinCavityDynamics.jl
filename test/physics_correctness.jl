@@ -172,6 +172,24 @@ end
     @test w_fgq ≈ w_gw rtol=1e-12 atol=1e-12
 end
 
+function _stress_paper_cfg(; ensemble_method=nothing)
+    base = (
+        C_ens = 0.6,
+        M_delta = 8,
+        M_g = 1,
+        kappa_e = 2π * 1e6,
+        kappa_i = 0.0,
+        delta0 = 0.0,
+        Ttotal = 1e-6,
+        Nt_save = 3,
+        freq_inhomogeneity = (kind=:lorentzian, FWHM=2π * 1e6, span_gamma=2.5, renormalize=false),
+        g_inhomogeneity = (kind=:constant, g_value=2π * 100.0),
+        simulation_order = :second_order,
+    )
+    ensemble_method === nothing && return base
+    return merge(base, (ensemble_method = ensemble_method,))
+end
+
 @testset "order-2 default ensemble method is :auto" begin
     setting = (simulation_order=:second_order, M_delta=4, M_g=2)
     @test !hasproperty(setting, :ensemble_method)
@@ -181,6 +199,34 @@ end
     @test merged1.ensemble_method === :auto
     forced = _with_default_ensemble_method(merge(setting, (ensemble_method=:histogram,)), :second_order)
     @test forced.ensemble_method === :histogram
+end
+
+@testset "order-2 :auto resolves to quadrature like the bible" begin
+    paper = _stress_paper_cfg()
+    @test !hasproperty(paper, :ensemble_method)
+    @test ensemble_method_for(paper.freq_inhomogeneity, paper.g_inhomogeneity).method === :quadrature
+    @test resolve_ensemble_method(paper).method === :quadrature
+    @test resolve_ensemble_method(paper, :auto).method === :quadrature
+
+    setting = (simulation_order=:second_order, M_delta=8, M_g=1)
+    merged = _with_default_ensemble_method(setting, :second_order)
+    cfg = merge(paper, merged)
+    @test cfg.ensemble_method === :auto
+    d = prepare_derived(cfg)
+    @test d.ensemble_method === :quadrature
+
+    d_implicit = prepare_derived(paper)
+    @test d_implicit.ensemble_method === :quadrature
+
+    d_hist = prepare_derived(merge(paper, (ensemble_method=:histogram,)))
+    @test d_hist.ensemble_method === :histogram
+
+    no_quad = ensemble_method_for((kind=:lorentzian,), (kind=:user_defined,))
+    @test no_quad.method === :histogram
+    @test resolve_ensemble_method(
+        merge(paper, (g_inhomogeneity = (kind=:user_defined, filename="missing.dat"),
+                      ensemble_method = :auto)),
+    ).method === :histogram
 end
 
 @testset "layout lengths" begin
@@ -921,15 +967,79 @@ end
     end
 end
 
-@testset "GPU↔CPU 2nd-order RHS parity" begin
-    gpu_ok = false
-    try
-        gpu_ok = CUDA.functional()
-    catch
-        gpu_ok = false
+@testset "NCCL reinterpret(real, Complex) length and pairing" begin
+    for M in (1, 2, 3, 5, 7, 8, 11, 64)
+        n = 3M
+        z = randn(ComplexF64, n)
+        raw = rowsum_nccl_real_view(z)
+        @test eltype(raw) === Float64
+        @test length(raw) == 2n
+        @test raw[1:2:end] ≈ real.(z)
+        @test raw[2:2:end] ≈ imag.(z)
+        acc = zero(ComplexF64)
+        for i in 1:n
+            acc += Complex(raw[2i - 1], raw[2i])
+        end
+        @test acc ≈ sum(z)
     end
-    if !gpu_ok
-        @test_skip "CUDA.functional() is false on this worker; device RHS not executed"
+    z32 = ComplexF32[1 + 2im, 3 - 4im, 5 + 6im]
+    r32 = rowsum_nccl_real_view(z32)
+    @test eltype(r32) === Float32
+    @test length(r32) == 6
+    @test r32 == Float32[1, 2, 3, -4, 5, 6]
+end
+
+@testset "P2P exchange is full-sync O(ns²) copies (no overlap)" begin
+    @test p2p_exchange_copy_count(1) == 0
+    @test p2p_exchange_copy_count(2) == 2
+    @test p2p_exchange_copy_count(3) == 6
+    @test p2p_exchange_copy_count(7) == 42
+    src = read(joinpath(@__DIR__, "..", "src", "MGPUproblem.jl"), String)
+    @test occursin("O(ns²) pairwise owned-slice copies", src)
+    @test occursin("CUDA.synchronize(s.stream)", src)
+    @test occursin("p2p_exchange_copy_count", src)
+end
+
+@testset "standalone NCCL script does not silently drop κᵢ" begin
+    src = read(joinpath(@__DIR__, "..", "src", "sim_2nd_multi_gpu_opt.jl"), String)
+    @test occursin("ki0", src)
+    @test occursin("kappa_t = ke0 + kappa_i", src)
+    @test occursin("κt_t = κe_t + kappa_i", src)
+    @test !occursin("kappa_t = ke0\n", src)
+    @test !occursin("κt_t = κe_t\n", src)
+    @test occursin("κᵢ is never silently dropped", src)
+end
+
+function _device_inventory()
+    require = get(ENV, "CHIMERA_REQUIRE_DEVICE", "0") == "1"
+    gpu = false
+    ndev = 0
+    try
+        gpu = CUDA.functional()
+        gpu && (ndev = length(collect(CUDA.devices())))
+    catch
+        gpu = false
+        ndev = 0
+    end
+    return (; require, gpu, ndev)
+end
+
+function _device_unavailable!(needed::AbstractString, inv)
+    msg = "HARDWARE UNAVAILABLE: need $needed; this worker has gpu=$(inv.gpu) ndev=$(inv.ndev). " *
+          "This is NOT device coverage. Re-run on a ≥2-GPU box or set CHIMERA_REQUIRE_DEVICE=1."
+    println('\n', '='^78, '\n', msg, '\n', '='^78)
+    if inv.require
+        @test false
+    else
+        @test_skip msg
+    end
+    return nothing
+end
+
+@testset "GPU↔CPU 2nd-order RHS parity (CuArray when present)" begin
+    inv = _device_inventory()
+    if !inv.gpu
+        _device_unavailable!("CUDA.functional()", inv)
         return
     end
 
@@ -952,5 +1062,79 @@ end
         du_gpu = CUDA.zeros(ComplexF64, length(u))
         rhs_2nd_order!(du_gpu, CuArray(u), p_gpu, 1e-6)
         @test Array(du_gpu) ≈ du_cpu rtol=1e-12 atol=1e-12
+    end
+end
+
+@testset "device NCCL Allreduce + P2P copyto! (requires ≥2 GPUs)" begin
+    inv = _device_inventory()
+    if inv.ndev < 2
+        _device_unavailable!("≥2 NVIDIA GPUs", inv)
+        return
+    end
+
+    M = 5
+    ns = 2
+    part = EnsemblePartition(M, ns)
+    rng = MersenneTwister(20260905)
+    cpu_bufs, truth = _stress_local_rowsums(part, rng)
+
+    devs = collect(CUDA.devices())[1:ns]
+    gpu_bufs = Vector{Any}(undef, ns)
+    for p in 1:ns
+        CUDA.device!(devs[p])
+        gpu_bufs[p] = CuArray(cpu_bufs[p])
+        raw = rowsum_nccl_real_view(gpu_bufs[p])
+        @test length(raw) == 6M
+        @test eltype(raw) === Float64
+    end
+
+    nccl_ok = false
+    try
+        @eval using NCCL
+        nccl_ok = true
+    catch err
+        println("NCCL.jl failed to load on a multi-GPU worker: ", err)
+        @test false
+        return
+    end
+
+    comms = NCCL.Communicators(devs)
+    NCCL.group() do
+        for p in 1:ns
+            CUDA.device!(devs[p])
+            NCCL.Allreduce!(rowsum_nccl_real_view(gpu_bufs[p]), +, comms[p])
+        end
+    end
+    for p in 1:ns
+        CUDA.device!(devs[p])
+        CUDA.synchronize()
+        @test Array(gpu_bufs[p]) ≈ truth rtol=0 atol=1e-14
+    end
+
+    p2p_bufs = Vector{Any}(undef, ns)
+    for p in 1:ns
+        CUDA.device!(devs[p])
+        p2p_bufs[p] = CuArray(cpu_bufs[p])
+    end
+    for src in 1:ns, dst in 1:ns
+        src == dst && continue
+        CUDA.device!(devs[src])
+        CUDA.synchronize()
+    end
+    ncopy = 0
+    for dst in 1:ns
+        CUDA.device!(devs[dst])
+        for src in 1:ns
+            src == dst && continue
+            r = rowsum_owned_range(part, src)
+            copyto!(p2p_bufs[dst], first(r), p2p_bufs[src], first(r), length(r))
+            ncopy += 1
+        end
+    end
+    @test ncopy == p2p_exchange_copy_count(ns)
+    for p in 1:ns
+        CUDA.device!(devs[p])
+        CUDA.synchronize()
+        @test Array(p2p_bufs[p]) ≈ truth rtol=0 atol=1e-14
     end
 end

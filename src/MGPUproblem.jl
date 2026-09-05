@@ -194,7 +194,7 @@ function exchange_rowsums_nccl!(prob::MGPUProblem{T}, rb) where {T}
     NCCL.group() do
         for (s, comm) in zip(shards, comms)
             CUDA.device!(s.dev)
-            buf = reinterpret(real(eltype(rb(s))), rb(s))
+            buf = rowsum_nccl_real_view(rb(s))
             NCCL.Allreduce!(buf, +, comm; stream = s.stream)
         end
     end
@@ -202,19 +202,25 @@ function exchange_rowsums_nccl!(prob::MGPUProblem{T}, rb) where {T}
 end
 
 function exchange_rowsums_p2p!(prob::MGPUProblem{T}, rb) where {T}
+    # Full sync of every shard, then O(ns²) pairwise owned-slice copies.
+    # Do not pipeline or overlap; correctness is the contract.
     shards = prob.shards
     for s in shards
         CUDA.device!(s.dev)
         CUDA.synchronize(s.stream)
     end
+    ncopy = 0
     for dst in shards
         CUDA.device!(dst.dev)
         for src in shards
             src.id == dst.id && continue
             off = 3 * src.joff
             copyto!(rb(dst), off + 1, rb(src), off + 1, 3 * src.mloc)
+            ncopy += 1
         end
     end
+    ncopy == p2p_exchange_copy_count(length(shards)) || error(
+        "P2P row-sum copy count $(ncopy) ≠ ns*(ns-1) = $(p2p_exchange_copy_count(length(shards))).")
     return nothing
 end
 

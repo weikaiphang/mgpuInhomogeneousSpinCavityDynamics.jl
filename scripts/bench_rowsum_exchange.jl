@@ -83,7 +83,10 @@ function bench_rowsum(; M::Int = 4096, ns::Int = 0, repeats::Int = 20)
             NCCL.group() do
                 for ((dev, buf, _, _), comm) in zip(shards, comms)
                     CUDA.device!(dev)
-                    NCCL.Allreduce!(reinterpret(Float64, buf), +, comm)
+                    raw = reinterpret(Float64, buf)
+                    length(raw) == 2 * length(buf) || error(
+                        "NCCL reinterpret length mismatch: $(length(buf)) Complex -> $(length(raw)) Float64")
+                    NCCL.Allreduce!(raw, +, comm)
                 end
             end
             _sync_all(shards)
@@ -93,7 +96,10 @@ function bench_rowsum(; M::Int = 4096, ns::Int = 0, repeats::Int = 20)
                 NCCL.group() do
                     for ((dev, buf, _, _), comm) in zip(shards, comms)
                         CUDA.device!(dev)
-                        NCCL.Allreduce!(reinterpret(Float64, buf), +, comm)
+                        raw = reinterpret(Float64, buf)
+                        length(raw) == 2 * length(buf) || error(
+                            "NCCL reinterpret length mismatch: $(length(buf)) Complex -> $(length(raw)) Float64")
+                        NCCL.Allreduce!(raw, +, comm)
                     end
                 end
                 _sync_all(shards)

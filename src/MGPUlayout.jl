@@ -163,6 +163,22 @@ end
 rowsum_owned_range(part::EnsemblePartition, p::Integer) =
     (3 * part.offsets[p] + 1):(3 * part.offsets[p] + 3 * part.counts[p])
 
+# NCCL Allreduce is typed on real scalars. Complex addition is
+# componentwise, so a 3M Complex{T} row-sum is a 6M T buffer.
+# Reject length/eltype drift before the collective.
+function rowsum_nccl_real_view(buf::AbstractVector{Complex{T}}) where {T}
+    n = length(buf)
+    raw = reinterpret(T, buf)
+    length(raw) == 2n || error(
+        "NCCL reinterpret length mismatch: Complex{$T}[$n] viewed as " *
+        "$T[$(length(raw))]; expected $(2n).")
+    return raw
+end
+
+# P2P exchange is a full device sync, then ns*(ns-1) pairwise copyto!
+# of owned 3*mloc slices. No overlap / pipeline (intentional).
+p2p_exchange_copy_count(ns::Integer) = ns <= 1 ? 0 : Int(ns) * (Int(ns) - 1)
+
 # CPU mirrors of exchange_rowsums_nccl! / _p2p! / _host!.
 # NCCL Allreduces the full 3M buffer (non-owned slots must be zero).
 # P2P and host copy each shard's owned 3*mloc slice (assignment, not sum).

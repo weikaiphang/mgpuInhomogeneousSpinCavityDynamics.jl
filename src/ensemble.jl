@@ -82,7 +82,7 @@ end
 
 function resolve_ensemble_method(CONFIG, want::Symbol = :config)
     if want === :config
-        want = hasproperty(CONFIG, :ensemble_method) ? Symbol(CONFIG.ensemble_method) : :histogram
+        want = hasproperty(CONFIG, :ensemble_method) ? Symbol(CONFIG.ensemble_method) : :auto
     end
     want in (:histogram, :quadrature, :auto) ||
         error("ensemble_method must be :histogram, :quadrature, or :auto; got :$want")
