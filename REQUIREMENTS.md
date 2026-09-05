@@ -25,8 +25,8 @@ All implementations live in `src/SpinCavityMonolith.jl` unless noted.
 | B-spline `E(t)` 0 alloc (B3) | `PulseDrive` + `BSplineScratch` / `bspline_dot!`. Dual-through-`u` owns its own scratch. |
 | Large layout (B5) | `mg_pair` pair-interleaved 5-tuples. CPU default 1 shard. |
 | Ensemble API (B7/B8) | Histogram is `:constant` g only (honest error). `:auto`+`:uniform` builds a histogram. Unknown freq kinds error with the `:auto` reason. |
-| C_eff honesty | `prepare_derived` exposes `C_ens`, `Σp_δ`, `Σp_g`, `Σp`, `C_eff=C_ens×Σp`. `renormalize=false` does not claim full `C_ens`. Printed by `prepare` / `summarize_cooperativity`. |
-| `amp_scale` from √⟨g²⟩ | `CompositePulse` uses `_g_rms_for_scale` (`√g2_avg`, else `g_rms`, else `|g_mean|`). |
+| C_eff honesty | `prepare` exposes **and prints** both `C_ens` and `C_eff`. `C_eff=C_ens×Σp_δ×Σp_g` (g-mass included when coupling is truncated). |
+| `amp_scale` convention | `amp_scale = (κₜ / (4 √g2_avg √κₑ)) × Ω`. `_g_rms_for_scale` is `√g2_avg` (else `g_rms`, else `|g_mean|`). |
 | Docs invoke (B10) | `julia --project=. --startup-file=no test/spin_cavity_monolith.jl` |
 | ≥2-GPU NCCL/P2P is the bar | Deferred to Tuesday iron. `build_collectives` is wired (`:nccl` / `:p2p`) but unproven here. This VM has **no NVIDIA GPU**. |
 | On-device small RHS + rowsums (no hot-path D2H) | Wired in `solve_2nd_gpu`; not executed on this VM. Shared math: `_small_cavity_derivs!`, `_small_bin_deriv!`. |
