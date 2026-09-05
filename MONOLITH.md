@@ -1,18 +1,18 @@
-# Standalone nude-quad monolith
+# SpinCavityMonolith
 
-`src/monolith_mgpu.jl` is the product. This branch does **not** ship the old
-nude-quad module tree (`rhs_*.jl`, `MGPU*.jl`, `pulse_optimizer2.jl`,
-`sim_2nd_multi_gpu_opt.jl`, …). Physics, B-splines, loss, adjoint, and
-multi-GPU are self-contained. No Volkov–Zon.
+Single-file solver (`src/SpinCavityMonolith.jl`). Settings describe cavity,
+ensemble, and drive. Modes run 1st-order, 2nd-order, B-spline parameterization,
+or Adam on B-spline parameters.
 
 ## Tree
 
 ```
-src/monolith_mgpu.jl          # the implementation
-scripts/nude_quad_monolith.jl # CLI
-examples/monolith_*.jl        # settings for each mode
-test/monolith_mgpu.jl
-MONOLITH.md  README.md  LICENSE  Project.toml
+src/SpinCavityMonolith.jl
+scripts/run_monolith.jl
+examples/monolith_*.jl|.json
+test/spin_cavity_monolith.jl
+test/runtests.jl
+MONOLITH.md  REQUIREMENTS.md  README.md  LICENSE  Project.toml  .gitignore
 ```
 
 ## Modes
@@ -23,11 +23,32 @@ settings → prepare(ensemble_method=:auto|:quadrature|:histogram)
          → optimize(u; grad=:adjoint|:forward)
 ```
 
-`:auto` uses Gauss–Legendre when frequency is `:lorentzian`/`:gaussian` and
-coupling is `:constant`/`:gaussian`/`:powerlaw_g`. **order2 uses the same rule.**
+| Mode | What it does |
+|---|---|
+| `forward` | 1st-order ODE, raw `PULSE_CONFIG` |
+| `forward_bspline` | Fit raw pulse → `k` B-spline sub-pulses, then 1st-order |
+| `order2` | 2nd-order (includes 1st-order fields), raw pulse |
+| `order2_bspline` | B-spline parameterization, then 2nd-order |
+| `optimizer` | Adam on the B-spline vector only (`grad=:adjoint` default) |
 
-B-spline: `n_params = 3k + k nA + k nf`, unpack `gaps|durs|φ0|cA|cf`, softplus
-scales, Gevrey taper.
+Hyphenated aliases (`forward-bspline`, `order2-bspline`) are accepted.
+
+B-spline: `n_params = 3k + k n_coeff_A + k n_coeff_f`, unpack `gaps|durs|φ0|cA|cf`,
+softplus scales, Gevrey taper. `build_E_of_t` is in this file.
+
+## Settings
+
+A `.jl` file assigns `MODE`, `SIM_SETTING`, `SYSTEM_CONFIG`, `PULSE_CONFIG`,
+and optionally `BSPLINE`, `OPTIMIZER`, `COMPUTE`. JSON uses the same keys
+(`examples/monolith_forward.json`).
+
+- **Cavity:** `delta0`, `kappa_e`, `kappa_i` (`κₜ = κₑ+κᵢ`)
+- **Ensemble:** `C_ens`, `freq_inhomogeneity`, `g_inhomogeneity`, `M_delta`, `M_g`
+- **Pulse:** tuple of `:gaussian` / `:wurst` / `:custom`
+
+`:auto` uses Gauss–Legendre when frequency is `:lorentzian`/`:gaussian` and
+coupling is `:constant`/`:gaussian`/`:powerlaw_g`; otherwise histogram.
+**order2 uses the same prepare path.**
 
 ## Loss
 
@@ -40,15 +61,14 @@ J = (1−fid)² + (κ_I/2)[I_min−I]₊² + (κ_S/2)[S_min−ss]₊²
 ```
 
 Defaults: `I_min=S_min=0.85`, `κ_I=κ_S=50`, `w_time=0.15`, `w_power=0.05`,
-`w_tmax=1`, `track=:weak`. Optimizer updates **only** B-spline parameters.
-No noise/QRT unless a future mode asks for it.
+`w_tmax=1`, `track=:weak`. Primary gradient: checkpointed discrete Tsit5 adjoint.
 
-Primary gradient: checkpointed discrete Tsit5 adjoint. `grad=:forward` is a
-parity-only Dual-through-solve path.
+## ICs and equations
 
-## ICs (package ground SmSp=0 is wrong)
+Auditable at the top of `src/SpinCavityMonolith.jl`:
 
 ```
+ȧ = √κₑ E − i δ₀ a − i Σ gⱼ Sⱼ⁻ − (κₜ/2) a
 SmSp_same = |Sp|²(1−1/N)+N/2−Sz     # ground ⇒ Nⱼ
 SzSz_same = Sz²(1−1/N)+N/4
 SpSp_same = Sp²(1−1/N)
@@ -56,29 +76,15 @@ SzSp_same = Sz·Sp·(1−1/N)
 cross j≠k = mean products
 ```
 
-`κₜ = κₑ + κᵢ` always.
+## Multi-GPU
 
-## Multi-GPU (the hot path)
-
-One 2nd-order RHS stack, sharded:
-
-- **small** `3+9M` — RHS evaluated **once** (rank 0). Other GPUs do not re-integrate `ȧ`.
-- **large** `5×M×mloc` columns: `SpSp, SzSp, SzSpT, SmSp, SzSz`.
-- Collectives: on-device Allreduce of O(M) row-sums (NCCL, else P2P).
-  Not host `exchange_rowsums!`.
-- CUDA kernels for large-block RHS. CPU is the same `rhs2_sharded!` loops
-  (correctness / CI fallback), not a second physics stack.
-
-1st-order shards bins; Allreduce of `Σ g S⁻`; `a` updated on rank 0.
-
-If CUDA is absent, `backend=:auto` uses the CPU sharded fallback. That is
-**not** pretending to be multi-GPU: the GPU path is what production should hit.
-
-## Run
+One order-2 RHS: small `3+9M` once on rank 0; large `5×M×mloc` =
+`SpSp, SzSp, SzSpT, SmSp, SzSz`. CUDA kernels + NCCL/P2P Allreduce of O(M)
+row-sums. CPU runs the same `rhs2_sharded!` (CI fallback).
 
 ```bash
-julia --project=. scripts/nude_quad_monolith.jl -s examples/monolith_forward.jl
-julia --project=. scripts/nude_quad_monolith.jl -s examples/monolith_order2.jl
-julia --project=. scripts/nude_quad_monolith.jl -s examples/monolith_optimizer.jl --grad adjoint
-julia --project=. test/monolith_mgpu.jl
+julia --project=. scripts/run_monolith.jl -s examples/monolith_forward.jl
+julia --project=. scripts/run_monolith.jl -s examples/monolith_order2.jl
+julia --project=. scripts/run_monolith.jl -s examples/monolith_optimizer.jl --grad adjoint
+julia --startup-file=no test/spin_cavity_monolith.jl
 ```

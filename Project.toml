@@ -1,7 +1,6 @@
-name = "NudeQuadMonolith"
-uuid = "d5b32329-195a-4cf2-8166-e16172a7f364"
-version = "0.2.0"
-authors = ["Qove Laboratory"]
+name = "SpinCavityMonolith"
+uuid = "230e6bac-f383-4415-ba98-aaf7da95e674"
+version = "0.1.0"
 
 [deps]
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"

@@ -1,5 +1,4 @@
-# Standalone monolith tests (no CUDA / DifferentialEquations required).
-#   julia --project=. test/monolith_mgpu.jl
+#   julia --startup-file=no test/spin_cavity_monolith.jl
 #
 # Covers: vacuum⊗ground fixed point, 1st-order κₜ, sharded RHS parity,
 #         B-spline pack/unpack, product-state ICs, adjoint vs forward.
@@ -9,10 +8,10 @@ using LinearAlgebra
 using Random
 using ForwardDiff
 
-include(joinpath(@__DIR__, "..", "src", "monolith_mgpu.jl"))
-using .NudeQuadMonolith
+include(joinpath(@__DIR__, "..", "src", "SpinCavityMonolith.jl"))
+using .SpinCavityMonolith
 
-const M = NudeQuadMonolith
+const M = SpinCavityMonolith
 
 @testset "B-spline pack/unpack / param count" begin
     d = (
@@ -146,7 +145,7 @@ end
     @test st2[13][1, 1] == 0 && st2[13][2, 2] == 0    # same-bin lives in small
 end
 
-@testset "MGPU 5-block product-state ICs" begin
+@testset "5-block product-state ICs" begin
     Mbin = 4
     Nj = [3.0, 5.0, 2.0, 8.0]
     small, larges, counts, offsets = M.build_u0_2nd_mgpu(Mbin, Nj, :ground, 2)
@@ -241,4 +240,4 @@ end
     @test g_fwd ≈ g_adj rtol=5e-3 atol=1e-6
 end
 
-println("monolith_mgpu tests finished.")
+println("SpinCavityMonolith tests finished.")

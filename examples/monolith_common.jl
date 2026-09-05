@@ -8,7 +8,7 @@ SYSTEM_CONFIG = (
     C_ens = 0.6,
     delta0 = 0.0,
     kappa_e = κe,
-    kappa_i = 2π * 0.0,   # included in κₜ = κₑ + κᵢ wherever the package uses κ
+    kappa_i = 2π * 0.0,   # κₜ = κₑ + κᵢ
     freq_inhomogeneity = (
         kind = :lorentzian,
         FWHM = FWHM,

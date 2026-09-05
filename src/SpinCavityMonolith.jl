@@ -1,5 +1,5 @@
-# Standalone multi-GPU monolith for inhomogeneous spin–cavity cumulant dynamics.
-# Self-contained: no legacy nude-quad modules, no Volkov–Zon.
+# Spin–cavity multi-GPU monolith: inhomogeneous ensemble cumulant dynamics.
+# Single module. Equations in this file are the implementation.
 #
 #   ȧ = √κₑ E(t) − i δ₀ a − i Σⱼ gⱼ ⟨Sⱼ⁻⟩ − (κₜ/2) a          κₜ = κₑ+κᵢ
 #   ⟨Ṡ⁺⟩ⱼ = i δⱼ ⟨S⁺⟩ⱼ − 2i gⱼ a* ⟨Sᶻ⟩ⱼ
@@ -15,7 +15,7 @@
 #       + (κ_S/2)[S_min-ss]₊² + w_time(T/Tmax) + w_tmax(tmax_ex/Tmax)²
 #       + w_power(‖cA/amp_scale‖²/n_cA)
 
-module NudeQuadMonolith
+module SpinCavityMonolith
 
 using LinearAlgebra
 using Random
@@ -64,7 +64,7 @@ end
 @inline _value(x::Complex) = complex(ForwardDiff.value(real(x)), ForwardDiff.value(imag(x)))
 
 # =============================================================================
-# B-spline + CompositePulse (ported; no legacy include)
+# B-spline + CompositePulse (k sub-pulses; Gevrey taper)
 # =============================================================================
 
 function make_clamped_knots(n_coeff::Integer, t0, t1, degree::Integer=3)
@@ -346,7 +346,7 @@ end
 
 make_diag_mask_host(M) = ComplexF64.(.!Matrix(I, M, M))
 
-# MGPU layout: small = 3+9M; large = 5×M×mloc (SpSp, SzSp, SzSpT, SmSp, SzSz)
+# Multi-GPU layout: small = 3+9M; large = 5×M×mloc (SpSp, SzSp, SzSpT, SmSp, SzSz)
 const MG_NSCALAR = 3
 const MG_NSMALLFIELD = 9
 const MG_B_SpSp, MG_B_SzSp, MG_B_SzSpT, MG_B_SmSp, MG_B_SzSz = 1, 2, 3, 4, 5
@@ -371,7 +371,7 @@ end
 # =============================================================================
 #
 # A settings file is either:
-#   (A) Julia (.jl) that assigns NamedTuples (package spirit):
+#   (A) Julia (.jl) that assigns NamedTuples:
 #         MODE, SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG,
 #         optional BSPLINE, OPTIMIZER, COMPUTE
 #   (B) JSON with the same keys (see MONOLITH.md).
@@ -436,9 +436,9 @@ end
 # Coupling:
 #   constant    single node; M_g forced to 1
 #   gaussian    GL on [max(0,μ−span σ), μ+span σ] times Normal pdf
-#               MODELING: default renormalize=true (package coupling default)
+#               MODELING: default renormalize=true for coupling
 #   powerlaw_g  GL on log g
-# Cooperativity → total spin number (package formula):
+# Cooperativity → total spin number:
 #   Lorentzian: N = C_ens κₜ FWHM / (4 ⟨g²⟩)
 #   Gaussian:   N = C_ens κₜ FWHM / (4 √(π ln 2) ⟨g²⟩)
 # κₜ = κₑ + κᵢ  is used here (internal loss included), matching the main package.
@@ -739,7 +739,7 @@ function build_E_of_t_raw(PULSE_CONFIG)
 end
 
 # =============================================================================
-# §5  Initial conditions  (CORRECTED — do not copy nude-quad 2nd-order bugs)
+# §5  Initial conditions  (product-state, finite Nⱼ)
 # =============================================================================
 
 const WEAK_SEED = 1.0e-3
@@ -758,7 +758,7 @@ end
 Same-bin product-state closures (Reader / finite-N algebra).
   SpSp_same = Sp² (1 − 1/Nⱼ)
   SzSp_same = Sz Sp (1 − 1/Nⱼ)
-  SmSp_same = |Sp|² (1 − 1/Nⱼ) + Nⱼ/2 − Sz     # ground ⇒ Nⱼ  (package IC = 0 is WRONG)
+  SmSp_same = |Sp|² (1 − 1/Nⱼ) + Nⱼ/2 − Sz     # ground ⇒ Nⱼ
   SzSz_same = Sz² (1 − 1/Nⱼ) + Nⱼ/4
 Cross j≠k = products of means. Nⱼ≤0 → 0.
 """
@@ -821,7 +821,7 @@ function build_u0_2nd_order(M, Nj, ::Type{T}, kind::Symbol=:ground) where {T}
 end
 
 # =============================================================================
-# §6  First-order RHS  (eqs. 1–3)  — matches package rhs_1st_order!
+# §6  First-order RHS  (eqs. 1–3)
 # =============================================================================
 
 function rhs1!(du, u, p, t)
@@ -849,14 +849,13 @@ function rhs1!(du, u, p, t)
 end
 
 # =============================================================================
-# §7  Second-order RHS  (package rhs_2nd_order!, with κₜ = κₑ+κᵢ)
+# §7  Second-order RHS  (κₜ = κₑ+κᵢ)
 # =============================================================================
 #
 # Extra cavity moments:
 #   d⟨a†a†⟩, d⟨a†a⟩ couple to Σ gⱼ ⟨a† Sⱼ⁺⟩ and drive √κₑ E(t).
 # Spin–cavity (adSp, adSm, adSz) and same/cross bin pairs follow the
-# standard 2nd-order cumulant closure used in rhs_2nd_order.jl (nude-quad).
-# Cross-bin diagonals are projected out (diag_mask).
+# Standard 2nd-order cumulant closure. Cross-bin diagonals are zero (same-bin lives in small).
 
 # =============================================================================
 # One 2nd-order RHS stack (sharded). Dense rhs2! is a thin adapter.
@@ -1153,7 +1152,7 @@ end
 
 """
 Analytic VJP of eqs. (1)–(3) in real coordinates (drive E(t) treated separately).
-Matches package `rhs_1st_order_vjp!` (lab frame). κₜ = κₑ+κᵢ.
+Lab-frame VJP of eqs. (1)–(3). κₜ = κₑ+κᵢ.
 """
 function rhs1_vjp!(x̄, λ, x, p, t)
     delta0, kappa_e, kappa_i, delta_b, g_b, M = p[1], p[2], p[3], p[4], p[5], p[6]
@@ -2181,8 +2180,8 @@ function reverse_tsit5!(gθ, λx, states, t, dts, p, pulse, u_pulse)
     return gθ
 end
 
-"""Checkpointed reverse (package `reverse_tsit5_on_checkpoints!`): replay each
-window from a stored checkpoint, then VJP. Primary optimizer path."""
+"""Checkpointed reverse: replay each window from a stored checkpoint, then VJP.
+Primary optimizer path."""
 function reverse_tsit5_checkpoints!(gθ, λx, ts, dts, idxs, stack_u, p, pulse, u_pulse)
     nchk = length(idxs)
     nchk >= 2 || return reverse_tsit5!(gθ, λx, stack_u, ts, dts, p, pulse, u_pulse)
@@ -2198,7 +2197,7 @@ function reverse_tsit5_checkpoints!(gθ, λx, ts, dts, idxs, stack_u, p, pulse, 
 end
 
 # =============================================================================
-# §12  Observables + pulse_cost  (current pulse_optimizer2.jl formulation)
+# §12  Observables + pulse_cost  (fidelity-physics loss)
 # =============================================================================
 
 function _weighted_inversion(Sz, g_b, Nj, ::Type{T}) where {T}
@@ -3046,7 +3045,7 @@ function parse_cli(args)
             i += 1
             grad = Symbol(args[i])
         elseif a == "--help" || a == "-h"
-            println("Usage: julia --project=. scripts/nude_quad_monolith.jl --settings FILE [--mode MODE] [--grad adjoint|forward]")
+            println("Usage: julia --project=. scripts/run_monolith.jl --settings FILE [--mode MODE] [--grad adjoint|forward]")
             println("Modes: forward | forward_bspline | order2 | order2_bspline | optimizer")
             return nothing
         elseif settings === nothing && !startswith(a, "-")
@@ -3082,6 +3081,6 @@ export state_length_1st_order, state_length_2nd_order
 end # module
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    NudeQuadMonolith._load_optional_stacks!()
-    NudeQuadMonolith.main(ARGS)
+    SpinCavityMonolith._load_optional_stacks!()
+    SpinCavityMonolith.main(ARGS)
 end
