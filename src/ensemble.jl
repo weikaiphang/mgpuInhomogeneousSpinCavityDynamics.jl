@@ -99,17 +99,65 @@ function resolve_ensemble_method(CONFIG, want::Symbol = :config)
     return plan
 end
 
-function _log_ensemble_truncation(p_delta, p_g, freq_cfg, g_cfg, C_ens)
+# Discrete optical-depth factors after binning / quadrature.
+# N is inverted from full-line C_ens; the ODE sees C_eff = C_ens × ∑p_δ × ∑p_g.
+# Do not rescale N. Print both C_ens and C_eff (no silent ~0.76×).
+function ensemble_optical_depth(C_ens, p_delta, p_g)
     pδ = sum(p_delta)
     pg = sum(p_g)
+    return (p_delta_sum = pδ, p_g_sum = pg, C_eff = Float64(C_ens) * pδ * pg)
+end
+
+function _g_cfg_or_nothing(sys)
+    return hasproperty(sys, :g_inhomogeneity) ? sys.g_inhomogeneity : nothing
+end
+
+function cooperativity_honesty(C_ens, freq_inhomogeneity, g_inhomogeneity=nothing)
+    pδ = frequency_truncation_mass(freq_inhomogeneity)
+    pg = g_inhomogeneity === nothing ? 1.0 : coupling_truncation_mass(g_inhomogeneity)
+    return (
+        C_ens = Float64(C_ens),
+        p_delta_sum = pδ,
+        p_g_sum = pg,
+        C_eff = Float64(C_ens) * pδ * pg,
+    )
+end
+
+function cooperativity_honesty(sys)
+    return cooperativity_honesty(sys.C_ens, sys.freq_inhomogeneity, _g_cfg_or_nothing(sys))
+end
+
+function print_cooperativity_honesty(io::IO, C_ens, freq_inhomogeneity, g_inhomogeneity=nothing)
+    h = cooperativity_honesty(C_ens, freq_inhomogeneity, g_inhomogeneity)
+    freq_renorm = renormalize_frequency_probs_enabled(freq_inhomogeneity)
+    println(io, "C_ens = $(h.C_ens)  (full-line; N is built from this)")
+    println(io, "∑p_δ  = $(h.p_delta_sum)  (freq renormalize=$(freq_renorm))")
+    if g_inhomogeneity !== nothing
+        g_renorm = coupling_renormalize_enabled(g_inhomogeneity)
+        pg_str = isnan(h.p_g_sum) ? "unknown (user_defined, renormalize=false)" : string(h.p_g_sum)
+        println(io, "∑p_g  = $pg_str  (g renormalize=$(g_renorm))")
+    end
+    println(io, "C_eff = $(h.C_eff)  (ODE optical depth = C_ens × ∑p_δ × ∑p_g)")
+    return h
+end
+
+print_cooperativity_honesty(C_ens, freq_inhomogeneity, g_inhomogeneity=nothing) =
+    print_cooperativity_honesty(stdout, C_ens, freq_inhomogeneity, g_inhomogeneity)
+
+print_cooperativity_honesty(io::IO, sys) =
+    print_cooperativity_honesty(io, sys.C_ens, sys.freq_inhomogeneity, _g_cfg_or_nothing(sys))
+
+print_cooperativity_honesty(sys) = print_cooperativity_honesty(stdout, sys)
+
+function _log_ensemble_truncation(p_delta, p_g, freq_cfg, g_cfg, C_ens)
+    od = ensemble_optical_depth(C_ens, p_delta, p_g)
     freq_renorm = renormalize_frequency_probs_enabled(freq_cfg)
     g_renorm = coupling_renormalize_enabled(g_cfg)
-    if !freq_renorm || !g_renorm
-        C_eff = C_ens * pδ * pg
-        println("[ensemble] ∑p_δ = $pδ, ∑p_g = $pg  (renormalize freq=$(freq_renorm), g=$(g_renorm))")
-        println("[ensemble] effective cooperativity C_eff = C_ens × ∑p_δ × ∑p_g = $C_eff")
-    end
-    return nothing
+    println("[ensemble] C_ens = $C_ens  (full-line; N is built from this)")
+    println("[ensemble] ∑p_δ = $(od.p_delta_sum), ∑p_g = $(od.p_g_sum)  " *
+            "(renormalize freq=$(freq_renorm), g=$(g_renorm))")
+    println("[ensemble] C_eff = $(od.C_eff)  (ODE optical depth = C_ens × ∑p_δ × ∑p_g)")
+    return od
 end
 
 function _log_ensemble_choice(plan, M_delta_req, M_g_req, M_delta, M_g, M)
@@ -233,10 +281,13 @@ function prepare_derived(CONFIG; ensemble_method::Symbol = :config)
     Nt = length(t_save)
 
     _log_ensemble_choice(_ens_plan, CONFIG.M_delta, CONFIG.M_g, M_delta, M_g, M)
-    _log_ensemble_truncation(p_delta, p_g, freq_cfg, g_inhomogeneity, C_ens)
+    od = _log_ensemble_truncation(p_delta, p_g, freq_cfg, g_inhomogeneity, C_ens)
 
     return (
         C_ens = C_ens,
+        p_delta_sum = od.p_delta_sum,
+        p_g_sum = od.p_g_sum,
+        C_eff = od.C_eff,
 
         M_delta = M_delta,
         M_g = M_g,

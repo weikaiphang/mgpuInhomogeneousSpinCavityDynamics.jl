@@ -99,6 +99,7 @@ end
 function run_case()
     outdir = mktempdir()
     SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG = frozen_case(; outdir = outdir)
+    print_cooperativity_honesty(SYSTEM_CONFIG)
     data = run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; clean_gpu = true)
     return data
 end

@@ -100,6 +100,9 @@ export plot_E_of_t
 
 export build_full_config, prepare_derived
 export prepare_derived_quadrature, ensemble_method_for, resolve_ensemble_method
+export frequency_truncation_mass, coupling_truncation_mass
+export effective_cooperativity, ensemble_optical_depth
+export cooperativity_honesty, print_cooperativity_honesty
 export make_clamped_knots, bspline_basis, bspline_basis!, bspline_eval, bspline_area, bspline_antiderivative
 export CompositePulse, n_params, decode, initial_guess, total_area, pulse_duration
 export points_per_segment_for_budget

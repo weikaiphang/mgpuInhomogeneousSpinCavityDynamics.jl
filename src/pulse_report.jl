@@ -558,6 +558,10 @@ function cfg_section(b::Bundle)
     cav = [("κ_e", twopi_mhz(sys.kappa_e)), ("κ_i", twopi_mhz(sys.kappa_i)),
            ("κ_t", twopi_mhz(sys.kappa_e + sys.kappa_i)), ("δ₀", sig(sys.delta0))]
     ens = [("C_ens", sig(sys.C_ens)),
+           ("C_eff", hasproperty(d, :C_eff) ? sig(d.C_eff) :
+                     sig(cooperativity_honesty(sys).C_eff)),
+           ("∑p_δ / ∑p_g", hasproperty(d, :p_delta_sum) ?
+                     string(d.p_delta_sum, " / ", d.p_g_sum) : "—"),
            ("freq inhom.", "$(fi.kind), FWHM " * twopi_mhz(fi.FWHM)),
            ("freq span", string(get(fi, :span_gamma, get(fi, :span_sigma, "—"))) *
                          (haskey(fi, :renormalize) ? ", renorm=$(fi.renormalize)" : "")),

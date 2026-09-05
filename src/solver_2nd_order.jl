@@ -89,6 +89,10 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
             g_b_1d = d.g_b_1d,
             Nj_2d = d.Nj_2d,
             N_total = d.N_total,
+            C_ens = d.C_ens,
+            C_eff = d.C_eff,
+            p_delta_sum = d.p_delta_sum,
+            p_g_sum = d.p_g_sum,
             elapsed_seconds = elapsed_seconds,
             solver_stats = stats,
             backend = :cpu,
@@ -189,6 +193,10 @@ function run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
         Nj_2d = d.Nj_2d,
 
         N_total = d.N_total,
+        C_ens = d.C_ens,
+        C_eff = d.C_eff,
+        p_delta_sum = d.p_delta_sum,
+        p_g_sum = d.p_g_sum,
         elapsed_seconds = elapsed_seconds,
         backend = :gpu,
     )

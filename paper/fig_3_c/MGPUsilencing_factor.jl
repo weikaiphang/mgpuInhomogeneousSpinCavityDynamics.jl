@@ -161,6 +161,7 @@ SYSTEM_CONFIG_BASE = (
         renormalize = true,
     ),
 )
+print_cooperativity_honesty(SYSTEM_CONFIG_BASE)
 
 
 PULSE_CONFIG_BASE = (

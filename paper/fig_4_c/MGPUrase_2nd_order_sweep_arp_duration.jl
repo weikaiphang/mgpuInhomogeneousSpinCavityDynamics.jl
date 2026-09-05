@@ -122,6 +122,7 @@ function run_duration_sweep(
     println("Starting WURST-duration sweep")
     println("Number of simulations: $N_runs")
     println("Fixed C_ens:           $(system_config.C_ens)")
+    print_cooperativity_honesty(system_config)
     println(
         "Fixed g / 2π:          ",
         system_config.g_inhomogeneity.g_value / (2π),

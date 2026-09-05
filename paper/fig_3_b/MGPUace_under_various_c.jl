@@ -159,6 +159,7 @@ function run_C_sweep(
         println("============================================================")
         println("Run $run_index / $(length(C_VALUES))")
         println("C_ens = $C_value")
+        print_cooperativity_honesty(SYSTEM_CONFIG_RUN)
         println("Saving to: $saved_file_name")
         println("============================================================")
 

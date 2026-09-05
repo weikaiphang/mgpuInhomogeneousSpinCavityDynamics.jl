@@ -554,6 +554,10 @@ function run_sim_1st_order(
         peak_detection_results = peak_detection_results,
 
         N_total = d.N_total,
+        C_ens = d.C_ens,
+        C_eff = d.C_eff,
+        p_delta_sum = d.p_delta_sum,
+        p_g_sum = d.p_g_sum,
         elapsed_seconds = elapsed_seconds,
     )
 

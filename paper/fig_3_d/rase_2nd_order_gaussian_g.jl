@@ -162,6 +162,8 @@ function run_sweep()
         println("------------------------------------------------------------")
         println("Run $run_index / $N_runs")
         println("C_ens        = $C_ens")
+        print_cooperativity_honesty(C_ens, BASE_SYSTEM_CONFIG.freq_inhomogeneity,
+                                    merge(BASE_SYSTEM_CONFIG.g_inhomogeneity, (std = 2π * g_std_Hz,)))
         println("g_std / 2π   = $g_std_Hz Hz")
         println("Output file  = $saved_file_name")
         println("------------------------------------------------------------")

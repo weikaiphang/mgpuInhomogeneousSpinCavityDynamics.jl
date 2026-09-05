@@ -105,7 +105,14 @@ kappa_t = ke0 + ki0
 
 g2_avg = g_mean^2 + g_std^2
 N_spin = (C_ens) * (kappa_t * FWHM) / (4 * g2_avg)
+# Full-line C_ens inverts N; Lorentzian edges are ±2.5 γ (renormalize=false).
+# The ODE sees C_eff = C_ens × ∑p_δ. Do not silently label the run as C_ens.
+p_delta_mass = 2 * atan(2.5) / π
+C_eff = C_ens * p_delta_mass
 println("N_spin = $N_spin")
+println("C_ens = $C_ens  (full-line; N is built from this)")
+println("∑p_δ  = $p_delta_mass  (Lorentzian span_gamma=2.5, renormalize=false)")
+println("C_eff = $C_eff  (ODE optical depth = C_ens × ∑p_δ)")
 
 alpha0  = USER.alpha0
 A0      = 0.5 * sqrt(ke0) * alpha0

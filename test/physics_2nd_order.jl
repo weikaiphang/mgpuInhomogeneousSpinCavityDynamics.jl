@@ -12,6 +12,7 @@ for (pred, rel) in (
     (!isdefined(@__MODULE__, :_with_default_ensemble_method), "simulation_api.jl"),
     (!isdefined(@__MODULE__, :build_constant_coupling_bins), "coupling_inhomogeneity.jl"),
     (!isdefined(@__MODULE__, :total_spin_number_from_cooperativity), "frequency_inhomogeneity.jl"),
+    (!isdefined(@__MODULE__, :prepare_derived), "ensemble.jl"),
     (!isdefined(@__MODULE__, :_quad_frequency_nodes), "ensemble_quadrature.jl"),
 )
     pred && include(joinpath(_PHYS_SRC, rel))
@@ -325,6 +326,71 @@ end
     @test sum(p) ≈ 2 * atan(span) / π rtol = 1e-12
     maybe_renormalize_frequency_probs!(copy(p), freq)
     @test sum(p) < 1
+end
+
+@testset "C_eff honesty: truncated Lorentzian is not silent" begin
+    C = 0.6
+    span = 2.5
+    freq = (kind = :lorentzian, FWHM = 2π * 1e6, span_gamma = span, renormalize = false)
+    pδ = frequency_truncation_mass(freq)
+    @test pδ ≈ 2 * atan(span) / π rtol = 1e-14
+    @test 0.70 < pδ < 0.80
+    C_eff = effective_cooperativity(C, freq)
+    @test C_eff ≈ C * pδ
+    @test C_eff != C
+    freq_r = merge(freq, (renormalize = true,))
+    @test frequency_truncation_mass(freq_r) == 1.0
+    @test effective_cooperativity(C, freq_r) == C
+
+    g = (kind = :constant, g_value = 2π * 100)
+    cfg = (
+        C_ens = C,
+        M_delta = 17,
+        M_g = 1,
+        kappa_e = 2π * 1e6,
+        kappa_i = 0.0,
+        delta0 = 0.0,
+        Ttotal = 1e-6,
+        Nt_save = 3,
+        freq_inhomogeneity = freq,
+        g_inhomogeneity = g,
+        ensemble_method = :quadrature,
+    )
+    d = prepare_derived(cfg)
+    @test hasproperty(d, :C_eff) && hasproperty(d, :p_delta_sum)
+    @test d.C_ens == C
+    @test d.p_delta_sum ≈ pδ rtol = 1e-12
+    @test d.C_eff ≈ C * d.p_delta_sum * d.p_g_sum
+    @test d.C_eff != d.C_ens
+    @test d.N == total_spin_number_from_cooperativity(C, d.kappa_t, d.g2_avg, freq)
+    h = cooperativity_honesty(cfg)
+    @test h.C_eff ≈ d.C_eff rtol = 1e-12
+end
+
+@testset "paper/demos print C_eff when freq truncation is un-renormalized" begin
+    roots = (
+        joinpath(@__DIR__, "..", "paper"),
+        joinpath(@__DIR__, "..", "examples"),
+        joinpath(@__DIR__, "..", "scripts"),
+    )
+    offenders = String[]
+    repo = joinpath(@__DIR__, "..")
+    for root in roots
+        isdir(root) || continue
+        for (dir, _, files) in walkdir(root)
+            for f in files
+                endswith(f, ".jl") || continue
+                path = joinpath(dir, f)
+                txt = read(path, String)
+                occursin(r"renormalize\s*=\s*false", txt) || continue
+                (occursin("span_gamma", txt) || occursin("span_sigma", txt)) || continue
+                if !occursin("C_eff", txt) && !occursin("print_cooperativity_honesty", txt)
+                    push!(offenders, relpath(path, repo))
+                end
+            end
+        end
+    end
+    @test isempty(offenders)
 end
 
 @testset "order-2 ensemble_method defaults to :auto" begin

@@ -121,10 +121,35 @@ function maybe_renormalize_frequency_probs!(p_delta, freq_inhomogeneity)
 end
 
 
+# Truncation mass the frequency mesh keeps when renormalize=false.
+# Lorentzian on [-span_gamma·γ, span_gamma·γ] is 2 atan(span_gamma)/π
+# (span_gamma=2.5 → ≈0.758). After renormalize=true this is 1.
+function frequency_truncation_mass(freq_inhomogeneity)
+    validate_frequency_inhomogeneity(freq_inhomogeneity)
+    renormalize_frequency_probs_enabled(freq_inhomogeneity) && return 1.0
+    kind = freq_inhomogeneity.kind
+    if kind === :lorentzian
+        return 2 * atan(Float64(freq_inhomogeneity.span_gamma)) / π
+    elseif kind === :gaussian
+        s = Float64(freq_inhomogeneity.span_sigma)
+        return 2 * cdf(Normal(0.0, 1.0), s) - 1
+    end
+end
+
+
+# Full-line cooperativity used to invert N. The ODE sees C_ens × this mass
+# when renormalize=false — print C_eff separately; do not silently treat them
+# as equal, and do not rescale N.
+effective_cooperativity(C_ens, freq_inhomogeneity) =
+    Float64(C_ens) * frequency_truncation_mass(freq_inhomogeneity)
+
+
 
 # Cooperativity inversion (do not change; Gaussian is peak-matched to Lorentzian FWHM):
 #   N_Lorentzian = C κ FWHM / (4 ⟨g²⟩)
 #   N_Gaussian   = C κ FWHM / (4 √(π ln 2) ⟨g²⟩)
+# C here is the full-line C_ens. Truncated meshes with renormalize=false
+# see C_eff = C_ens × ∑p_δ (and × ∑p_g if g is also un-renormalized).
 function total_spin_number_from_cooperativity(
     C_ens,
     kappa_t,

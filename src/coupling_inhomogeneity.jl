@@ -25,6 +25,32 @@ function maybe_renormalize_coupling_probs!(p_g, g_inhomogeneity)
 end
 
 
+# Mass kept on the g mesh when renormalize=false. Constant / power-law
+# support is already the full definition interval (mass 1). Gaussian is
+# truncated to [max(0, μ − span σ), μ + span σ].
+function coupling_truncation_mass(g_inhomogeneity)
+    validate_coupling_inhomogeneity(g_inhomogeneity)
+    coupling_renormalize_enabled(g_inhomogeneity) && return 1.0
+    kind = g_inhomogeneity.kind
+    kind === :constant && return 1.0
+    kind === :powerlaw_g && return 1.0
+    if kind === :user_defined
+        return NaN
+    end
+    if kind === :gaussian
+        μ = Float64(g_inhomogeneity.mean)
+        σ = Float64(g_inhomogeneity.std)
+        span = Float64(g_inhomogeneity.span_sigma)
+        σ <= 0 && return 1.0
+        lo = max(0.0, μ - span * σ)
+        hi = μ + span * σ
+        dist = Normal(μ, σ)
+        return cdf(dist, hi) - cdf(dist, lo)
+    end
+    error("coupling_truncation_mass: unsupported g kind $(kind).")
+end
+
+
 function weighted_g_stats_from_bins(g_b_1d, p_g)
     p_sum = sum(p_g)
 
