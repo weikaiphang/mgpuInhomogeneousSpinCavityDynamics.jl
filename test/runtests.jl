@@ -46,7 +46,68 @@ const FAKE_D = (
     kp, d = bspline_antiderivative(c, knots, deg)
     @test bspline_eval(t0, d, kp, deg + 1) ≈ 0 atol=1e-15
     @test bspline_eval(t1, d, kp, deg + 1) ≈ area_id rtol=1e-12
+
+    Bout = Vector{Float64}(undef, n)
+    bspline_basis!(Bout, 0.3, knots, deg)
+    @test Bout ≈ bspline_basis(0.3, knots, deg)
+    C = reshape(c, n, 1)
+    @test bspline_eval(0.3, C, 1, knots, deg) ≈ bspline_eval(0.3, c, knots, deg)
 end
+
+@testset "B-spline / pulse E(t) warm no-alloc" begin
+    n, deg = 6, 3
+    t0, t1 = 0.1, 0.7
+    knots = make_clamped_knots(n, t0, t1, deg)
+    c = collect(range(0.2, 1.4; length=n))
+    tmid = 0.3
+    eval_f() = bspline_eval(tmid, c, knots, deg)
+    eval_f(); eval_f()
+    @test @allocated(eval_f()) == 0
+
+    Bout = Vector{Float64}(undef, n)
+    fill_b() = bspline_basis!(Bout, tmid, knots, deg)
+    fill_b(); fill_b()
+    @test @allocated(fill_b()) == 0
+
+    cd = ForwardDiff.Dual.(c, 1.0)
+    eval_dc() = bspline_eval(tmid, cd, knots, deg)
+    eval_dc(); eval_dc()
+    @test @allocated(eval_dc()) == 0
+
+    dt = ForwardDiff.Dual(tmid, 1.0)
+    eval_dt() = bspline_eval(dt, c, knots, deg)
+    eval_dt(); eval_dt()
+    @test @allocated(eval_dt()) == 0
+
+    pulse = CompositePulse(1, 4, 4, FAKE_D)
+    u = initial_guess(pulse; seed=1)
+    E = build_E_of_t(pulse, u)
+    ts, te, _, _, _ = decode(pulse, u)
+    tm = (ts[1] + te[1]) / 2
+    E(tm); E(0.0)
+    @test @allocated(E(tm)) == 0
+    @test @allocated(E(0.0)) == 0
+    A, f = build_A_f_of_t(pulse, u)
+    A(tm); f(tm)
+    @test @allocated(A(tm)) == 0
+    @test @allocated(f(tm)) == 0
+
+    pulse3 = CompositePulse(3, 4, 4, FAKE_D)
+    u3 = initial_guess(pulse3; seed=2)
+    E3 = build_E_of_t(pulse3, u3)
+    ts3, te3, _, _, _ = decode(pulse3, u3)
+    tm3 = (ts3[2] + te3[2]) / 2
+    gap3 = (te3[1] + ts3[2]) / 2
+    E3(tm3); E3(gap3)
+    @test @allocated(E3(tm3)) == 0
+    @test @allocated(E3(gap3)) == 0
+
+    ud = ForwardDiff.Dual.(u, 1.0)
+    Ed = build_E_of_t(pulse, ud)
+    Ed(tm); Ed(tm)
+    @test @allocated(Ed(tm)) == 0
+end
+
 
 @testset "Gevrey Dual at 0" begin
     naive(x) = x > 0 ? exp(-1 / x) : 0.0

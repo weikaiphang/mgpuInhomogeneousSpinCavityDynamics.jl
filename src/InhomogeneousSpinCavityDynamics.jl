@@ -100,7 +100,7 @@ export plot_E_of_t
 
 export build_full_config, prepare_derived
 export prepare_derived_quadrature, ensemble_method_for, resolve_ensemble_method
-export make_clamped_knots, bspline_basis, bspline_eval, bspline_area, bspline_antiderivative
+export make_clamped_knots, bspline_basis, bspline_basis!, bspline_eval, bspline_area, bspline_antiderivative
 export CompositePulse, n_params, decode, initial_guess, total_area, pulse_duration
 export points_per_segment_for_budget
 export k_of_seed_kind, seed_hs1, seed_composite_with_ghosts, seed_corpse, seed_bb1, seed_bir4, seed_canonical
