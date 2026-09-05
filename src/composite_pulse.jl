@@ -251,6 +251,10 @@ function _pulse_scratch(::Type{T}, knot_lists) where {T}
     return Vector{T}(undef, n0), Vector{T}(undef, n0)
 end
 
+# Scratch Vectors are closed over by one E (or A/f) and are not MT-safe if
+# that same closure is called concurrently. threaded_grad rebuilds E per
+# worker and the ODE is serial on E, so this is OK. If one E is ever shared
+# across tasks, switch these to task-local (see _bspline_tls).
 function build_E_of_t(pulse::CompositePulse, u::AbstractVector)
     t_start, t_end, phi0, cA, cf = decode(pulse, u)
     k = pulse.k

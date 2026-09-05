@@ -384,6 +384,11 @@ end
     rhs_cpu!(du_s, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
     alloc = @allocated rhs_cpu!(du_s, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
     @test alloc == 0
+
+    p_prod = (0.1, 1.5, 0.25, delta_b, g_b, M, nothing, Returns(Et), nothing)
+    rhs_2nd_order!(du_s, u, p_prod, 0.0)
+    alloc2 = @allocated rhs_2nd_order!(du_s, u, p_prod, 0.0)
+    @test alloc2 == 0
 end
 
 @testset "solver/integrator persistent workspace" begin

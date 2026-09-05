@@ -196,6 +196,8 @@ function bspline_antiderivative(c::AbstractVector, knots::AbstractVector, degree
         width = knots[i+degree+1] - knots[i]
         d[i+1] = d[i] + c[i] * width / (degree + 1)
     end
+    # Construct-time only (not the E(t) hot path). One Vector + copyto!;
+    # a new BSpline is allocated here anyway.
     knots_prime = Vector{T}(undef, length(knots) + 2)
     knots_prime[1] = knots[1]
     copyto!(knots_prime, 2, knots, 1, length(knots))

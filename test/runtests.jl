@@ -108,6 +108,41 @@ end
     @test @allocated(Ed(tm)) == 0
 end
 
+@testset "1st-order CPU RHS warm no-alloc" begin
+    M = 24
+    rng = Random.Xoshiro(1)
+    u = randn(rng, ComplexF64, state_length_1st_order(M))
+    du = similar(u)
+    delta_b = Float64[0.1 * (j - 12) for j in 1:M]
+    g_b = fill(0.4, M)
+    E = t -> 1.3 + 0.7im
+    p = (0.1, 1.5, 0.25, delta_b, g_b, M, E)
+    rhs_1st_order!(du, u, p, 0.0)
+    rhs_1st_order!(du, u, p, 0.0)
+    @test @allocated(rhs_1st_order!(du, u, p, 1.3e-6)) == 0
+
+    p_ip = (0.1, 1.5, 0.25, delta_b, g_b, M, E, :ip)
+    rhs_1st_order!(du, u, p_ip, 1.3e-6)
+    rhs_1st_order!(du, u, p_ip, 1.3e-6)
+    @test @allocated(rhs_1st_order!(du, u, p_ip, 1.3e-6)) == 0
+
+    pulse = CompositePulse(1, 4, 4, FAKE_D)
+    uu = initial_guess(pulse; seed=1)
+    Ep = build_E_of_t(pulse, uu)
+    pp = (0.1, 1.5, 0.25, delta_b, g_b, M, Ep)
+    rhs_1st_order!(du, u, pp, 2.0e-5)
+    rhs_1st_order!(du, u, pp, 2.0e-5)
+    @test @allocated(rhs_1st_order!(du, u, pp, 2.0e-5)) == 0
+
+    u1d = Complex.(ForwardDiff.Dual.(real.(u), 0.0), ForwardDiff.Dual.(imag.(u), 0.0))
+    du1d = similar(u1d)
+    Ed = t -> Complex(ForwardDiff.Dual(1.3, 0.01), ForwardDiff.Dual(0.7, 0.0))
+    pd = (0.1, 1.5, 0.25, delta_b, g_b, M, Ed)
+    rhs_1st_order!(du1d, u1d, pd, 0.0)
+    rhs_1st_order!(du1d, u1d, pd, 0.0)
+    @test @allocated(rhs_1st_order!(du1d, u1d, pd, 1.3e-6)) == 0
+end
+
 
 @testset "Gevrey Dual at 0" begin
     naive(x) = x > 0 ? exp(-1 / x) : 0.0
