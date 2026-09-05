@@ -3,10 +3,6 @@ using InhomogeneousSpinCavityDynamics
 OUTDIR = joinpath(@__DIR__, "..", "data")
 mkpath(OUTDIR)
 
-# 2nd-order RASE / WURST-pulse demonstration, sharded over the ensemble.
-# On a single GPU this still runs the full multi-shard code path if you set
-# `nshards` larger than 1 (virtual sharding).  On a multi-GPU node, omit
-# `device_ids` and the solver will use every visible device.
 
 SIM_SETTING = (
     simulation_order = :order2,
@@ -19,10 +15,9 @@ SIM_SETTING = (
     abstol  = 1e-8,
     saved_file_name = joinpath(OUTDIR, "rase_2nd_mgpu.jld2"),
 
-    # --- multi-GPU ---
-    nshards    = 1,                 # raise to the number of GPUs
-    integrator = :tsit5,            # or :ck45 to cut register count from 9 to 5
-    save_mode  = :tstops,           # :interpolate is faster with many output times
+    nshards    = 1,
+    integrator = :tsit5,
+    save_mode  = :tstops,
 )
 
 SYSTEM_CONFIG = (

@@ -1,16 +1,3 @@
-# ============================================================
-# DEVICE TOPOLOGY AND WORK DISPATCH
-# ============================================================
-
-"""
-    Executor(nshards; threaded)
-
-Issues per-shard work either from one host thread (switching CUDA devices
-between launches) or from one Julia task per shard.  Kernel launches are
-asynchronous either way, so the sequential executor still keeps every GPU
-busy; threading only removes host-side launch latency, which matters once
-there are many shards or the per-stage kernels are short.
-"""
 struct Executor
     threaded::Bool
 end
@@ -26,14 +13,6 @@ function Executor(ns::Integer; threaded::Union{Nothing,Bool} = nothing)
     return Executor(th)
 end
 
-"""
-    each_shard(f, shards, exec)
-
-Run `f(shard)` for every shard with that shard's device active, and return
-only once all of them have been issued.  The host barrier at the end is what
-makes cross-device event synchronisation safe: every `record` for a stage is
-enqueued before any `wait` on it.
-"""
 function each_shard(f::F, shards, exec::Executor) where {F}
     if exec.threaded && length(shards) > 1
         @sync for s in shards
@@ -51,17 +30,6 @@ function each_shard(f::F, shards, exec::Executor) where {F}
     return nothing
 end
 
-"""
-    resolve_devices(nshards, device_ids)
-
-Map shards onto physical CUDA devices.
-
-* `device_ids === nothing` uses every visible device, one shard each.
-* An explicit vector may repeat a device id, which places several shards on
-  the same GPU.  That "virtual sharding" mode runs the full multi-shard code
-  path (separate streams, peer copies, cross-stream events) on a single GPU
-  and is what the shard-invariance tests use.
-"""
 function resolve_devices(ns::Union{Nothing,Integer}, device_ids::Union{Nothing,AbstractVector})
     CUDA.functional() || error("CUDA is not functional; no GPU available.")
 
@@ -77,7 +45,6 @@ function resolve_devices(ns::Union{Nothing,Integer}, device_ids::Union{Nothing,A
             Requested more shards than visible GPUs; shards will share devices.
             """ nshards=n ndevices=ndev
         end
-        # round-robin so that n > ndev still balances
         return [all_devs[mod1(p, ndev)] for p in 1:n]
     else
         ids = collect(device_ids)
@@ -91,14 +58,6 @@ function resolve_devices(ns::Union{Nothing,Integer}, device_ids::Union{Nothing,A
     end
 end
 
-"""
-    enable_peer_access!(devs)
-
-Best-effort enabling of peer-to-peer access between all distinct devices.
-Returns the fraction of ordered device pairs that support P2P; pairs without
-it silently fall back to staging through host memory, which only affects the
-tiny row-sum exchange.
-"""
 function enable_peer_access!(devs)
     uniq = unique(devs)
     length(uniq) <= 1 && return 1.0

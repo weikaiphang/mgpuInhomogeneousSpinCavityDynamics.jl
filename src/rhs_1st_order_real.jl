@@ -1,22 +1,3 @@
-# ============================================================
-# Real isomorphic split of the 1st-order mean-field state, and the
-# Jacobian-transpose (VJP) of rhs_1st_order! as an R^{2N} → R^{2N} map.
-#
-# Layout (N = 1+2M complex = a, Sp[1:M], Sz[1:M]):
-#   x = [Re(a), Im(a), Re(Sp)..., Im(Sp)..., Re(Sz)..., Im(Sz)...]
-# length 2N = 2+4M. This matches the stored Complex state, including
-# Im(Sz), which the Complex layout carries even though dSz is real for
-# real g. Do NOT drop Im(Sz) here — that would be a different map than
-# the production RHS.
-#
-# rhs_1st_order_real! is a pack/call/unpack wrapper around the unmodified
-# rhs_1st_order!, so F_x is algebraically the production vector field.
-# rhs_1st_order_vjp! is the analytic J_x^T (real g, real detunings — the
-# ensemble's g_b/delta_b). It is verified against ForwardDiff of F_x on
-# the toy ensemble; it is NOT used to replace rhs_1st_order! on the
-# forward solve.
-# ============================================================
-
 real_state_length_1st_order(M::Integer) = 2 * state_length_1st_order(M)
 
 @inline _real_idx_ar() = 1
@@ -91,14 +72,6 @@ function complex_to_real!(x::AbstractVector, u::AbstractVector, M::Integer)
     return pack_state_real!(x, u, M)
 end
 
-"""
-    rhs_1st_order_real!(dx, x, p, t)
-
-Real-split image of `rhs_1st_order!`: unpack `x` → complex `u`, call the
-production RHS, pack `du` → `dx`. `p` is the same 7-tuple the complex
-RHS uses. Allocates a pair of complex work vectors (used in tests and
-the algebraic identity, not on the adjoint hot path).
-"""
 function rhs_1st_order_real!(dx, x, p, t)
     M = p[6]
     N = state_length_1st_order(M)
@@ -114,14 +87,6 @@ function rhs_1st_order_real!(dx, x, p, t)
     return nothing
 end
 
-"""
-    rhs_1st_order_vjp!(x̄, λ, x, p, t)
-
-`x̄ = J_x(x,t)^T λ` for the real-split production RHS, with real `g_b`
-and real `delta_b` (the ensemble). `p` is the same 7-tuple; `E_of_t` is
-ignored (θ-dependence of the drive is accumulated separately from the
-cavity components of `λ`). `x`, `λ`, `x̄` are length-`2N` real vectors.
-"""
 function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::AbstractVector, p, t)
     delta0, kappa_e, kappa_i, delta_b, g_b, M, _ = p
     n = real_state_length_1st_order(M)
@@ -153,7 +118,6 @@ function rhs_1st_order_vjp!(x̄::AbstractVector, λ::AbstractVector, x::Abstract
         λpr = λ[_real_idx_pr(j, M)]
         λpi = λ[_real_idx_pi(j, M)]
         λzr = λ[_real_idx_zr(j, M)]
-        # dzi/dt ≡ 0 for real g: λzi does not enter J^T.
 
         two_g = 2 * gj
         x̄ar += two_g * (λpr * zi - λpi * zr + λzr * pi_)

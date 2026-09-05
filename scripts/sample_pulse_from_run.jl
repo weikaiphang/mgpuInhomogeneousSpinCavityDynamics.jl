@@ -1,33 +1,3 @@
-# ============================================================
-# BATCH-SAMPLE THE DRIVE PULSE FOR EVERY SAVED RUN
-#
-# Recursively scans a root directory (default: data/) for *.jld2
-# files. For each one, if a corresponding *_pulsemat.csv does not
-# already exist alongside it, rebuilds that run's own E_of_t from
-# its saved PULSE_CONFIG (rather than retyping pulse parameters by
-# hand) and samples it via sample_E_of_t(...; savepath=...), which
-# writes the (N, 2) matrix [Re[E(t)] Im[E(t)]] as a plain CSV, with the
-# total pulse length (microseconds) on a leading "# t_end_us,..." comment
-# line -- see save_E_samples's own docstring for the exact format and the
-# Python read pattern (numpy.loadtxt(path, delimiter=",", skiprows=2)).
-#
-# "Corresponding" means same directory, same basename:
-#   data/run_001.jld2  ->  data/run_001_pulsemat.csv
-#
-# Already-existing *_pulsemat.csv files are left untouched, so
-# re-running this script after adding new runs only fills in the
-# gaps.
-#
-# Usage:
-#   julia --project=. scripts/sample_pulse_from_run.jl [root_dir] [N_samples]
-#
-#   root_dir  -- defaults to data/ (relative to the package root).
-#   N_samples -- defaults to that run's own SIM_SETTING.Nt_save
-#                (one sample per saved time point); pass an
-#                explicit value to use the same sample count for
-#                every run instead.
-# ============================================================
-
 using InhomogeneousSpinCavityDynamics
 using JLD2
 
@@ -36,9 +6,6 @@ N_OVERRIDE = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : nothing
 
 isdir(ROOT_DIR) || error("No such directory: $ROOT_DIR")
 
-# ============================================================
-# DISCOVER *.jld2 FILES
-# ============================================================
 
 function find_jld2_files(root)
     paths = String[]
@@ -59,15 +26,6 @@ jld2_files = find_jld2_files(ROOT_DIR)
 println("Found $(length(jld2_files)) .jld2 file(s) under $ROOT_DIR")
 println()
 
-# ============================================================
-# GENERATE MISSING PULSE MATRICES
-#
-# Wrapped in a function (rather than left at top-level) so the
-# loop body is a normal function scope: n_generated/n_skipped/
-# n_failed are then unambiguous locals, avoiding Julia's
-# top-level soft-scope warnings (and resulting UndefVarErrors)
-# for loop-local assignment.
-# ============================================================
 
 function generate_missing_pulse_matrices(jld2_files, N_OVERRIDE)
     n_generated = 0

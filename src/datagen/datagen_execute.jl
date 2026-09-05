@@ -1,27 +1,3 @@
-# ============================================================
-# Ensemble split, trajectory execution, reduced save.
-#
-# From a simulconfig (SYSTEM + PULSE), at simulate time:
-#   1. Ttotal from the pulse timeline (+ system settle).
-#   2. M_delta_min = Ttotal * BW / 2π  (Dirichlet / Fourier bound).
-#   3. Default split, under M = M_delta * M_g ≤ M_cap and safety ≥ 3:
-#        - constant g: M_g = 1, largest safety with M_delta ≤ M_cap
-#        - continuous g: largest M_g ≤ M_g_cap that still allows
-#          safety ≥ 3, then largest M_delta for that M_g.
-#      If the floor cannot fit under M_cap, the split errors.
-#   4. M-sizing n>1 adds extra grids at safeties equally spaced on
-#      (3, S], including S; the floor 3 itself is not a sample.
-# Caps, ICs, Nt_save, and n_sizes come from simulate-time run params.
-# Result files are named {stem}_{ic}_Md{M_delta}_Mg{M_g}_Nt{Nt_save}.jld2
-# with ic in DATAGEN_TRACKS (ground, inverted, equator, weak, weak_inverted);
-# skip if that path and its pulsemat csv both exist and are non-empty.
-#
-# Trajectories are dispatched one-per-functional-CUDA-device (CPU if none).
-# Concurrent GPU occupancy needs julia -t N with N >= number of GPUs.
-# After every job the owning worker synchronizes, GC.gc(false), and
-# CUDA.reclaim()s that device; the pool reclaims every device on exit.
-# ============================================================
-
 const _DATAGEN_IO_LOCK = ReentrantLock()
 const _DATAGEN_MANIFEST_LOCK = ReentrantLock()
 
@@ -45,14 +21,6 @@ function _cannot_meet_safety(safety_min, M_delta_needed, M_delta_min, M_cap)
     )
 end
 
-"""
-    compute_optimal_splitting(freq_inhomogeneity, g_inhomogeneity, T_max;
-                              M_cap=RULE_M_CAP, M_g_max=RULE_M_G_MAX,
-                              safety_min=RULE_SAFETY_MIN) -> NamedTuple
-
-Largest M_g ≤ M_g_max (or 1 if g is constant) and largest Fourier safety
-such that M_delta * M_g ≤ M_cap and M_delta / M_delta_min ≥ safety_min.
-"""
 function compute_optimal_splitting(
     freq_inhomogeneity,
     g_inhomogeneity,
@@ -173,16 +141,9 @@ function safety_targets(default_safety::Real, n_sizes::Integer)
     n_sizes == 1 && return [Float64(default_safety)]
     S = Float64(default_safety)
     S <= RULE_SAFETY_MIN && return [S]
-    # n points on (3, S], equally spaced, including S.
     return collect(range(RULE_SAFETY_MIN, S; length = n_sizes + 1)[2:end])
 end
 
-"""
-Default split (max safety under the cap, safety ≥ 3), plus n_sizes-1 extra
-grids whose target safeties are equally spaced on (3, default_safety].
-n_sizes == 1 is the default split only. Duplicate (M_delta, M_g) pairs
-are dropped.
-"""
 function splits_for_run(sys, Ttotal::Float64, run)
     default = splitting_for_run(sys, Ttotal; M_cap = run.M_cap, M_g_max = run.M_g_max)
     targets = safety_targets(default.safety_factor, run.n_sizes)
@@ -267,7 +228,7 @@ function reduce_trajectory(t, a, Sp, Sz, d, E_of_t)
         idelta_res = idelta_res,
         delta_res = delta_res,
         keep_bins = keep_bins,
-        g_keep = collect(d.g_b_1d),  # 1-D g grid, length M_g (not the flat M-vector)
+        g_keep = collect(d.g_b_1d),
         delta_keep = fill(delta_res, M_g),
         Sp_keep = Sp_keep,
         Sz_keep = Sz_keep,
@@ -305,8 +266,6 @@ function save_datagen_result(filename, data, E_of_t)
     catch
         isfile(jld_tmp) && rm(jld_tmp; force=true)
         isfile(csv_tmp) && rm(csv_tmp; force=true)
-        # A half-written dest pair must not look skippable, and must not
-        # linger as a jld2 without its pulsemat sibling.
         if committed_jld && !committed_csv
             isfile(filename) && rm(filename; force=true)
         elseif committed_jld && committed_csv
@@ -339,15 +298,6 @@ function _tracks_help_tokens()
         "cannon (=ground,equator), approx (=ground,weak), all"
 end
 
-"""
-    parse_tracks(s) -> Tuple{Vararg{Symbol}}
-
-Parse `--tracks` / `--default-conditions`. Comma-separated tokens,
-order-preserving, duplicates dropped. Tokens: `ground`, `inverted`,
-`equator` (`equatorial`), `weak`, `weak_inverted`. Groups: `poles`,
-`precess`, `cannon`, `approx`, `all`. These are ICs, not the optimizer
-cost-mode `track` (`:weak` default / `:dual` opt-in).
-"""
 function parse_tracks(s::AbstractString)
     raw = strip(String(s))
     isempty(raw) && error(
@@ -446,8 +396,6 @@ function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString
     elapsed = (time_ns() - t0) / 1e9
 
     reduced = reduce_trajectory(t, a, Sp, Sz, d, E_of_t)
-    # Host trajectories are Nt × M; drop them before the JLD2 write so the
-    # peak RSS is the reduced payload, not reduced + raw.
     t = nothing
     a = nothing
     Sp = nothing
@@ -460,9 +408,6 @@ function run_one_ic(sys, PULSE_SPEC, ic::Symbol, saved_file_name::AbstractString
             SYSTEM_CONFIG = sys,
             PULSE_CONFIG = PULSE_SPEC.segments,
             PULSE_SPEC = PULSE_SPEC,
-            # Analytic WURST/Gaussian segments are package-legal PULSE_CONFIG.
-            # Composite records are not: rebuild with materialize_pulse_config(PULSE_SPEC)
-            # or use the sibling _pulsemat.csv (jld2 loader load_mode=:csv).
             pulse_rebuild = any(seg -> seg.kind === :composite_record, PULSE_SPEC.segments) ?
                 "pulse_spec" : "pulse_config",
             elapsed_seconds = elapsed,
@@ -484,10 +429,6 @@ function _datagen_println(io_args...)
     return nothing
 end
 
-"""
-Functional CUDA devices for datagen. Empty if CUDA is missing or unusable.
-Uses every device (no 8-GPU pulse-optimizer cap).
-"""
 function datagen_cuda_devices()
     try
         CUDA.functional() || return Any[]
@@ -512,11 +453,6 @@ function describe_datagen_compute(n_jobs::Integer=0; n_gpu::Union{Nothing,Int}=n
     return "$n_gpu_eff CUDA GPU(s)  julia_threads=$n_th  concurrent=$(n_workers)"
 end
 
-"""
-Idle the current CUDA device, drop unreachable `CuArray`s, and return the
-CUDA.jl cached-free pool to the driver. No-op without a functional device.
-Never throws. Call only from the worker that owns this device.
-"""
 function datagen_reclaim_current_gpu!()
     try
         CUDA.functional() || return nothing
@@ -528,10 +464,6 @@ function datagen_reclaim_current_gpu!()
     return nothing
 end
 
-"""
-`synchronize` + `reclaim` on every listed device. Restores the caller's
-current device. Call only when no datagen ODE is in flight.
-"""
 function datagen_reclaim_all_gpus!(devices)
     isempty(devices) && return nothing
     try
@@ -640,23 +572,10 @@ function _execute_datagen_job(job, compute::Symbol, worker_tag::AbstractString)
         _datagen_println("[$(worker_tag)] [$(job.stem) $(job.key)] FAILED: ", msg)
         return _job_outcome_failed(job, worker_tag, msg)
     finally
-        # Solver already reclaimed primal GPU buffers; this catches host
-        # arrays and any leftover cached pool on *this* worker's device.
         datagen_reclaim_current_gpu!()
     end
 end
 
-"""
-Run independent trajectories concurrently: one in-flight ODE per CUDA
-device. Falls back to CPU thread workers when no GPU is available.
-
-Every index of the returned vector is assigned, including jobs that never
-started (marked `failed` with an explanatory `error`). `InterruptException`
-is rethrown after that fill and after reclaiming every device.
-
-`executor` and `on_complete` are for the self-test and for crash-safe
-in-memory report updates; production simulate uses the defaults.
-"""
 function run_datagen_jobs!(jobs; executor=_execute_datagen_job, on_complete=nothing)
     n = length(jobs)
     n == 0 && return NamedTuple[]

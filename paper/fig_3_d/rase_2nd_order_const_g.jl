@@ -1,9 +1,6 @@
 using InhomogeneousSpinCavityDynamics
 using Printf
 
-# ============================================================
-# 1) USER SETTINGS
-# ============================================================
 
 SWEEP_OUTDIR = joinpath(
     @__DIR__,
@@ -15,7 +12,6 @@ SWEEP_OUTDIR = joinpath(
 
 mkpath(SWEEP_OUTDIR)
 
-# Cooperativity values to sweep.
 C_values = [
     0.05,
     0.2,
@@ -24,48 +20,33 @@ C_values = [
     0.8,
 ]
 
-# Skip simulations whose output files already exist.
 SKIP_EXISTING = true
 
 
-# ============================================================
-# 2) BASE SIMULATION SETTINGS
-# ============================================================
 
 BASE_SIM_SETTING = (
-    # --- simulation order ---
     simulation_order = :order2,
 
-    # --- discretization ---
     M_delta = 375,
     M_g     = 1,
 
-    # --- initial condition ---
     initial_condition = :inverted,
 
-    # --- simulation time ---
     Ttotal = 150e-6,
 
-    # --- solver ---
     Nt_save = 5001,
     reltol  = 1e-8,
     abstol  = 1e-8,
 )
 
 
-# ============================================================
-# 3) FIXED SYSTEM PARAMETERS
-# ============================================================
 
 BASE_SYSTEM_CONFIG = (
-    # C_ens is inserted separately for every sweep point.
 
-    # --- cavity ---
     delta0  = 0.0,
     kappa_e = 2π * 1e6,
     kappa_i = 2π * 0.0,
 
-    # --- detuning distribution ---
     freq_inhomogeneity = (
         kind        = :lorentzian,
         FWHM        = 2π * 1e6,
@@ -73,7 +54,6 @@ BASE_SYSTEM_CONFIG = (
         renormalize = false,
     ),
 
-    # --- coupling distribution ---
     g_inhomogeneity = (
         kind        = :constant,
         g_value     = 2π * 100.0,
@@ -82,21 +62,12 @@ BASE_SYSTEM_CONFIG = (
 )
 
 
-# ============================================================
-# 4) OUTPUT-FILENAME HELPER
-# ============================================================
 
 function make_number_tag(x)
-    # Examples:
-    # 0.050 -> "0p050"
-    # 0.600 -> "0p600"
     return replace(@sprintf("%.3f", x), "." => "p")
 end
 
 
-# ============================================================
-# 5) PULSE-CONFIGURATION HELPER
-# ============================================================
 
 function build_pulse_config(SYSTEM_CONFIG)
     return (
@@ -128,14 +99,10 @@ function build_pulse_config(SYSTEM_CONFIG)
 end
 
 
-# ============================================================
-# 6) COOPERATIVITY SWEEP
-# ============================================================
 
 function run_sweep()
     N_runs = length(C_values)
 
-    # Convert the fixed coupling from rad/s to Hz for printing.
     g_value_Hz = (
         BASE_SYSTEM_CONFIG.g_inhomogeneity.g_value /
         (2π)
@@ -151,9 +118,6 @@ function run_sweep()
 
     for (run_index, C_ens) in enumerate(C_values)
 
-        # ----------------------------------------------------
-        # Construct a unique output filename
-        # ----------------------------------------------------
 
         C_tag = make_number_tag(C_ens)
 
@@ -172,18 +136,12 @@ function run_sweep()
         println("Output file = $saved_file_name")
         println("------------------------------------------------------------")
 
-        # ----------------------------------------------------
-        # Optionally skip completed simulations
-        # ----------------------------------------------------
 
         if SKIP_EXISTING && isfile(saved_file_name)
             println("Output file already exists. Skipping this run.")
             continue
         end
 
-        # ----------------------------------------------------
-        # Construct simulation settings
-        # ----------------------------------------------------
 
         SIM_SETTING = merge(
             BASE_SIM_SETTING,
@@ -192,9 +150,6 @@ function run_sweep()
             ),
         )
 
-        # ----------------------------------------------------
-        # Construct system configuration
-        # ----------------------------------------------------
 
         SYSTEM_CONFIG = merge(
             BASE_SYSTEM_CONFIG,
@@ -203,15 +158,9 @@ function run_sweep()
             ),
         )
 
-        # ----------------------------------------------------
-        # Construct pulse configuration
-        # ----------------------------------------------------
 
         PULSE_CONFIG = build_pulse_config(SYSTEM_CONFIG)
 
-        # ----------------------------------------------------
-        # Run simulation
-        # ----------------------------------------------------
 
         run_simulation(
             SIM_SETTING,
@@ -222,9 +171,6 @@ function run_sweep()
         println("Run $run_index finished.")
     end
 
-    # ========================================================
-    # 7) FINISH
-    # ========================================================
 
     println()
     println("============================================================")

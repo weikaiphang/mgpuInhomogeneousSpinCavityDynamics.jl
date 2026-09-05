@@ -5,7 +5,6 @@ using Random
 using DifferentialEquations
 using DiffEqCallbacks
 
-# Include the pulse stack without loading the full CUDA package.
 include(joinpath(@__DIR__, "..", "src", "bspline.jl"))
 include(joinpath(@__DIR__, "..", "src", "composite_pulse.jl"))
 include(joinpath(@__DIR__, "..", "src", "canon_pulses.jl"))
@@ -108,7 +107,6 @@ end
     @test count(active) >= 8
     @test f1[findfirst(active)] < f1[findlast(active)]
 
-    # inversion already 0.5 → unit amplitude scale; chirp_bandwidth=0 keeps phase
     pulse_amp, u_amp, report_amp, _ = generate_interior_seed(
         u, 0.5, 0.5, pulse, FAKE_D;
         N_samples=N, param_budget=40, chirp_bandwidth=0.0,
@@ -129,7 +127,6 @@ end
 
 @testset "w_tmax default is identically zero" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D)
-    # Large positive raw duration/gap so t_end can exceed T_max.
     u = initial_guess(pulse; seed=1)
     u[1:2] .= 20.0
     _, t_end, _, _, _ = decode(pulse, u)
@@ -180,9 +177,9 @@ end
     u_c = seed_corpse(p5, p5.amp_scale)
     @test length(u_c) == n_params(p5)
     _, _, _, cA5, cf5 = decode(p5, u_c)
-    @test all(cA5[:, 2] .< cA5[:, 1])  # ghost amplitude << active
+    @test all(cA5[:, 2] .< cA5[:, 1])
     @test all(cA5[:, 4] .< cA5[:, 3])
-    @test cf5[1, 2] != 0  # ghost chirp for π jump
+    @test cf5[1, 2] != 0
 
     p7 = CompositePulse(7, 4, 4, FAKE_D)
     u_b = seed_bb1(p7, p7.amp_scale)
@@ -197,16 +194,12 @@ end
     @test all(cA4 .> 0)
     @test all(te4 .> ts4)
     @test issorted(ts4)
-    # amplitude nodes at the quarter points: segments start full / end near
-    # zero (seg 1, 3) and vice versa (seg 2, 4)
     @test cA4[1, 1] > cA4[end, 1]
     @test cA4[end, 2] > cA4[1, 2]
-    # discrete phase jumps Δφ and −Δφ around the inner segments (θ = π)
     @test phi4[1] == 0
     @test phi4[2] ≈ pi + pi / 2
     @test phi4[3] == 0
     @test phi4[4] ≈ -(pi + pi / 2)
-    # frequency sweep is antisymmetric between the paired segments
     @test cf4[1, 1] ≈ 0 atol = 1e-12
     @test cf4[1, 2] < 0
     @test_throws ErrorException seed_bir4(p1, p1.amp_scale)
@@ -231,19 +224,12 @@ end
     @test Sz_g ≈ .-Nj ./ 2
     @test all(iszero, Sp_i)
     @test Sz_i ≈ Nj ./ 2
-    # :equator is the true macroscopic equator (Sz = 0, Sp = Nj/2) -- kept,
-    # but NOT used by the dual-trajectory cost (radiates / outside HP).
     @test real.(Sp_e) ≈ Nj ./ 2
     @test all(iszero, imag.(Sp_e))
     @test all(iszero, Sz_e)
-    # :weak = paper App. B weak-excitation seed: near-|g⟩ (Sz = -Nj/2) with a
-    # tiny +x coherence Sp = ε·Nj/2, ε = _WEAK_SEED ≪ 1. Sp(0) is held at
-    # EXACTLY ε·Nj/2 (matches _weighted_silencing_factor's initial-overlap
-    # denominator); the O(ε²) off-sphere excess is negligible.
     @test real.(Sp_w) ≈ _WEAK_SEED .* Nj ./ 2
     @test all(iszero, imag.(Sp_w))
     @test Sz_w ≈ .-Nj ./ 2
-    # :weak_inverted = the :inverted analogue (Sz = +Nj/2, same ε seed).
     @test real.(Sp_wi) ≈ _WEAK_SEED .* Nj ./ 2
     @test all(iszero, imag.(Sp_wi))
     @test Sz_wi ≈ Nj ./ 2
@@ -259,10 +245,6 @@ end
     @test CompositePulse(1, 4, 4, FAKE_D) isa CompositePulse
 end
 
-# Small ensemble to actually exercise the ODE-solve path (run_sim_1st_order_pure,
-# pulse_cost, run_local_adam) -- FAKE_D above only carries what CompositePulse's
-# constructor needs; rhs_1st_order! additionally needs M/Nj/delta0/kappa_e/
-# kappa_i/delta_b/g_b.
 const FAKE_D_ODE = merge(FAKE_D, (
     M = 3,
     Nj = [2.0, 4.0, 6.0],
@@ -287,10 +269,7 @@ const FAKE_D_ODE = merge(FAKE_D, (
     @test 0 <= sil <= 1
     @test 0 <= coh <= 1
     @test 0 <= famp <= 1
-    # coherence is the per-slice MAGNITUDE bound on |F|_⋆ (triangle ineq)
     @test coh >= sil - 1e-12
-    # weak_seed_retention is coherence's un-clamped value: equal while ≤ 1,
-    # and ≥ coherence always (clamp only ever lowers).
     @test ret >= coh - 1e-12
     @test isfinite(ret) && ret >= 0
 
@@ -301,16 +280,6 @@ const FAKE_D_ODE = merge(FAKE_D, (
     @test sil2 == sil
     @test dur ≈ pulse_duration(pulse, u0)
 
-    # ForwardDiff.gradient through a real ODE solve, cross-checked against
-    # finite differences (this is the claim CompositePulse's own module
-    # docstring makes about raw_gap/the taper window -- verify it here too).
-    # The relerr denominator carries an absolute floor (as test/adjoint.jl's
-    # own `_relmax` does): the global-drive-phase parameter has a STRUCTURAL
-    # zero gradient (both inversion and the per-slice |F| are invariant to a
-    # common phase), so its one-sided FD estimate is pure solver-FP noise
-    # (~1e-11) that a bare `max(|g|, 1e-8)` would inflate into a false ~1e-3
-    # relative error. Any genuinely wrong component (|g| ≫ floor) is still
-    # checked strictly.
     g = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE)[1], u0)
     @test all(isfinite, g)
     eps = 1e-6
@@ -323,16 +292,10 @@ const FAKE_D_ODE = merge(FAKE_D, (
     relerr = abs.(g .- fd) ./ max.(abs.(g), abs.(fd), 1e-6)
     @test maximum(relerr) < 1e-3
 
-    # kappa_I=kappa_S=0.0 (explicit) must reproduce the legacy, unbarriered
-    # inversion*silencing_success formula bit-for-bit -- I_min/S_min are
-    # irrelevant at kappa=0 (0.5*0*x^2 == 0.0 exactly for any finite x).
     cost_nopenalty = pulse_cost(u0, pulse, FAKE_D_ODE; kappa_I=0.0, kappa_S=0.0)
     cost_nopenalty2 = pulse_cost(u0, pulse, FAKE_D_ODE; I_min=0.3, kappa_I=0.0, S_min=0.99, kappa_S=0.0)
     @test cost_nopenalty === cost_nopenalty2
 
-    # ForwardDiff.gradient vs finite difference at nontrivial squared-hinge
-    # penalty settings -- the SAME check as above, repeated over a grid
-    # spanning inversion-only, silencing-only, and both penalties active.
     for (I_min, kI, S_min, kS) in ((0.99, 5.0, 0.0, 0.0), (0.0, 0.0, 0.99, 5.0), (0.9, 3.0, 0.9, 8.0))
         costb = pulse_cost(u0, pulse, FAKE_D_ODE; I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1]
         gb = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1], u0)
@@ -347,26 +310,11 @@ const FAKE_D_ODE = merge(FAKE_D, (
         @test maximum(relerrb) < 1e-3
     end
 
-    # g_b = 0 decouples spins from the drive AND from the cavity mode
-    # entirely: :ground never inverts, and _weighted_inversion's own
-    # bright-mode weight Nj*g^2 is exactly zero everywhere -> inversion
-    # == 0.0. The per-frequency-slice silencing factor (see
-    # _weighted_silencing_factor) likewise has zero bright-mode density
-    # n(omega) = sum(Nj g^2) in every slice, so |F|_* collapses to its own
-    # epsilon floor (~0), NOT to 1.0: g=0 means no coupling channel into
-    # the cavity at all, a genuinely different statement than "the spins
-    # stay locally coherent" (they do -- :weak's own Sp never decays
-    # here -- this metric just doesn't measure that).
     d_nog = merge(FAKE_D_ODE, (g_b = zeros(FAKE_D_ODE.M),))
     inv_nog, sil_nog = pulse_metrics(u0, pulse, d_nog)
     @test inv_nog == 0.0
     @test sil_nog < 1e-6
 
-    # Direct regression guard: inversion == 0.0 EXACTLY here, deep inside
-    # the squared-hinge penalty's own activation region (0 < I_min) -- the
-    # correct gradient still must be finite and match FD (unlike the old
-    # power-law barrier, this penalty's own gradient at the violation is
-    # LINEAR (-kappa_I*(I_min-inversion)), never vanishing at inversion=0).
     cost_nog = pulse_cost(u0, pulse, d_nog; kappa_I=5.0)[1]
     g_nog = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, d_nog; kappa_I=5.0)[1], u0)
     @test all(isfinite, g_nog)
@@ -379,7 +327,6 @@ const FAKE_D_ODE = merge(FAKE_D, (
     relerr_nog = abs.(g_nog .- fd_nog) ./ max.(abs.(g_nog), 1e-8)
     @test maximum(relerr_nog) < 1e-3
 
-    # dual-trajectory cost/metrics fix their own initial conditions
     @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; initial_condition=:ground)
     @test_throws ErrorException pulse_metrics(u0, pulse, FAKE_D_ODE; initial_condition=:ground)
 end
@@ -393,10 +340,8 @@ end
 
     inv_d, sil_d, coh_d, famp_d, ret_d = pulse_metrics(u0, pulse, FAKE_D_ODE; track=:dual)
     inv_w, sil_w, coh_w, famp_w, ret_w = pulse_metrics(u0, pulse, FAKE_D_ODE; track=:weak)
-    # silencing/coherence/field_amp/retention come from the SAME :weak solve either way
     @test sil_w == sil_d
     @test coh_w == coh_d && famp_w == famp_d && ret_w == ret_d
-    # inversion:weak differs from inversion:ground only at O(ε) (ε = _WEAK_SEED = 1e-3)
     @test abs(inv_w - inv_d) < 5e-3
     @test 0 <= inv_w <= 1
 
@@ -404,14 +349,12 @@ end
     @test isfinite(cost_w)
     @test i2 == inv_w && s2 == sil_w && c2 == coh_w && f2 == famp_w && r2 == ret_w
 
-    # single-track threaded gradient == serial ForwardDiff of pulse_cost(track=:weak)
     g_serial = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; track=:weak)[1], u0)
     g_thr, cost_thr, inv_thr, sil_thr = _pulse_cost_grad_threaded(u0, pulse, FAKE_D_ODE; track=:weak)
     @test cost_thr == cost_w
     @test inv_thr == inv_w && sil_thr == sil_w
     @test maximum(abs.(g_thr .- g_serial) ./ max.(abs.(g_thr), abs.(g_serial), 1e-6)) < 1e-9
 
-    # FD check on the single-track cost
     eps = 1e-6
     fd = similar(g_serial)
     for i in eachindex(u0)
@@ -420,7 +363,6 @@ end
     end
     @test maximum(abs.(g_serial .- fd) ./ max.(abs.(g_serial), abs.(fd), 1e-6)) < 1e-3
 
-    # optimiser + k-hopping smoke, and track is recorded
     r = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE; track=:weak,
         num_epochs=2, n_hops=1, patience=2, hop_patience=1, tol=1e-3, seed=1,
         label_prefix="[oc-weak] ")
@@ -428,22 +370,19 @@ end
     @test isfinite(r[2])
     @test all(haskey(h, :weak_seed_retention) for h in r[6])
 
-    # automatic winner re-check: optimizer_settings carries the canonical
-    # :ground inversion of the winner and the O(ε) bias (one extra :ground
-    # solve for track=:weak; reused, gap==0, for track=:dual).
     @test haskey(r[8], :final_inversion_ground) && haskey(r[8], :final_inv_gap)
     inv_g = pulse_metrics(r[1], r[3], FAKE_D_ODE; track=:dual)[1]
     inv_w = pulse_metrics(r[1], r[3], FAKE_D_ODE; track=:weak)[1]
     @test r[8].final_inversion_ground ≈ inv_g atol=1e-10
     @test r[8].final_inv_gap ≈ inv_w - inv_g atol=1e-10
-    @test abs(r[8].final_inv_gap) < 5e-3               # O(ε) bias
+    @test abs(r[8].final_inv_gap) < 5e-3
     @test r[8].final_inv_gap ≈ r[7][2] - r[8].final_inversion_ground atol=1e-12
 
     rd = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE; track=:dual,
         num_epochs=2, n_hops=1, patience=2, hop_patience=1, tol=1e-3, seed=1,
         label_prefix="[oc-dual] ")
-    @test rd[8].final_inv_gap == 0.0                   # :dual scored inversion on :ground already
-    @test rd[8].final_inversion_ground == rd[7][2]     # no extra solve, reused
+    @test rd[8].final_inv_gap == 0.0
+    @test rd[8].final_inversion_ground == rd[7][2]
 end
 
 @testset "threaded gradient matches serial" begin
@@ -464,8 +403,6 @@ end
         @test coh_t == coh_s
     end
 
-    # SAME cross-check at nontrivial squared-hinge penalty settings,
-    # threaded into both sides.
     for (I_min, kI, S_min, kS) in ((0.99, 5.0, 0.0, 0.0), (0.0, 0.0, 0.99, 5.0), (0.9, 3.0, 0.9, 8.0))
         gb_serial = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; cost_kwargs..., I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1], u0)
         costb_s = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., I_min=I_min, kappa_I=kI, S_min=S_min, kappa_S=kS)[1]
@@ -474,9 +411,6 @@ end
         @test costb_t ≈ costb_s atol=1e-12
     end
 
-    # run_local_adam(threaded_grad=true) end-to-end smoke test -- must
-    # behave like a normal run (finite cost, non-empty history), on the
-    # SAME tiny budget the existing serial smoke test below uses.
     best_u_t, best_cost_t, best_inv_t, best_sil_t, best_dur_t, history_t = run_local_adam(
         u0, pulse, FAKE_D_ODE, cost_kwargs;
         num_epochs=3, patience=3, learning_rate=0.05, label="[thr]", threaded_grad=true,
@@ -507,38 +441,27 @@ end
 @testset "_curriculum_fidelity_weight" begin
     target_F = 1.0
 
-    # Boundary conditions: f(fidelity_phys=0)=0, f(fidelity_phys=1)=1, for
-    # several x_tune values (including negative, and the x_tune=0 linear
-    # special case).
     for x in (-8.0, -0.5, 0.0, 0.5, 8.0)
-        @test _curriculum_fidelity_weight(NaN, NaN, target_F, x) == 0.0  # no accepted point -> worst case
-        @test _curriculum_fidelity_weight(1.0, target_F, target_F, x) ≈ 1.0  # perfect fidelity
+        @test _curriculum_fidelity_weight(NaN, NaN, target_F, x) == 0.0
+        @test _curriculum_fidelity_weight(1.0, target_F, target_F, x) ≈ 1.0
     end
 
-    # x_tune=0 is exactly linear (the removable-singularity limit).
-    @test _curriculum_fidelity_weight(0.5, 1.0, target_F, 0.0) ≈ 0.5 * 1.0  # fidelity_phys = 0.5*1 = 0.5
+    @test _curriculum_fidelity_weight(0.5, 1.0, target_F, 0.0) ≈ 0.5 * 1.0
     @test _curriculum_fidelity_weight(0.3, target_F, target_F, 0.0) ≈ 0.3
 
-    # Monotone in fidelity_phys, for both signs of x_tune.
     for x in (-5.0, 5.0)
         lo = _curriculum_fidelity_weight(0.2, target_F, target_F, x)
         hi = _curriculum_fidelity_weight(0.9, target_F, target_F, x)
         @test hi > lo
     end
 
-    # Front-loaded (x<0) vs back-loaded (x>0): at the SAME low fidelity,
-    # negative x_tune must give strictly more weight than positive x_tune,
-    # and both must bracket the linear (x=0) curve -- this is the whole
-    # point of switching away from the old physics_loss-gated schedule.
     f_neg = _curriculum_fidelity_weight(0.1, target_F, target_F, -5.0)
     f_lin = _curriculum_fidelity_weight(0.1, target_F, target_F, 0.0)
     f_pos = _curriculum_fidelity_weight(0.1, target_F, target_F, 5.0)
     @test f_neg > f_lin > f_pos
 
-    # inv/sil are clamped to [0,1] defensively (tiny float overshoot).
     @test _curriculum_fidelity_weight(1.0 + 1e-14, target_F, target_F, 0.0) ≈ 1.0
 
-    # Validation: non-finite or too-large x_tune must error, not silently NaN/Inf.
     @test_throws ErrorException _curriculum_fidelity_weight(0.5, 0.5, target_F, NaN)
     @test_throws ErrorException _curriculum_fidelity_weight(0.5, 0.5, target_F, Inf)
     @test_throws ErrorException _curriculum_fidelity_weight(0.5, 0.5, target_F, 700.0)
@@ -548,11 +471,6 @@ end
 @testset "solve_optimal_x_start" begin
 
     @testset "_schedule_shape matches _curriculum_fidelity_weight" begin
-        # _curriculum_fidelity_weight(inv, sil, target_F, x) computes
-        # fidelity_phys = inv*(1-(sil-target_F)^2) internally; sil=target_F=1
-        # makes silencing_success=1, so fidelity_phys=inv exactly -- i.e.
-        # _curriculum_fidelity_weight(F_0, 1.0, 1.0, x) reproduces
-        # _schedule_shape(x, F_0) exactly.
         for F_0 in (0.001, 0.05, 0.1, 0.3, 0.6, 0.9, 0.999)
             for x in (-50.0, -5.0, -1.0, -1e-5, 0.0, 1e-5, 1.0, 5.0, 50.0)
                 @test _schedule_shape(x, F_0) ≈ _curriculum_fidelity_weight(F_0, 1.0, 1.0, x) atol=1e-12
@@ -564,10 +482,10 @@ end
         F_0 = 0.1
         xs = collect(-50.0:1.0:50.0)
         vals = [_schedule_shape(x, F_0) for x in xs]
-        @test issorted(vals; rev=true)  # strictly decreasing across the WHOLE real line
-        @test _schedule_shape(-50.0, F_0) > 0.99   # -> 1 as x -> -inf
-        @test _schedule_shape(50.0, F_0) < 1e-15   # -> 0 as x -> +inf
-        @test _schedule_shape(0.0, F_0) == F_0     # exactly F_0 at x=0 (linear point)
+        @test issorted(vals; rev=true)
+        @test _schedule_shape(-50.0, F_0) > 0.99
+        @test _schedule_shape(50.0, F_0) < 1e-15
+        @test _schedule_shape(0.0, F_0) == F_0
     end
 
     @testset "positive-x branch (alpha < F_0)" begin
@@ -587,18 +505,16 @@ end
     end
 
     @testset "the specific pathological case from the real run" begin
-        # F_0=0.0002 (silencing stuck near 0), wanting alpha=0.01 (1% weight
-        # even at that near-zero fidelity).
         F_0, alpha = 0.0002, 0.01
         x = solve_optimal_x_start(F_0, alpha)
-        @test x < -1.0  # a genuinely strongly front-loaded curvature, not near-zero
+        @test x < -1.0
         @test _schedule_shape(x, F_0) ≈ alpha atol=1e-5
         @test _curriculum_fidelity_weight(F_0, 1.0, 1.0, x) ≈ alpha atol=1e-5
     end
 
     @testset "alpha ≈ F_0 -> linear sentinel" begin
         @test solve_optimal_x_start(0.3, 0.3) == 1e-4
-        @test solve_optimal_x_start(0.3, 0.3 + 1e-8) == 1e-4  # within default tol
+        @test solve_optimal_x_start(0.3, 0.3 + 1e-8) == 1e-4
     end
 
     @testset "degenerate F_0 (0 or 1): factor has no x-dependence, no crash" begin
@@ -609,13 +525,11 @@ end
     end
 
     @testset "alpha at the unreachable open endpoint: graceful degradation, no crash" begin
-        # alpha=1 with F_0<1 strictly needs x->-inf; no finite root exists.
         x = solve_optimal_x_start(0.1, 1.0; x_max=50.0)
         @test isfinite(x)
         @test x < 0
-        @test _schedule_shape(x, 0.1) > 0.9  # close to alpha=1, even if not exact
+        @test _schedule_shape(x, 0.1) > 0.9
 
-        # Symmetric case: alpha=0 with F_0>0 strictly needs x->+inf.
         x2 = solve_optimal_x_start(0.9, 0.0; x_max=50.0)
         @test isfinite(x2)
         @test x2 > 0
@@ -631,12 +545,6 @@ end
         @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; x_max=-1.0)
         @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; tol=0.0)
         @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; tol=-1e-6)
-        # Audit finding: x_max >= 700 lets _schedule_shape(x_max, F_0) silently
-        # evaluate Inf/Inf=NaN at the search boundary (Float64 exp overflow),
-        # which the bisection's `val > alpha` comparison would then silently
-        # treat as false (NaN comparisons are always false in Julia) instead
-        # of erroring -- must be rejected upfront instead, matching
-        # _curriculum_fidelity_weight's own |x_tune|<700 contract.
         @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; x_max=700.0)
         @test_throws ErrorException solve_optimal_x_start(0.5, 0.1; x_max=1000.0)
     end
@@ -647,12 +555,6 @@ end
                 x = solve_optimal_x_start(F_0, alpha)
                 @test isfinite(x)
                 got = _schedule_shape(x, F_0)
-                # Loose-ish tolerance: some (F_0,alpha) pairs near the open
-                # endpoints (e.g. F_0=0.001,alpha=0.99) are only reachable
-                # in the x->-inf limit and won't hit the tight bisection
-                # tol within x_max -- in that case at least confirm x
-                # landed in the CORRECT half (alpha>F_0 needs x<0,
-                # alpha<F_0 needs x>0 -- opposite sign from (alpha-F_0)).
                 @test abs(got - alpha) < 1e-3 || sign(x) == -sign(alpha - F_0)
             end
         end
@@ -663,12 +565,6 @@ end
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
 
-    # Fast, ODE-free exactness check: _direct_cost_term IS w_time*(dur/T_max)
-    # + w_tmax*tmax_frac_sq + w_power*power_mean, so evaluating it at two
-    # different (w_time, w_tmax, w_power) triples on the SAME u and
-    # comparing against _reconstitute_static_direct_cost exercises the
-    # exact same linear algebra pulse_cost's own ODE-dependent physics_cost
-    # term never touches, without paying for a solve.
     dur = pulse_duration(pulse, u0)
     tmax_frac_sq, power_mean = _tmax_power_components(u0, pulse)
     w_time1, w_tmax1, w_power1 = 0.15, 1.0, 0.05
@@ -683,9 +579,6 @@ end
         direct2, w_time1, w_time2, w_tmax1, w_tmax2, w_power1, w_power2, dur, tmax_frac_sq, power_mean, pulse.T_max,
     ) ≈ direct1 atol=1e-12
 
-    # Cross-checked against a REAL second ODE solve too (pulse_cost, not
-    # just _direct_cost_term in isolation) -- physics_cost must cancel
-    # exactly since it never depends on w_time/w_tmax/w_power.
     cost1, inv1, sil1, dur1, coh1 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w_time1, w_tmax=w_tmax1, w_power=w_power1)
     cost2, inv2, sil2, dur2, coh2 = pulse_cost(u0, pulse, FAKE_D_ODE; w_time=w_time2, w_tmax=w_tmax2, w_power=w_power2)
     @test dur1 == dur2 && inv1 == inv2 && sil1 == sil2 && coh1 == coh2
@@ -694,7 +587,6 @@ end
     )
     @test reconstructed_full ≈ cost2 atol=1e-10
 
-    # Inf (failed-solve) sentinel passes through unchanged.
     @test _reconstitute_static_direct_cost(
         Inf, w_time2, w_time1, w_tmax2, w_tmax1, w_power2, w_power1, dur, tmax_frac_sq, power_mean, pulse.T_max,
     ) == Inf
@@ -705,14 +597,6 @@ end
     u0 = seed_canonical(pulse, :hs1)
     cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
 
-    # hop==0 is run_local_adam's own default: a standalone call with no
-    # explicit hop must NEVER anneal, regardless of anneal_direct_weights/
-    # x_tune_alpha -- schedule_factor and x_tune pinned at 0.0 on EVERY
-    # epoch, no calibration pulse_cost call spent, and (critically) the
-    # GRADIENT itself must reflect w_time=0 for the whole hop -- not merely
-    # the recorded factor/x_tune fields. Verified two ways: (a) history
-    # fields, (b) best_u after 1 epoch bit-identical to an explicit w_time=0
-    # run with annealing/barrier both off (isolating just the w_time effect).
     hop0 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         num_epochs=3, patience=3, learning_rate=0.05, label="[hop0]")
     @test all(h.schedule_factor == 0.0 for h in hop0[6])
@@ -725,65 +609,39 @@ end
     explicit_w_time0 = run_local_adam(u0, pulse, FAKE_D_ODE, w_time0_kwargs;
         hop=1, num_epochs=1, patience=1, learning_rate=0.05, label="[explicit-w0]",
         anneal_direct_weights=false)
-    @test hop0_one_epoch[1] == explicit_w_time0[1]  # best_u: identical raw-gradient trajectory
+    @test hop0_one_epoch[1] == explicit_w_time0[1]
 
-    # Adam's sandbox on hop 0 uses w_time=0 (history); the returned cost is
-    # a separate static evaluation of best_u under the caller's cost_kwargs.
-    # 1-epoch: Adam records cost at u0 then steps, so best_u is still u0.
     sandbox_at_u0 = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_nopenalty..., w_time=0.0)[1]
     static_at_u0 = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_nopenalty...)[1]
     @test hop0_one_epoch[6][1].cost ≈ sandbox_at_u0 atol=1e-12
     @test hop0_one_epoch[2] ≈ static_at_u0 atol=1e-12
-    @test sandbox_at_u0 != static_at_u0  # duration term is the difference
+    @test sandbox_at_u0 != static_at_u0
     @test hop0[2] ≈ pulse_cost(hop0[1], pulse, FAKE_D_ODE; cost_kwargs...)[1] atol=1e-10
 
-    # hop=1 is the first hop annealing ever applies to: behaves exactly like
-    # the OLD hop=0 default did before this change -- mandatory calibration,
-    # bit-for-bit identical between the implicit default and an explicit
-    # anneal_direct_weights=true.
     baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-default]")
     explicit_on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-explicit]", anneal_direct_weights=true)
-    @test baseline[1] == explicit_on[1]  # best_u
-    @test baseline[2] == explicit_on[2]  # best_cost
-    @test baseline[6] == explicit_on[6]  # history
-    # u0's own measured fidelity -> the calibrated x_tune the whole hop uses,
-    # AND (inv0, sil0) is the seed run_local_adam plants into last_good_aux's
-    # (inversion, silencing) slots so epoch 1 already anneals at the calibrated
-    # floor rather than the old NaN->factor=0 sandbox.
+    @test baseline[1] == explicit_on[1]
+    @test baseline[2] == explicit_on[2]
+    @test baseline[6] == explicit_on[6]
     _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
     F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
     x_tune_expected = solve_optimal_x_start(F_0, _DEFAULT_X_TUNE_ALPHA)
     factor1 = _curriculum_fidelity_weight(Float64(inv0), Float64(sil0), 1.0, x_tune_expected)
 
-    # Returned cost is the static evaluation of best_u under full cost_kwargs.
     @test baseline[2] ≈ pulse_cost(baseline[1], pulse, FAKE_D_ODE; cost_kwargs...)[1] atol=1e-10
-    # Epoch 1 is NO LONGER the w_time=0 sandbox: the calibration seed makes its
-    # schedule_factor == x_tune_alpha (the deliberate non-zero floor, equal to
-    # _DEFAULT_X_TUNE_ALPHA up to solve_optimal_x_start's root tol), so epoch 1
-    # is descended at dyn_w_time = 0.15 * factor1.
     @test factor1 > 0.0
     @test isapprox(factor1, _DEFAULT_X_TUNE_ALPHA; atol=1e-5)
     @test baseline[6][1].schedule_factor == factor1
     @test baseline[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.15*factor1)[1] atol=1e-12
 
-    # anneal_direct_weights=false at hop!=0 is the ORIGINAL "disable
-    # annealing, recover the fixed w_time" contract -- schedule_factor==1.0
-    # (NOT 0.0, which is the DIFFERENT hop==0 sentinel -- these two "off"
-    # cases must not be conflated), diverging from the annealed baseline.
     off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-off]", anneal_direct_weights=false)
     @test all(h.schedule_factor == 1.0 for h in off[6])
     @test off[6] != baseline[6]
 
-    # history's x_tune field carries the CALIBRATED value (constant across
-    # every row) matching solve_optimal_x_start applied to u0's own fidelity.
     @test all(h.x_tune == x_tune_expected for h in baseline[6])
-    # Every epoch's factor reproduces _curriculum_fidelity_weight applied to
-    # the last ACCEPTED point's (inversion, silencing): epoch 1 from the
-    # calibration seed (u0's own inv0/sil0), each later epoch from the
-    # previous row.
     @test baseline[6][1].schedule_factor ==
         _curriculum_fidelity_weight(Float64(inv0), Float64(sil0), 1.0, x_tune_expected)
     for i in 2:length(baseline[6])
@@ -792,28 +650,14 @@ end
         @test baseline[6][i].schedule_factor == expected
     end
 
-    # w_tmax/w_power are NEVER annealed -- the epoch_cost_kwargs merge only
-    # ever overrides w_time. Direct regression guard: at hop=1 with
-    # annealing genuinely suppressing w_time below base (factor<1 at some
-    # epoch), the GRADIENT must still match an explicit w_tmax/w_power-only
-    # override of pulse_cost exactly for that epoch's own dyn_w_time.
-    @test any(h.schedule_factor < 1.0 for h in baseline[6][2:end])  # confirms annealing is genuinely active
+    @test any(h.schedule_factor < 1.0 for h in baseline[6][2:end])
     dyn_w_time_ep2 = 0.15 * baseline[6][2].schedule_factor
     g_dyn = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; cost_kwargs..., w_time=dyn_w_time_ep2)[1], u0)
     g_full_wtime = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; cost_kwargs...)[1], u0)
     g_tmax_power_only = ForwardDiff.gradient(uu -> pulse_cost(uu, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.0)[1], u0)
-    # dyn gradient must differ from BOTH the full-w_time and the
-    # w_time-zeroed gradients whenever 0 < factor < 1 (proves w_time really
-    # is being scaled, not silently dropped or left at full weight).
     @test g_dyn != g_full_wtime
     @test g_dyn != g_tmax_power_only
 
-    # Passing x_tune_alpha=nothing EXPLICITLY is the escape hatch: bypasses
-    # calibration entirely, falling back to the plain linear schedule
-    # (x_tune=0, i.e. factor = fidelity_phys exactly) since there is no raw
-    # x_tune keyword to fall back to any more. No calibration eval is spent,
-    # so there is no (inv, sil) seed either -- epoch 1 stays at the NaN->0
-    # sentinel (schedule_factor==0, w_time=0 for that one epoch).
     manual = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-manual]",
         x_tune_alpha=nothing)
@@ -821,12 +665,8 @@ end
     @test manual[6][1].schedule_factor == _curriculum_fidelity_weight(NaN, NaN, 1.0, 0.0)
     @test manual[6][1].schedule_factor == 0.0
     @test manual[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.0)[1] atol=1e-12
-    @test manual[6] != baseline[6]  # linear (x_tune=0) differs from the calibrated default
+    @test manual[6] != baseline[6]
 
-    # _precalibrated_x_tune hops (recalibrate_optima_x=false, hop>=2) inject an
-    # already-calibrated x_tune and spend NO calibration pulse_cost -- so there
-    # is no (inv, sil) seed, and epoch 1 deliberately keeps schedule_factor==0
-    # (dyn_w_time==0 for that one epoch), unlike the calibrating hops above.
     precal = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=2, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-precal]",
         _precalibrated_x_tune=x_tune_expected)
@@ -835,10 +675,6 @@ end
     @test precal[6][1].schedule_factor == 0.0
     @test precal[6][1].cost ≈ pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.0)[1] atol=1e-12
 
-    # A custom x_tune_alpha overrides the default target, actually takes
-    # effect (diverges from both the default-alpha baseline and the
-    # uncalibrated linear manual run), and is a silent no-op when
-    # anneal_direct_weights=false (nothing to calibrate for).
     custom_alpha = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adw-custom]", x_tune_alpha=0.5)
     @test custom_alpha[6][1].x_tune == solve_optimal_x_start(F_0, 0.5)
@@ -849,10 +685,6 @@ end
         anneal_direct_weights=false, x_tune_alpha=0.5)
     @test all(h.schedule_factor == 1.0 for h in off_with_alpha[6])
 
-    # If n_hops==1 is simulated directly (never reaching hop 1), nothing
-    # should ever anneal -- already covered by the hop0/hop0_one_epoch
-    # checks above; this is the pipeline-level consequence, tested in the
-    # optimise_composite_pulse testset below.
 end
 
 @testset "run_local_adam hop0_phyonly=false makes hop 0 a normal scheduled hop" begin
@@ -860,10 +692,6 @@ end
     u0 = seed_canonical(pulse, :hs1)
     cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
 
-    # --- (a) hop0_phyonly=false + anneal_direct_weights=false -------------
-    # hop 0 stops being the w_time=0 sandbox: it takes the ordinary
-    # "annealing disabled -> factor=1.0" branch, so dyn_w_time == base_w_time
-    # (0.15) on EVERY epoch, exactly like any hop>=1 with annealing off.
     phy_off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=0, hop0_phyonly=false, anneal_direct_weights=false,
         num_epochs=3, patience=3, learning_rate=0.05, label="[h0-phyoff-adwoff]")
@@ -871,22 +699,15 @@ end
     @test all(h.x_tune == 0.0 for h in phy_off[6])
     @test phy_off[6][1].cost ≈
         pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.15)[1] atol=1e-12
-    # Bit-identical to running the SAME call at an explicit hop=1 (the only
-    # difference the flag removes is the hop==0 short-circuit; the recorded
-    # `.hop` index still differs).
     ref_hop1_off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, anneal_direct_weights=false,
         num_epochs=3, patience=3, learning_rate=0.05, label="[ref-hop1-adwoff]")
-    @test phy_off[1] == ref_hop1_off[1]           # best_u
-    @test phy_off[2] == ref_hop1_off[2]           # best_cost
+    @test phy_off[1] == ref_hop1_off[1]
+    @test phy_off[2] == ref_hop1_off[2]
     @test [Base.structdiff(h, (hop=0,)) for h in phy_off[6]] ==
           [Base.structdiff(h, (hop=0,)) for h in ref_hop1_off[6]]
     @test all(h.hop == 0 for h in phy_off[6])
 
-    # --- (b) hop0_phyonly=false + anneal_direct_weights=true -------------
-    # hop 0 now performs the SAME mandatory calibration hop 1 does: one
-    # pulse_cost eval from its own u_start -> a nonzero calibrated x_tune,
-    # and schedule_factor follows _curriculum_fidelity_weight.
     _, inv0, sil0, _, _ = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs...)
     F_0 = Float64(inv0) * (1.0 - (Float64(sil0) - 1.0)^2)
     x_tune_expected = solve_optimal_x_start(F_0, _DEFAULT_X_TUNE_ALPHA)
@@ -901,7 +722,6 @@ end
     @test phy_on[6][1].schedule_factor == factor1
     @test phy_on[6][1].cost ≈
         pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs..., w_time=0.15*factor1)[1] atol=1e-12
-    # ...and again bit-identical (modulo `.hop`) to the same call at hop=1.
     ref_hop1_on = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, anneal_direct_weights=true,
         num_epochs=3, patience=3, learning_rate=0.05, label="[ref-hop1-adwon]")
@@ -910,7 +730,6 @@ end
     @test [Base.structdiff(h, (hop=0,)) for h in phy_on[6]] ==
           [Base.structdiff(h, (hop=0,)) for h in ref_hop1_on[6]]
 
-    # --- default hop0_phyonly=true is unchanged (still the w_time=0 sandbox)
     default_h0 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=0, anneal_direct_weights=true,
         num_epochs=3, patience=3, learning_rate=0.05, label="[h0-default]")
@@ -919,9 +738,6 @@ end
 end
 
 @testset "_fidelity_physics_cost / _fidelity_gradient_coefficients" begin
-    # kappa_I=kappa_S=0 bit-identity over a grid including inv/sil edges
-    # (0, near-0, 1) -- === not ≈, proving 0.5*0*x^2 == 0.0 exactly, not
-    # merely numerically close, regardless of I_min/S_min.
     for inv in (0.0, 1e-15, 0.5, 1.0), sil in (0.0, 0.5, 1.0), tF in (0.0, 1.0)
         ss_legacy = 1.0 - (sil - tF)^2
         fid_legacy = inv * ss_legacy
@@ -931,25 +747,12 @@ end
         @test fid === fid_legacy
         @test ss === ss_legacy
         coeff_I, coeff_S = _fidelity_gradient_coefficients(inv, ss, fid, 0.85, 0.0, 0.85, 0.0)
-        # == not === here: at fid_legacy==1.0 exactly, (1.0-fid_legacy) is a
-        # signed zero whose SIGN depends on multiplication order/associativity
-        # (-0.0 vs 0.0) -- mathematically identical (0.0 == -0.0), just not
-        # bit-identical, unlike the pc/fid/ss checks above (no such exact-1.0
-        # cancellation there).
         @test coeff_I == -2.0 * (1.0 - fid_legacy) * ss_legacy
         @test coeff_S == -2.0 * (1.0 - fid_legacy) * inv
     end
 
-    # Coefficients vs ForwardDiff over a grid spanning inert (kappa=0) to
-    # strongly-penalized settings, including the exact corners where the
-    # penalty's own one-sided hinge switches on/off (inv/ss at, just below,
-    # and just above I_min/S_min).
     for I_min in (0.0, 0.5, 0.85), kI in (0.0, 1.0, 50.0), S_min in (0.0, 0.5, 0.85), kS in (0.0, 1.0, 50.0)
         for inv in (0.0, 0.3, 0.85, 1.0), ss in (0.0, 0.3, 0.85, 1.0)
-            # v[1]=inversion, v[2]=silencing_success DIRECTLY -- bypasses the
-            # silencing->silencing_success mapping entirely (already checked
-            # in the bit-identity loop above) so this isolates the penalty
-            # formula/gradient itself against an independent FD reference.
             f(v) = (1.0 - v[1] * v[2])^2 + 0.5 * kI * max(0.0, I_min - v[1])^2 + 0.5 * kS * max(0.0, S_min - v[2])^2
             g_fd = ForwardDiff.gradient(f, [inv, ss])
             fid = inv * ss
@@ -960,8 +763,6 @@ end
         end
     end
 
-    # Continuity at the hinge (x == floor): penalty contribution and its
-    # gradient are both exactly 0 there (C1 kink, not a discontinuity).
     pc_at, _, _ = _fidelity_physics_cost(0.85, 1.0, 0.0, 0.85, 50.0, 0.0, 0.0)
     pc_ref, _, _ = _fidelity_physics_cost(0.85, 1.0, 0.0, 0.85, 0.0, 0.0, 0.0)
     @test pc_at == pc_ref
@@ -969,10 +770,6 @@ end
     coeff_I_ref, _ = _fidelity_gradient_coefficients(0.85, 1.0, 0.85 * 1.0, 0.85, 0.0, 0.0, 0.0)
     @test coeff_I_at == coeff_I_ref
 
-    # Validation: negative kappa (would REWARD low inversion/silencing_success
-    # instead of penalising it) and I_min/S_min outside [0,1] (permanently
-    # active penalty, unsatisfiable even at perfect fidelity) both error
-    # loudly, on both functions, rather than silently misoptimising.
     @test_throws ErrorException _fidelity_physics_cost(0.5, 1.0, 1.0, 0.85, -50.0, 0.0, 0.0)
     @test_throws ErrorException _fidelity_physics_cost(0.5, 1.0, 1.0, 0.0, 0.0, 0.85, -50.0)
     @test_throws ErrorException _fidelity_physics_cost(1.0, 1.0, 1.0, 1.5, 50.0, 0.0, 0.0)
@@ -983,9 +780,6 @@ end
     @test_throws ErrorException _fidelity_gradient_coefficients(0.5, 1.0, 0.5, 0.85, -50.0, 0.0, 0.0)
     @test_throws ErrorException _fidelity_gradient_coefficients(1.0, 1.0, 1.0, 1.5, 50.0, 0.0, 0.0)
 
-    # ...and the same guard is actually reached from the public entry points
-    # (pulse_cost, run_local_adam via cost_kwargs), not just the two
-    # internal helpers directly.
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
     @test_throws ErrorException pulse_cost(u0, pulse, FAKE_D_ODE; kappa_I=-1.0)
@@ -998,38 +792,20 @@ end
 @testset "run_local_adam squared-hinge penalty" begin
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
-    # Penalty settings are NOT separate run_local_adam keywords -- they
-    # travel through cost_kwargs, exactly like target_F/w_tmax/w_power/
-    # w_time's own base values (see run_local_adam's own docstring).
-    #
-    # I_min=0.99 (kappa_I keeps pulse_cost's own default 50.0) so the
-    # inversion squared-hinge penalty is genuinely ACTIVE at the :hs1 seed
-    # (inversion ≈ 0.986 < 0.99): under the paper-aligned metrics the :hs1
-    # pulse keeps the :weak track's coherence well above its ε seed, so its |F|_⋆
-    # clamps to 1.0 and BOTH default floors (I_min=0.85, S_min=0.85) would
-    # otherwise be slack here -- this test is about the penalty MECHANISM
-    # biting, not about which floor a canonical seed happens to trip.
     cost_kwargs_default = (w_tmax=1.0, w_power=0.05, w_time=0.15, I_min=0.99)
     cost_kwargs_off = (w_tmax=1.0, w_power=0.05, w_time=0.15, I_min=0.99, kappa_I=0.0, kappa_S=0.0)
 
-    # default (kappa_I=50.0 from pulse_cost, I_min=0.99 active) vs
-    # kappa_I=kappa_S=0 (explicitly inert) must actually produce a
-    # DIFFERENT history -- the penalty is on by default and does something.
     baseline = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
         num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-default]")
     off = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_off;
         num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-off]")
     @test baseline[6] != off[6]
 
-    # Penalty is already in the live formula (no barrier reconstitution).
-    # Hop 0's history records the sandbox (w_time=0); the returned cost is
-    # the static pulse_cost of best_u under the SAME cost_kwargs. 1-epoch:
-    # best_u is still u0. Holds for BOTH default (penalty on) and kappa=0.
     plain_cost_default = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_default...)[1]
     plain_cost_off = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_off...)[1]
     sandbox_default = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_default..., w_time=0.0)[1]
     sandbox_off = pulse_cost(u0, pulse, FAKE_D_ODE; cost_kwargs_off..., w_time=0.0)[1]
-    @test plain_cost_default != plain_cost_off  # sanity: the penalty really changes the value
+    @test plain_cost_default != plain_cost_off
     @test sandbox_default != sandbox_off
     on1 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
         num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-on1]")
@@ -1040,16 +816,11 @@ end
     @test on1[2] ≈ plain_cost_default atol=1e-12
     @test off1[2] ≈ plain_cost_off atol=1e-12
 
-    # Threshold knobs actually bite: much stricter I_min/kappa_I produces a
-    # different history from the default.
     strict = run_local_adam(u0, pulse, FAKE_D_ODE,
         merge(cost_kwargs_default, (I_min=0.999, kappa_I=500.0));
         num_epochs=3, patience=3, learning_rate=0.05, label="[penalty-strict]")
     @test strict[6] != baseline[6]
 
-    # dynamic_barrier is NOT gated by hop==0, and neither is this penalty --
-    # hop 0 (which suppresses w_time to 0, see the hop-0 testset above)
-    # still shows the penalty-on vs penalty-off cost difference.
     baseline_hop0 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_default;
         hop=0, num_epochs=1, patience=1, learning_rate=0.05, label="[penalty-hop0-on]")
     off_hop0 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs_off;
@@ -1058,46 +829,26 @@ end
 end
 
 @testset "optimise_composite_pulse: hop 0 never anneals, hop 1 is the calibration seed" begin
-    # n_hops=3 -- hop 0 (never anneals), hop 1 (mandatory fresh seed
-    # calibration), hop 2 (recalibrate_optima_x branches) -- need all three
-    # to observe the full hop-1-seed/hop-2-reuse behaviour.
     common = (n_hops=3, num_epochs=2, patience=2, tol=1e-3, learning_rate=0.05,
               hop_step_size=0.5, seed=7, threaded_grad=false)
 
-    # anneal_direct_weights=true is now the default: calling with nothing
-    # else set must reproduce EXACTLY the same result as explicitly passing
-    # anneal_direct_weights=true (default x_tune_alpha, default
-    # recalibrate_optima_x=true) -- bit-for-bit.
     baseline = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-default] ")
     explicit_on = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-explicit] ", anneal_direct_weights=true)
-    @test baseline[1] == explicit_on[1]  # best_u
-    @test baseline[2] == explicit_on[2]  # best_cost
-    @test baseline[6] == explicit_on[6]  # history
+    @test baseline[1] == explicit_on[1]
+    @test baseline[2] == explicit_on[2]
+    @test baseline[6] == explicit_on[6]
 
-    # hop 0's rows never anneal, regardless of anneal_direct_weights/
-    # x_tune_alpha -- schedule_factor and x_tune pinned at 0.0.
     @test all(h.schedule_factor == 0.0 && h.x_tune == 0.0 for h in baseline[6] if h.hop == 0)
-    # hop>=1 rows DO anneal under the default (schedule_factor moves off 0
-    # at some epoch).
     @test any(h.schedule_factor != 0.0 for h in baseline[6] if h.hop != 0)
 
-    # x_tune_alpha=nothing bypasses calibration entirely (the escape
-    # hatch) from hop 1 onwards: falls back to the plain linear schedule
-    # (x_tune=0) for every hop, diverging from the calibrated-by-default
-    # baseline above. (hop 0 is already x_tune=0 either way.)
     manual = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-manual] ",
         x_tune_alpha=nothing, recalibrate_optima_x=false)
     @test all(h.x_tune == 0.0 for h in manual[6])
     @test manual[6] != baseline[6]
 
-    # x_tune_alpha set to a custom value, recalibrate_optima_x=true
-    # (default): hop 1 ALWAYS calibrates fresh from its own starting point
-    # (the first hop annealing applies to); hop 2 independently recalibrates
-    # too via run_local_adam's own internal calibration. Smoke-tests
-    # cleanly and diverges from the uncalibrated manual run above.
     recal_true = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-recal-true] ", anneal_direct_weights=true,
         x_tune_alpha=0.9, recalibrate_optima_x=true)
@@ -1106,71 +857,50 @@ end
     @test recal_true[6] != manual[6]
     hop1_x_tune_true = first(h.x_tune for h in recal_true[6] if h.hop == 1)
     hop2_x_tune_true = first(h.x_tune for h in recal_true[6] if h.hop == 2)
-    @test hop1_x_tune_true != hop2_x_tune_true  # hop 2 recalibrated independently
+    @test hop1_x_tune_true != hop2_x_tune_true
 
-    # x_tune_alpha set, recalibrate_optima_x=false: the SAME single
-    # seed-calibrated x_tune (from hop 1's own starting point) is reused for
-    # every LATER hop, so hop 0 AND hop 1 themselves must be UNCHANGED vs
-    # recalibrate=true (hop 0 never anneals either way; hop 1 always
-    # calibrates fresh either way -- recalibrate_optima_x only affects hop
-    # 2 onwards), while hop 2 differs (no per-hop recalibration there).
     recal_false = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-recal-false] ", anneal_direct_weights=true,
         x_tune_alpha=0.9, recalibrate_optima_x=false)
     @test isfinite(recal_false[2])
     n_hop01 = count(h -> h.hop in (0, 1), recal_true[6])
-    @test recal_true[6][1:n_hop01] == recal_false[6][1:n_hop01]  # hop 0+1 identical either way
+    @test recal_true[6][1:n_hop01] == recal_false[6][1:n_hop01]
     hop2_x_tune_false = first(h.x_tune for h in recal_false[6] if h.hop == 2)
-    @test hop2_x_tune_false == hop1_x_tune_true  # hop 2 reused hop 1's own value unchanged
-    @test hop2_x_tune_false != hop2_x_tune_true  # ...which differs from hop 2's own fresh calibration
+    @test hop2_x_tune_false == hop1_x_tune_true
+    @test hop2_x_tune_false != hop2_x_tune_true
 
-    # x_tune_alpha with anneal_direct_weights=false is a silent no-op (like
-    # x_tune itself) -- nothing to calibrate x_tune for, but no error --
-    # for hop>=1 rows; hop 0 rows are always schedule_factor==0.0 regardless.
     off_with_alpha = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., anneal_direct_weights=false, x_tune_alpha=0.5)
     @test all(h.schedule_factor == 1.0 for h in off_with_alpha[6] if h.hop != 0)
     @test all(h.schedule_factor == 0.0 for h in off_with_alpha[6] if h.hop == 0)
 
-    # n_hops=1 (no hop ever reaches hop 1): the entire run never anneals.
     single_hop = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         n_hops=1, num_epochs=2, patience=2, threaded_grad=false, seed=7, label_prefix="[ocp-1hop] ")
     @test all(h.schedule_factor == 0.0 && h.x_tune == 0.0 for h in single_hop[6])
 
-    # I_min/kappa_I/S_min/kappa_S settings are present in optimizer_settings
-    # and forwarded correctly (defaults; kappa=0 propagates through cost).
     @test baseline[8].I_min == _DEFAULT_PENALTY_MIN
     @test baseline[8].kappa_I == _DEFAULT_PENALTY_KAPPA
     off_penalty = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., kappa_I=0.0, kappa_S=0.0, label_prefix="[ocp-nopenalty] ")
     @test off_penalty[8].kappa_I == 0.0
-    # I_min=1.0 unconditionally activates the penalty (inversion < 1.0
-    # always, short of an exact fixed point) -- deterministic difference
-    # from kappa=0, unlike relying on the random seed's own physics.
     u0_base, pulse_base = baseline[4], baseline[3]
     plain_cost_u0 = pulse_cost(u0_base, pulse_base, FAKE_D_ODE;
         w_tmax=1.0, w_power=0.05, target_F=1.0, w_time=0.15, kappa_I=0.0, kappa_S=0.0)[1]
     barriered_cost_u0 = pulse_cost(u0_base, pulse_base, FAKE_D_ODE;
         w_tmax=1.0, w_power=0.05, target_F=1.0, w_time=0.15, I_min=1.0, kappa_I=50.0, kappa_S=0.0)[1]
-    @test plain_cost_u0 != barriered_cost_u0  # sanity: penalty really changes u0's cost
+    @test plain_cost_u0 != barriered_cost_u0
 end
 
 @testset "optimise_composite_pulse: hop0_phyonly flag" begin
     common = (n_hops=3, num_epochs=2, patience=2, tol=1e-3, learning_rate=0.05,
               hop_step_size=0.5, seed=7, threaded_grad=false)
 
-    # Default is hop0_phyonly=true -- recorded in optimizer_settings, hop-0
-    # rows are the w_time=0 sandbox (schedule_factor/x_tune pinned at 0.0).
     default_run = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[ocp-h0phy-default] ")
     @test default_run[8].hop0_phyonly === true
     @test all(h.schedule_factor == 0.0 && h.x_tune == 0.0
               for h in default_run[6] if h.hop == 0)
 
-    # hop0_phyonly=false -> hop 0 becomes a fully normal scheduled hop: it
-    # anneals under the default anneal_direct_weights=true (schedule_factor
-    # and x_tune move off 0.0 at hop 0), and the hop-0 history diverges from
-    # the sandboxed default.
     phy_off = optimise_composite_pulse(1, 4, 4, FAKE_D_ODE;
         common..., hop0_phyonly=false, label_prefix="[ocp-h0phy-off] ")
     @test phy_off[8].hop0_phyonly === false
@@ -1182,44 +912,25 @@ end
 end
 
 @testset "optimise_composite_pulse_rjmcmc: hop 0 never anneals, hop 1 is the calibration seed" begin
-    # n_hops=3 -- hop 0 (never anneals), hop 1 (mandatory fresh seed
-    # calibration), hop 2 (recalibrate_optima_x branches) -- need all three
-    # to observe the full hop-1-seed/hop-2-reuse behaviour.
     common = (n_hops=3, num_epochs=2, patience=2, tol=1e-3, learning_rate=0.05,
               hop_step_size=0.5, seed=7)
 
-    # anneal_direct_weights=true is now the default: calling with nothing
-    # else set must reproduce EXACTLY the same result as explicitly passing
-    # anneal_direct_weights=true (default x_tune_alpha, default
-    # recalibrate_optima_x=true) -- bit-for-bit.
     baseline = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[rj-default] ")
     explicit_on = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[rj-explicit] ", anneal_direct_weights=true)
-    @test baseline[1] == explicit_on[1]  # best_u
-    @test baseline[2] == explicit_on[2]  # best_cost
-    @test baseline[6] == explicit_on[6]  # history
+    @test baseline[1] == explicit_on[1]
+    @test baseline[2] == explicit_on[2]
+    @test baseline[6] == explicit_on[6]
 
-    # hop 0's rows never anneal.
     @test all(h.schedule_factor == 0.0 && h.x_tune == 0.0 for h in baseline[6] if h.hop == 0)
 
-    # x_tune_alpha=nothing bypasses calibration entirely (the escape
-    # hatch) from hop 1 onwards: falls back to the plain linear schedule
-    # (x_tune=0) for every hop, diverging from the calibrated-by-default
-    # baseline above.
     manual = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[rj-manual] ",
         x_tune_alpha=nothing, recalibrate_optima_x=false)
     @test all(h.x_tune == 0.0 for h in manual[6])
     @test manual[6] != baseline[6]
 
-    # x_tune_alpha set, recalibrate_optima_x=false: the SAME single
-    # seed-calibrated x_tune (from hop 1's own starting point, always at
-    # the INPUT k) is reused for every LATER hop, so hop 0 AND hop 1
-    # themselves must be UNCHANGED vs recalibrate=true (hop 0 never anneals
-    # either way; hop 1 always calibrates fresh either way), while hop 2
-    # differs (no per-hop recalibration there) -- INCLUDING across any
-    # _grow_pulse/_shrink_pulse k-change a hop might take.
     recal_true = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
         common..., label_prefix="[rj-recal-true] ", anneal_direct_weights=true,
         x_tune_alpha=0.9, recalibrate_optima_x=true)
@@ -1229,21 +940,16 @@ end
     @test isfinite(recal_true[2])
     @test isfinite(recal_false[2])
     n_hop01 = count(h -> h.hop in (0, 1), recal_true[6])
-    @test recal_true[6][1:n_hop01] == recal_false[6][1:n_hop01]  # hop 0+1 identical either way
+    @test recal_true[6][1:n_hop01] == recal_false[6][1:n_hop01]
     hop1_x_tune = first(h.x_tune for h in recal_true[6] if h.hop == 1)
     hop2_x_tune_false = first(h.x_tune for h in recal_false[6] if h.hop == 2)
-    @test hop2_x_tune_false == hop1_x_tune  # hop 2 reused hop 1's own value unchanged
+    @test hop2_x_tune_false == hop1_x_tune
 
-    # x_tune_alpha with anneal_direct_weights=false is a silent no-op --
-    # nothing to calibrate x_tune for, but no error -- for hop>=1 rows;
-    # hop 0 rows are always schedule_factor==0.0 regardless.
     off_with_alpha = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
         common..., anneal_direct_weights=false, x_tune_alpha=0.5)
     @test all(h.schedule_factor == 1.0 for h in off_with_alpha[6] if h.hop != 0)
     @test all(h.schedule_factor == 0.0 for h in off_with_alpha[6] if h.hop == 0)
 
-    # optimizer_settings carries every explicit keyword actually forwarded
-    # -- no stray x_tune, and the ones that DO exist reflect what was passed.
     @test baseline[8].anneal_direct_weights == true
     @test baseline[8].hop0_phyonly === true
     @test baseline[8].x_tune_alpha == _DEFAULT_X_TUNE_ALPHA
@@ -1252,7 +958,6 @@ end
     @test baseline[8].kappa_I == _DEFAULT_PENALTY_KAPPA
     @test !haskey(baseline[8], :x_tune)
 
-    # kappa_I=kappa_S=0 propagates through optimizer_settings.
     off_penalty = optimise_composite_pulse_rjmcmc(1, 4, 4, FAKE_D_ODE;
         common..., kappa_I=0.0, kappa_S=0.0, label_prefix="[rj-nopenalty] ")
     @test off_penalty[8].kappa_I == 0.0

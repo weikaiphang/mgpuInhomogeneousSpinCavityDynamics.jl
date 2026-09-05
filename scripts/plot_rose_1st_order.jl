@@ -1,63 +1,29 @@
-# ============================================================
-# Retrieve + replot first-order ROSE data
-#
-# Compatible with saved data fields:
-#
-#   SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG,
-#   t_saved, a_sol, Σp_sol, Σz_sol,
-#   E_of_t_arr, a_out, a_out_x, a_out_p, a_out_abs,
-#   M_delta, M_g, M_total,
-#   delta_b_1d, g_b_1d, Nj_2d,
-#   idelta_res, delta_res,
-#   keep_bins, g_keep, delta_keep,
-#   Sp_keep, Sz_keep,
-#   peak_detection_config, peak_detection_results,
-#   N_total, elapsed_seconds
-#
-# Important unit convention:
-#   t_saved is stored in seconds.
-#   All plotted time axes below use microseconds.
-# ============================================================
-
 using JLD2
 using Plots
 using Measures
 using Statistics
 using Printf
 
-# ============================================================
-# 0) USER SETTINGS
-# ============================================================
 
 load_file = "data/demo.jld2"
 
 figdir = "fig"
 mkpath(figdir)
 
-# The total displayed width is twice the half-span.
-# Units: μs
 echo1_zoom_half_span_us = 30.0
 echo2_zoom_half_span_us = 30.0
 
-# Whole-time input-output plot limits.
-# Set both to nothing to disable the limited-y plot.
 whole_plot_ymin = -2000.0
 whole_plot_ymax =  2000.0
-# whole_plot_ymin, whole_plot_ymax = nothing, nothing
 
-# Region used for echo heatmaps. Units: Hz.
 delta_plot_min = -0.5e6
 delta_plot_max =  0.5e6
 
 g_plot_min = 0.0
 g_plot_max = 15000.0
 
-# Central detuning interval used for phase-versus-g.
-# Units: MHz.
 delta_window_MHz = 1.0
 
-# Requested g values for resonant-bin trajectory plots. Units: Hz.
-# The nearest saved g bin is used for each requested value.
 selected_g_values_Hz = [
     1.0,
     10.0,
@@ -68,25 +34,18 @@ selected_g_values_Hz = [
     15000.0,
 ]
 
-# Extra padding around each WURST pulse in its zoom plot. Units: μs.
 wurst_zoom_padding_us = 5.0
 
-# ============================================================
-# 1) SMALL HELPERS
-# ============================================================
 
-"""Return a normalized Symbol for labels or pulse kinds."""
 function as_symbol(x)
     return Symbol(lowercase(String(x)))
 end
 
-"""Return the pulse kind stored in one PULSE_CONFIG entry."""
 function pulse_kind(pulse)
     hasproperty(pulse, :kind) || error("A PULSE_CONFIG entry has no field :kind")
     return as_symbol(getproperty(pulse, :kind))
 end
 
-"""Find one detected-peak result by its label, with an index fallback."""
 function find_peak_result(results, target_label::Symbol, fallback_index::Int)
     results === nothing && return nothing
     isempty(results) && return nothing
@@ -102,7 +61,6 @@ function find_peak_result(results, target_label::Symbol, fallback_index::Int)
     return length(results) >= fallback_index ? results[fallback_index] : nothing
 end
 
-"""Convert a saved vector or matrix into an M_delta × M_g matrix."""
 function ensure_2d(A, M_delta::Int, M_g::Int, name::AbstractString)
     if ndims(A) == 2
         size(A) == (M_delta, M_g) || error(
@@ -119,7 +77,6 @@ function ensure_2d(A, M_delta::Int, M_g::Int, name::AbstractString)
     end
 end
 
-"""Safely normalize rows of a saved M_g × Nt resonant-bin array."""
 function normalize_resonant_rows(A, Nj_keep)
     M_g_local, Nt_local = size(A)
     length(Nj_keep) == M_g_local || error("Nj_keep length does not match A rows.")
@@ -144,7 +101,6 @@ function normalize_resonant_rows(A, Nj_keep)
     return out
 end
 
-"""Return indices inside a time window, where the axis is in μs."""
 function time_window_indices(t_us, center_us, half_span_us)
     idx = findall(
         (t_us .>= center_us - half_span_us) .&
@@ -159,14 +115,12 @@ function time_window_indices(t_us, center_us, half_span_us)
     return idx
 end
 
-"""Display a plot and save it in figdir."""
 function display_and_save(p, filename, figdir)
     display(p)
     savefig(p, joinpath(figdir, filename))
     return nothing
 end
 
-"""Add signal, WURST, and expected-echo markers to a plot."""
 function add_sequence_markers!(
     p;
     tsig_us,
@@ -193,12 +147,6 @@ function add_sequence_markers!(
     return p
 end
 
-"""
-Analyze one pulse envelope in a selected time window.
-
-The time axis is in μs. Therefore, integral and norm contain powers of μs,
-but their ratios remain dimensionless because input and echoes use the same axis.
-"""
 function pulse_window_analysis(t_us, center_us, half_span_us, y)
     idx = time_window_indices(t_us, center_us, half_span_us)
 
@@ -237,9 +185,6 @@ function pulse_window_analysis(t_us, center_us, half_span_us, y)
     )
 end
 
-# ============================================================
-# 2) LOAD DATA
-# ============================================================
 
 @load load_file data
 
@@ -258,10 +203,6 @@ a_sol = collect(data.a_sol)
 
 E_of_t_arr = collect(data.E_of_t_arr)
 
-# RECONSTRUCT OUTPUT FIELD
-# Input-output relation:
-#
-#     a_out(t) = E(t) - sqrt(kappa_e) * a(t)
 
 hasproperty(SYSTEM_CONFIG, :kappa_e) || error(
     "SYSTEM_CONFIG contains no kappa_e."
@@ -271,7 +212,6 @@ kappa_e = Float64(SYSTEM_CONFIG.kappa_e)
 
 a_out = E_of_t_arr .- sqrt(kappa_e) .* a_sol
 
-# Output-field components.
 a_out_x   = real.(a_out)
 a_out_p   = imag.(a_out)
 a_out_abs = abs.(a_out)
@@ -292,7 +232,6 @@ keep_bins  = Int.(collect(data.keep_bins))
 g_keep     = collect(data.g_keep)
 delta_keep = collect(data.delta_keep)
 
-# Rows: g bins. Columns: saved times.
 Sp_keep = ComplexF64.(Array(data.Sp_keep))
 Sz_keep = Float64.(real.(Array(data.Sz_keep)))
 
@@ -302,9 +241,6 @@ peak_detection_results = data.peak_detection_results
 N_total        = data.N_total
 elapsed_seconds = data.elapsed_seconds
 
-# ============================================================
-# 3) VALIDATE DIMENSIONS
-# ============================================================
 
 @assert M_total == M_delta * M_g
 @assert length(delta_b_1d) == M_delta
@@ -326,7 +262,6 @@ elapsed_seconds = data.elapsed_seconds
 @assert size(Sp_keep) == (M_g, Nt)
 @assert size(Sz_keep) == (M_g, Nt)
 
-# Verify the flattened-bin convention used by keep_bins.
 expected_keep_bins = [
     idelta_res + (ig - 1) * M_delta
     for ig in 1:M_g
@@ -334,11 +269,7 @@ expected_keep_bins = [
 
 @assert keep_bins == expected_keep_bins
 
-# ============================================================
-# 4) EXTRACT PULSE AND ECHO TIMING
-# ============================================================
 
-# PULSE_CONFIG is a tuple/vector of pulse NamedTuples.
 gaussian_pulses = [p for p in PULSE_CONFIG if pulse_kind(p) == :gaussian]
 wurst_pulses    = [p for p in PULSE_CONFIG if pulse_kind(p) == :wurst]
 
@@ -362,7 +293,6 @@ tw2_center = wurst2.t_center
 Tw2        = wurst2.duration
 t0w2       = tw2_center - Tw2 / 2
 
-# The peak results are saved as a vector of NamedTuples.
 echo1 = find_peak_result(peak_detection_results, :echo1, 1)
 echo2 = find_peak_result(peak_detection_results, :echo2, 2)
 
@@ -378,7 +308,6 @@ if has_peak_results
     amp_echo1_detected = echo1.detected_amplitude
     amp_echo2_detected = echo2.detected_amplitude
 else
-    # Fallback ROSE relations. Peak-dependent 2D plots will be skipped.
     techo1_expected = 2 * tw1_center - tsig
     techo2_expected = 2 * tw2_center - techo1_expected
 
@@ -391,7 +320,6 @@ end
 
 Ttotal = hasproperty(SIM_SETTING, :Ttotal) ? SIM_SETTING.Ttotal : last(t_s)
 
-# Convert key times to μs for plotting.
 tsig_us             = tsig * 1e6
 sigma_sig_us        = sigma_sig * 1e6
 
@@ -404,40 +332,24 @@ techo2_expected_us  = techo2_expected * 1e6
 t_echo1_detected_us = t_echo1_detected * 1e6
 t_echo2_detected_us = t_echo2_detected * 1e6
 
-# ============================================================
-# 5) DERIVED SPIN AND BIN QUANTITIES
-# ============================================================
 
-# Global normalized Bloch components.
-# This follows the same convention as the older retrieve file:
-#
-#   sp_avg = Σp / (N_total/2)
-#   sx_avg = real(sp_avg)
-#   sy_avg = imag(sp_avg)
-#   sz_avg = Σz / (N_total/2)
-#
 sp_avg = Σp ./ (N_total / 2)
 sx_avg = real.(sp_avg)
 sy_avg = imag.(sp_avg)
 sz_avg = Σz ./ (N_total / 2)
 
-# Input field components.
 a_in_x   = real.(E_of_t_arr)
 a_in_p   = imag.(E_of_t_arr)
 a_in_abs = abs.(E_of_t_arr)
 
-# Number of spins in every selected resonant-delta bin.
 Nj_flat = vec(Nj_2d)
 Nj_keep = Nj_flat[keep_bins]
 
-# Resonant-bin normalized Bloch variables.
 sigma_p_keep = normalize_resonant_rows(Sp_keep, Nj_keep)
 sigma_z_keep = normalize_resonant_rows(Sz_keep, Nj_keep)
 
-# Saved resonant g values in Hz.
 g_keep_Hz = g_keep ./ (2π)
 
-# Full axes in Hz.
 delta_axis_Hz  = delta_b_1d ./ (2π)
 g_axis_Hz      = g_b_1d ./ (2π)
 delta_axis_MHz = delta_axis_Hz ./ 1e6
@@ -462,9 +374,6 @@ println("peak results present = $has_peak_results")
 println("============================================================")
 println()
 
-# ============================================================
-# 6) PLOT DEFAULTS
-# ============================================================
 
 default(
     size = (900, 600),
@@ -479,9 +388,6 @@ default(
     bottom_margin = 3mm,
 )
 
-# ============================================================
-# 7) SELECT THE 2D HEATMAP REGION
-# ============================================================
 
 idx_delta_plot = findall(
     (delta_axis_Hz .>= delta_plot_min) .&
@@ -509,9 +415,6 @@ println("δ / 2π = [$(minimum(delta_plot_Hz)), $(maximum(delta_plot_Hz))] Hz")
 println("g / 2π = [$(minimum(g_plot_Hz)), $(maximum(g_plot_Hz))] Hz")
 println()
 
-# ============================================================
-# 8) DETUNING HISTOGRAM
-# ============================================================
 
 plot_delta = bar(
     delta_axis_Hz,
@@ -524,9 +427,6 @@ plot_delta = bar(
 
 display_and_save(plot_delta, "plot_delta_histogram.png", figdir)
 
-# ============================================================
-# 9) g HISTOGRAM
-# ============================================================
 
 plot_g = bar(
     g_axis_Hz,
@@ -539,9 +439,6 @@ plot_g = bar(
 
 display_and_save(plot_g, "plot_g_histogram.png", figdir)
 
-# ============================================================
-# 10) GLOBAL SPIN DYNAMICS
-# ============================================================
 
 plot_spins = plot(t_us, sx_avg; label="⟨σx⟩")
 plot!(plot_spins, t_us, sy_avg; label="⟨σy⟩")
@@ -562,9 +459,6 @@ title!(plot_spins, "Global spin dynamics")
 
 display_and_save(plot_spins, "plot_spins.png", figdir)
 
-# ============================================================
-# 11) DRIVE AMPLITUDE
-# ============================================================
 
 plot_drive = plot(t_us, a_in_abs; label="|E(t)|")
 
@@ -583,9 +477,6 @@ title!(plot_drive, "Input + WURST drive amplitude")
 
 display_and_save(plot_drive, "plot_drive_amplitude.png", figdir)
 
-# ============================================================
-# 12) INPUT-PULSE ZOOM
-# ============================================================
 
 signal_zoom_half_span_us = 5 * sigma_sig_us
 idx_signal = time_window_indices(t_us, tsig_us, signal_zoom_half_span_us)
@@ -604,9 +495,6 @@ title!(plot_signal, "Input pulse zoom")
 
 display_and_save(plot_signal, "plot_input_zoom.png", figdir)
 
-# ============================================================
-# 13) FIRST-ECHO ZOOM
-# ============================================================
 
 idx_echo1_zoom = time_window_indices(
     t_us,
@@ -632,9 +520,6 @@ title!(plot_echo1, "First echo zoom")
 
 display_and_save(plot_echo1, "plot_echo1_zoom.png", figdir)
 
-# ============================================================
-# 14) SECOND-ECHO ZOOM
-# ============================================================
 
 idx_echo2_zoom = time_window_indices(
     t_us,
@@ -660,9 +545,6 @@ title!(plot_echo2, "Second echo zoom")
 
 display_and_save(plot_echo2, "plot_echo2_zoom.png", figdir)
 
-# ============================================================
-# 15) RESONANT-DELTA TRAJECTORIES FOR SELECTED g BINS
-# ============================================================
 
 selected_g_indices = unique([
     argmin(abs.(g_keep_Hz .- g_target))
@@ -682,7 +564,6 @@ println()
 
 ig_first = first(selected_g_indices)
 
-# ---- normalized Sz trajectories ----
 plot_selected_sz = plot(
     t_us,
     vec(sigma_z_keep[ig_first, :]);
@@ -718,7 +599,6 @@ display_and_save(
     figdir,
 )
 
-# ---- normalized |Sp| trajectories ----
 plot_selected_sp_abs = plot(
     t_us,
     abs.(vec(sigma_p_keep[ig_first, :]));
@@ -754,7 +634,6 @@ display_and_save(
     figdir,
 )
 
-# ---- phase of Sp trajectories ----
 plot_selected_sp_phase = plot(
     t_us,
     angle.(vec(sigma_p_keep[ig_first, :]));
@@ -791,9 +670,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 16) WHOLE-TIME INPUT-OUTPUT FIELD
-# ============================================================
 
 plot_io = plot(t_us, a_in_x; label="Re[a_in]")
 plot!(plot_io, t_us, a_in_p; label="Im[a_in]")
@@ -816,9 +692,6 @@ title!(plot_io, "Whole-time input-output field")
 
 display_and_save(plot_io, "plot_input_output.png", figdir)
 
-# ============================================================
-# 17) WHOLE-TIME INPUT-OUTPUT FIELD WITH Y LIMIT
-# ============================================================
 
 if whole_plot_ymin !== nothing && whole_plot_ymax !== nothing
     plot_io_limited = deepcopy(plot_io)
@@ -831,9 +704,6 @@ if whole_plot_ymin !== nothing && whole_plot_ymax !== nothing
     )
 end
 
-# ============================================================
-# 18) WURST1 ZOOM
-# ============================================================
 
 w1_start_us = t0w1 * 1e6
 w1_end_us   = (t0w1 + Tw1) * 1e6
@@ -857,9 +727,6 @@ title!(plot_w1, "WURST1 zoom")
 
 display_and_save(plot_w1, "plot_wurst1_zoom.png", figdir)
 
-# ============================================================
-# 19) WURST2 ZOOM
-# ============================================================
 
 w2_start_us = t0w2 * 1e6
 w2_end_us   = (t0w2 + Tw2) * 1e6
@@ -883,10 +750,6 @@ title!(plot_w2, "WURST2 zoom")
 
 display_and_save(plot_w2, "plot_wurst2_zoom.png", figdir)
 
-# ============================================================
-# 20) PHASE HEATMAPS AT DETECTED ECHO PEAKS
-#     x-axis = delta, y-axis = g
-# ============================================================
 
 if has_peak_results
     Sp_echo1_2d = ensure_2d(
@@ -942,7 +805,6 @@ if has_peak_results
         sz_clim_max += pad
     end
 
-    # ---- phase at Echo1 ----
     plot_phase1 = heatmap(
         delta_plot_Hz,
         g_plot_Hz,
@@ -960,7 +822,6 @@ if has_peak_results
         figdir,
     )
 
-    # ---- phase at Echo2 ----
     plot_phase2 = heatmap(
         delta_plot_Hz,
         g_plot_Hz,
@@ -978,10 +839,6 @@ if has_peak_results
         figdir,
     )
 
-    # ========================================================
-    # 21) PHASE VERSUS g
-    #     Sum S+ only over the selected central detuning range.
-    # ========================================================
 
     idx_delta_phase = findall(abs.(delta_axis_MHz) .<= delta_window_MHz)
 
@@ -1031,11 +888,7 @@ else
     )
 end
 
-# ============================================================
-# 22) PULSE ANALYSIS
-# ============================================================
 
-# Reproduce the older convention: use ±15 signal standard deviations.
 analysis_half_span_us = 15 * sigma_sig_us
 
 input_analysis = pulse_window_analysis(
@@ -1072,9 +925,6 @@ result_integral_echo2 = echo2_analysis.integral / input_analysis.integral
 result_norm_echo1 = echo1_analysis.norm / input_analysis.norm
 result_norm_echo2 = echo2_analysis.norm / input_analysis.norm
 
-# ============================================================
-# 23) SUMMARY
-# ============================================================
 
 println()
 println("============================================================")

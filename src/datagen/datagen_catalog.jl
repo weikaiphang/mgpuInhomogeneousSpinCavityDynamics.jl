@@ -1,16 +1,3 @@
-# ============================================================
-# Nested pairing, validation, and catalog replace.
-#
-# Layers:
-#   1. Core: every gated system × one canonical pulse per family
-#   2. Pulse depth: canonical system × every valid pulse design
-#   3. Physics depth: every gated system × canonical RASE / ROSE / 3-ARP
-#      (already contained in layer 1; kept as an explicit tag)
-#
-# --phase configs writes to data/datagen/configs.staging, then replaces
-# data/datagen/configs/. See src/datagen/README.md.
-# ============================================================
-
 function try_bound_pulse(design, sys)
     try
         spec = bind_pulse(design, sys)
@@ -67,9 +54,6 @@ function enumerate_pairs(systems, designs)
         return nothing
     end
 
-    # Layer 1 / 3: all systems × canonical pulse of each family.
-    # Sort families so catalog order (and --limit) is reproducible;
-    # Dict iteration order is not.
     for sys in systems
         for fam in sort!(collect(keys(canon_pulses)))
             design = canon_pulses[fam]
@@ -78,7 +62,6 @@ function enumerate_pairs(systems, designs)
         end
     end
 
-    # Layer 2: canonical system × all pulse designs.
     for design in designs
         consider!(canon_sys, design, "pulse_depth")
     end

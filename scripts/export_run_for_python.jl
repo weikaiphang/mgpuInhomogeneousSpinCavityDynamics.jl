@@ -1,24 +1,3 @@
-# ============================================================
-# EXPORT A SAVED RUN FOR CROSS-CHECKING FROM PYTHON
-#
-# JLD2 packs the saved `data` NamedTuple using Julia-specific
-# compound HDF5 types (see sim_io.py's own HONEST CAVEAT docstring
-# in InhomogeneousSpinCavityDynamics.py for the same caveat from
-# the other direction) -- so it is not readable via plain h5py.
-# This script re-exports the one Julia run under comparison into
-# two plain, dependency-free formats any Python environment can
-# read directly:
-#
-#   trajectory.csv -- t_saved, a_sol, Sigma_p_sol, Sigma_z_sol,
-#                      E_of_t_arr (complex columns split into
-#                      _re/_im), one row per saved time point.
-#   meta.json      -- N_total, elapsed_seconds, ensemble sizes,
-#                      and peak_detection_results.
-#
-# Usage:
-#   julia --project=. scripts/export_run_for_python.jl <path/to/run.jld2> <output_dir>
-# ============================================================
-
 using JLD2
 using JSON3
 using Printf
@@ -36,9 +15,6 @@ mkpath(outdir)
 
 @load jld2_path data
 
-# ============================================================
-# TRAJECTORY CSV
-# ============================================================
 
 csv_path = joinpath(outdir, "trajectory.csv")
 
@@ -62,9 +38,6 @@ open(csv_path, "w") do io
     end
 end
 
-# ============================================================
-# METADATA JSON
-# ============================================================
 
 peaks = [
     Dict(

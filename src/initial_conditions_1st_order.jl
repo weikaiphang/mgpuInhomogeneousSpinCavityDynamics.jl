@@ -1,12 +1,3 @@
-# ============================================================
-# INITIAL CONDITIONS (1st-order)
-#
-# IC symbols match `build_u0_1st_order_cpu` in pulse_optimizer2.jl:
-#   :ground, :inverted, :equator, :weak, :weak_inverted, :custom
-# `:weak` / `:weak_inverted` use `_WEAK_SEED` (defined there).
-# Existing :ground / :inverted / :custom builders are unchanged.
-# ============================================================
-
 function _unknown_initial_condition(initial_condition)
     error(
         "Unknown initial_condition = $(initial_condition). " *
@@ -43,15 +34,12 @@ function build_u0_gpu_1st_order_ground(M, Nj)
 
     idx = 1
 
-    # a
     u0[idx] = 0.0 + 0.0im
     idx += 1
 
-    # S+
     u0[idx:idx+M-1] .= 0.0 + 0.0im
     idx += M
 
-    # Sz
     u0[idx:idx+M-1] .= - Nj ./ 2
     idx += M
 
@@ -63,15 +51,12 @@ function build_u0_gpu_1st_order_inverted(M, Nj)
 
     idx = 1
 
-    # a
     u0[idx] = 0.0 + 0.0im
     idx += 1
 
-    # S+
     u0[idx:idx+M-1] .= 0.0 + 0.0im
     idx += M
 
-    # Sz
     u0[idx:idx+M-1] .= Nj ./ 2
     idx += M
 
@@ -83,22 +68,18 @@ function build_u0_gpu_1st_order_custom(M, Nj)
 
     idx = 1
 
-    # a
     u0[idx] = 0.0 + 0.0im
     idx += 1
 
-    # S+
     u0[idx:idx+M-1] .= 0.0 + 0.0im
     idx += M
 
-    # Sz
     u0[idx:idx+M-1] .= 0.0 + 0.0im
     idx += M
 
     return CuArray(u0)
 end
 
-# Same assignments as `build_u0_1st_order_cpu` in pulse_optimizer2.jl.
 function build_u0_gpu_1st_order_equator(M, Nj)
     u0 = zeros(ComplexF64, state_length_1st_order(M))
     idx = 1

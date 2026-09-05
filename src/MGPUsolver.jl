@@ -1,15 +1,3 @@
-# ============================================================
-# USER-FACING SOLVER
-# ============================================================
-
-"""
-    assemble_problem(M, delta_b, g_b, Nj, E_of_t, delta0, kappa_e, kappa_i;
-                     nshards, device_ids, integrator, atol, rtol, threaded, T)
-
-Build a sharded problem and allocate its device registers.  The caller is
-responsible for the initial condition ([`set_initial_condition!`](@ref) or
-[`scatter_state!`](@ref)) and for freeing the shards afterwards.
-"""
 function assemble_problem(M::Integer,
                           delta_b::AbstractVector,
                           g_b::AbstractVector,
@@ -49,17 +37,11 @@ function assemble_problem(M::Integer,
 
     shards = build_shards(T, M, part, devs, delta_b, g_b, Nj, nreg)
 
-    # Pinned once, for the problem's whole lifetime (see exchange_rowsums!):
-    # page-locking makes the async H2D copy a genuine DMA transfer, and
-    # keeping a permanent reference on the problem struct means the GC can
-    # never collect it out from under an in-flight copy.
     local hostbuf
     try
         CUDA.device!(devs[1])
         hostbuf = CUDA.pin(Vector{Complex{T}}(undef, 3M))
     catch
-        # Don't leak the (potentially many-GiB) shards just built above if
-        # this last, tiny host-side allocation fails.
         free_shards!(shards)
         rethrow()
     end
@@ -72,23 +54,6 @@ function assemble_problem(M::Integer,
 end
 
 
-"""
-    mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...)
-
-Second-order cumulant simulation, sharded over the ensemble.  Extra keyword
-arguments (or matching fields on `SIM_SETTING`) control the multi-GPU path:
-
-| keyword          | default     | meaning |
-|------------------|-------------|---------|
-| `nshards`        | #GPUs       | number of ensemble shards |
-| `device_ids`     | `0:n-1`     | CUDA device indices, one per shard |
-| `integrator`     | `:tsit5`    | `:tsit5` (9 registers) or `:ck45` (5 registers) |
-| `save_mode`      | `:tstops`   | `:tstops` or `:interpolate` (Tsit5 only) |
-| `save_spins`     | `true`      | keep the `M × Nt` spin histories |
-| `threaded`       | auto        | one Julia task per shard |
-| `progress_every` | `0`         | print a progress line every N steps |
-| `clean_gpu`      | `true`      | reclaim device memory on exit |
-"""
 function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
                            nshards = UNSET,
                            device_ids = UNSET,
@@ -130,18 +95,6 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
         verbose = verbose,
     )
 
-    # Device memory is the scarce, expensive resource here (the shards can
-    # be many GiB; contrast the ~megabytes-at-most pinned row-sum buffer in
-    # assemble_problem, which isn't worth this treatment). Building `data`
-    # inside a try/finally, with the cleanup in the `finally`, guarantees
-    # the shards are released whether this run succeeds, throws mid-solve
-    # (e.g. the step-size-underflow error in solve_mgpu!), or throws while
-    # recording -- rather than only on the success path, which is what a
-    # bare `if clean_gpu ... end` after the fact would give. This matters
-    # most for a long-lived process that calls mgpu_run_sim_2nd_order many times
-    # in a loop (a parameter sweep or optimizer): one failed iteration
-    # should not permanently strand that iteration's GPU allocation for the
-    # rest of the process.
     data = try
         set_initial_condition!(prob, d.Nj, kind)
 
@@ -211,8 +164,6 @@ function mgpu_run_sim_2nd_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG;
         end
     end
 
-    # Freed above, before this (potentially slow) disk write, rather than
-    # after -- the GPU allocation has no reason to be held hostage by I/O.
     filename = CONFIG.saved_file_name
     save_run_data(filename, data)
     verbose && println("Saving to: ", filename)
@@ -224,10 +175,6 @@ function mgpu_run_simulation(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kwargs...
     order = get_simulation_order(SIM_SETTING)
     if order in (:first_order, :order1, :first, 1)
         println("Start running 1st-order cumulant spin-cavity simulation...")
-        # run_sim_1st_order is the shared, single-GPU-only implementation and
-        # only accepts `clean_gpu`; the other keywords accepted here
-        # (verbose, progress_every, nshards, integrator, ...) are specific to
-        # the multi-GPU 2nd-order path and must not be forwarded to it.
         kw1 = haskey(kwargs, :clean_gpu) ? (clean_gpu = kwargs[:clean_gpu],) : NamedTuple()
         return run_sim_1st_order(SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG; kw1...)
     elseif order in (:second_order, :order2, :second, 2)

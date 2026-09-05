@@ -1,12 +1,3 @@
-# ============================================================
-# RUNGE-KUTTA TABLEAUS
-# ============================================================
-
-# ------------------------------------------------------------
-# Tsitouras 5(4) — the method the single-GPU package uses through
-# OrdinaryDiffEq, with the identical coefficients so that step sequences and
-# error estimates match.  Nine full-state registers.
-# ------------------------------------------------------------
 struct Tsit5Tableau{T}
     c2::T; c3::T; c4::T; c5::T; c6::T
     a21::T
@@ -39,14 +30,6 @@ end
 
 alg_order(::Tsit5Tableau) = 5
 
-"""
-    Tsit5Interp(T)
-
-Coefficients of the 4th-order dense-output polynomials
-`b_i(Θ) = r_i1 Θ + r_i2 Θ² + r_i3 Θ³ + r_i4 Θ⁴`.  Used to sample observables
-at the requested output times without forcing the integrator to step onto
-them.
-"""
 function Tsit5Interp(::Type{T}) where {T}
     return (
         (T(1.0), T(-2.763706197274826), T(2.9132554618219126), T(-1.0530884977290216)),
@@ -59,11 +42,6 @@ function Tsit5Interp(::Type{T}) where {T}
     )
 end
 
-"""
-    interp_weights(interp, Θ)
-
-Evaluate the seven dense-output polynomials at `Θ ∈ [0,1]`.
-"""
 function interp_weights(interp::NTuple{7,NTuple{4,T}}, Θ::T) where {T}
     Θ2 = Θ * Θ
     Θ3 = Θ2 * Θ
@@ -75,26 +53,10 @@ function interp_weights(interp::NTuple{7,NTuple{4,T}}, Θ::T) where {T}
 end
 
 
-# ------------------------------------------------------------
-# RK4(3)5[2R+]C of Kennedy, Carpenter & Lewis, Appl. Numer. Math. 35 (2000)
-# 177-219, Table 1.
-#
-# A van der Houwen two-register scheme: a[i,j] = b[j] for j <= i-2, so the
-# stage values can be advanced with a running accumulator instead of keeping
-# every stage derivative.  With the state itself, the accumulator, the
-# derivative and an error accumulator that is five registers instead of the
-# nine Tsit5 needs — i.e. roughly 1.8x more ensemble bins per GPU, at the
-# cost of one order of accuracy.
-#
-# The coefficients below reproduce all eight fourth-order conditions and the
-# embedded third-order conditions to machine precision; `test/` re-checks
-# this, and dev/decode_lsrk_tableau.jl documents how they were recovered from
-# the published rational forms.
-# ------------------------------------------------------------
 struct CK45Tableau{T}
-    A::NTuple{4,T}      # subdiagonal a[i+1,i]
+    A::NTuple{4,T}
     b::NTuple{5,T}
-    bt::NTuple{5,T}     # b - b̂
+    bt::NTuple{5,T}
     c::NTuple{5,T}
 end
 
@@ -114,7 +76,6 @@ function CK45Tableau(::Type{T}) where {T}
           606302364029 / 971179775848,
           1097981568119 / 3980877426909)
 
-    # c_i = Σ_j a_ij with the 2R structure
     c = (0.0,
          A[1],
          b[1] + A[2],

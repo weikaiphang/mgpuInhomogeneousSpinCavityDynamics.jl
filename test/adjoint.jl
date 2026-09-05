@@ -1,16 +1,3 @@
-# Discrete Tsit5 adjoint tests. Existing Dual @testsets above are the
-# production CI contract and are not relaxed here.
-
-# Mixed absolute/relative max error. The 1e-6 absolute floor (raised from
-# 1e-8) covers STRUCTURAL zeros of the pulse_cost gradient -- notably the
-# global-drive-phase parameter, to which both the paper bright-mode
-# inversion and the per-frequency-slice silencing factor |F|_⋆ are exactly
-# invariant. Once |F|_⋆ clamps (a coherence-preserving pulse drives the
-# :weak track's coherence well above its ε seed), the silencing track
-# contributes an exact 0 to that component, so the two backends differ only
-# by reverse- vs forward-mode roundoff on a genuine 0 (~1e-16). Every
-# component with a non-negligible gradient (|g| ≫ 1e-6) is still compared at
-# full relative strictness.
 function _relmax(g, fd)
     return maximum(abs.(g .- fd) ./ max.(abs.(g), abs.(fd), 1e-6))
 end
@@ -38,14 +25,6 @@ end
     @test dx ≈ dx_ref atol=1e-14
 end
 
-# Pins rhs_1st_order! to its pre-optimisation formulation, elementwise.
-# `_rhs_1st_order_preopt!` is the RHS exactly as it stood before the
-# GPU-hot-path work (scalar `a = u[1]` / `du[1] = ...`, and a fresh
-# `sum(g_b .* conj.(Sp))` temporary each call). The current
-# rhs_1st_order! uses a 1-element view for `a`/`da` and a reused reduction
-# buffer; both are meant to be BIT-IDENTICAL on the Vector / Dual
-# backends. If a future change alters the vector field on these paths,
-# this fails even when the looser real-split `atol` test above would not.
 function _rhs_1st_order_preopt!(du, u, p, t)
     delta0, kappa_e, kappa_i, delta_b, g_b, M, E_of_t = p
     a = u[1]
@@ -68,19 +47,16 @@ end
     M = Int(d.M)
     p = _toy_p(d; E = t -> 1.3 + 0.7im)
 
-    # ComplexF64 path: exact bits, cold AND warm reduction buffer.
     for seed in (1, 2, 3), t in (0.0, 1.3e-6, 4.1e-5)
         rng = Random.Xoshiro(seed)
         u = randn(rng, ComplexF64, state_length_1st_order(M))
         a_new = similar(u); a_ref = similar(u)
         rhs_1st_order!(a_new, u, p, t)
-        rhs_1st_order!(a_new, u, p, t)          # warm buffer
+        rhs_1st_order!(a_new, u, p, t)
         _rhs_1st_order_preopt!(a_ref, u, p, t)
         @test reinterpret(UInt8, a_new) == reinterpret(UInt8, a_ref)
     end
 
-    # ForwardDiff.Dual path: derivative of a scalar functional of `du`
-    # w.r.t. a knob threaded through E(t) must match to the last bit.
     rng = Random.Xoshiro(7)
     u = randn(rng, ComplexF64, state_length_1st_order(M))
     w = randn(rng, ComplexF64, state_length_1st_order(M))
@@ -158,10 +134,6 @@ end
     Sp = randn(rng, ComplexF64, M)
     nR = real_state_length_1st_order(M)
 
-    # Pullbacks now seed the RAW ∂inversion/∂x, ∂silencing/∂x gradients
-    # (no w_inv/w_sil/target_F baked in -- pulse_cost's multiplicative
-    # fidelity couples the two tracks outside the pullback, see
-    # pulse_cost_grad_adjoint).
     λI = zeros(nR)
     inversion_pullback!(λI, Sz, d.g_b, d.Nj)
     zr0 = real.(Sz)
@@ -305,10 +277,6 @@ end
                      (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, I_min=0.99, kappa_I=5.0, kappa_S=0.0),
                      (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, S_min=0.99, kappa_S=5.0, kappa_I=0.0),
                      (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0, I_min=0.9, kappa_I=3.0, S_min=0.9, kappa_S=8.0))
-        # Both pulse_cost_grad_adjoint and pulse_cost_on_frozen_mesh get the
-        # SAME I_min/kappa_I/S_min/kappa_S -- this is the test that would go
-        # silently meaningless if pulse_cost_on_frozen_mesh had been
-        # forgotten when the squared-hinge penalty was added.
         g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw...)
         @test all(isfinite, g_adj)
         @test isfinite(cost_adj)
@@ -327,7 +295,6 @@ end
         end
         @test _relmax(g_adj, fd) < 1e-4
 
-        # Richardson on raw_gap (index 1): shrinking ε should not explode.
         ε2 = ε / 2
         up = copy(θ); um = copy(θ); up[1] += ε2; um[1] -= ε2
         Jp, = pulse_cost_on_frozen_mesh(up, pulse, d, mesh_g, mesh_e; cost_kw...)
@@ -343,20 +310,10 @@ end
     pulse = CompositePulse(1, 4, 4, d)
     θ = seed_canonical(pulse, :hs1)
     cost_kw = (target_F=1.0, w_time=0.15, w_power=0.05, w_tmax=1.0)
-    # use_checkpoints=false explicitly here: the reference "full store, no
-    # checkpointing" reverse path, deliberately NOT exercising checkpointing
-    # at all (use_checkpoints now defaults to true, per grad_mode=:adjoint's
-    # own default -- see pulse_cost_grad_adjoint's docstring).
     g_full, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., use_checkpoints=false)
     g_win, = pulse_cost_grad_adjoint(θ, pulse, d; cost_kw..., checkpoint_stride=2, use_checkpoints=true)
     @test g_win ≈ g_full atol=1e-10 rtol=1e-10
 
-    # use_checkpoints=true with checkpoint_stride explicitly reset to
-    # typemax(Int) (its old default) gives exactly one window spanning the
-    # whole trajectory -- still correct (same gradient), but should warn
-    # since it provides no memory saving. This degenerate combination no
-    # longer happens under pulse_cost_grad_adjoint's OWN defaults (300, not
-    # typemax(Int)) -- only when checkpoint_stride is reset explicitly.
     g_nostride = @test_logs (:warn, r"no memory saving") pulse_cost_grad_adjoint(
         θ, pulse, d; cost_kw..., use_checkpoints=true, checkpoint_stride=typemax(Int),
     )[1]
@@ -381,19 +338,6 @@ end
 end
 
 @testset "pulse_cost_grad_adjoint vs _pulse_cost_grad_threaded: independent backends agree" begin
-    # Two INDEPENDENTLY implemented exact differentiation methods (discrete
-    # reverse-mode adjoint vs forward-mode Dual AD) of the SAME pulse_cost --
-    # unlike every other adjoint test here, this is not checked against a
-    # finite-difference approximation (limited to ~1e-4 by FD truncation
-    # error) but directly against the OTHER production gradient backend, so
-    # it can assert much tighter agreement. cost/inversion/silencing/duration/
-    # coherence are expected to match EXACTLY (not just approximately): both
-    # backends solve the identical ODE (rhs_1st_order!, Tsit5, same
-    # tolerances) for the primal, and ForwardDiff.Dual's own value component
-    # is ordinary floating-point arithmetic mirroring the primal computation
-    # exactly, not a perturbed one. Only the GRADIENT itself, computed via
-    # genuinely different algorithms, is expected to differ -- at the
-    # Float64 roundoff floor, not at any looser tolerance.
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     θ = seed_canonical(pulse, :hs1)
     for kw in ((w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0),
@@ -403,7 +347,6 @@ end
                (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, S_min=0.99, kappa_S=5.0, kappa_I=0.0),
                (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, I_min=0.9, kappa_I=3.0, S_min=0.9, kappa_S=8.0),
                (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, I_min=0.9, kappa_I=6.0, S_min=0.9, kappa_S=2.0),
-               # single-track: adjoint (1 fwd + 2 rev on :weak) vs threaded (one Jacobian on :weak)
                (w_tmax=1.0, w_power=0.05, w_time=0.15, target_F=1.0, track=:weak),
                (w_tmax=2.0, w_power=0.2, w_time=0.5, target_F=0.0, track=:weak, I_min=0.9, kappa_I=6.0, S_min=0.9, kappa_S=2.0))
         g_adj, cost_adj, inv_a, sil_a, dur_a, coh_a, famp_a, ret_a = pulse_cost_grad_adjoint(θ, pulse, FAKE_D_ODE; kw...)
@@ -415,22 +358,12 @@ end
         @test coh_a == coh_t
         @test famp_a == famp_t
         @test ret_a == ret_t
-        # redefinition invariant: coherence is the triangle-inequality bound on |F|_⋆
         @test coh_a >= sil_a - 1e-12
         @test _relmax(g_adj, g_thr) < 1e-9
     end
 end
 
 @testset "run_local_adam grad_mode=:adjoint + anneal_direct_weights=true" begin
-    # Coverage gap otherwise: anneal_direct_weights=true is exercised
-    # elsewhere only under the default (:forwarddiff) grad_mode. The
-    # schedule/moving-target logic in run_local_adam is grad_mode-agnostic
-    # by construction (it only touches epoch_cost_kwargs/dyn_cost, whichever
-    # of the three branches produced them), but that wiring deserves its own
-    # direct check, not just an inference from the other two branches'
-    # coverage. hop=1 is REQUIRED here -- hop=0 (the default) never anneals,
-    # so this would silently stop testing anneal_direct_weights at all
-    # without it.
     pulse = CompositePulse(1, 4, 4, FAKE_D_ODE)
     u0 = seed_canonical(pulse, :hs1)
     cost_kwargs = (w_tmax=1.0, w_power=0.05, w_time=0.15)
@@ -441,18 +374,8 @@ end
     @test length(adj[1]) == n_params(pulse)
     @test isfinite(adj[2])
     @test length(adj[6]) >= 1
-    @test any(h.schedule_factor != 0.0 for h in adj[6])  # annealing genuinely active at hop=1
+    @test any(h.schedule_factor != 0.0 for h in adj[6])
 
-    # Epoch 1 starts from the SAME schedule state regardless of grad_mode
-    # (the calibration seed -> schedule_factor = x_tune_alpha, applied
-    # identically in all three branches), so all THREE
-    # grad_mode/threaded_grad branches must reproduce the SAME sandbox
-    # cost/inversion/silencing exactly (all solve the identical primal ODE
-    # at epoch 1 -- see the cross-backend testset above for why cost, as
-    # opposed to gradient, matches exactly rather than approximately). The
-    # squared-hinge penalty (I_min/kappa_I/S_min/kappa_S, defaulted here
-    # since cost_kwargs doesn't override them) is static, so this equality
-    # holds trivially at every epoch, not just epoch 1 -- checked below too.
     fwd = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=1, patience=1, learning_rate=0.05, label="[fwd-anneal]",
         threaded_grad=false, anneal_direct_weights=true)
@@ -463,11 +386,6 @@ end
     @test adj[6][1].inversion == fwd[6][1].inversion == thr[6][1].inversion
     @test adj[6][1].silencing == fwd[6][1].silencing == thr[6][1].silencing
 
-    # cost/inversion/silencing stay CLOSE across all three branches over
-    # several epochs (not bit-exact past epoch 1: each backend's own
-    # roundoff-level gradient difference feeds into Adam's next step, which
-    # a nonlinear ODE solve then amplifies slightly -- so this is a loose
-    # relative check, not the epoch-1 exact-equality one above).
     adj3 = run_local_adam(u0, pulse, FAKE_D_ODE, cost_kwargs;
         hop=1, num_epochs=3, patience=3, learning_rate=0.05, label="[adj-anneal3]",
         grad_mode=:adjoint, threaded_grad=false)

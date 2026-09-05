@@ -2,9 +2,6 @@ using InhomogeneousSpinCavityDynamics
 using JLD2
 using Printf: @sprintf, @printf
 
-# ============================================================
-# 1) OUTPUT DIRECTORY
-# ============================================================
 
 OUTDIR = normpath(
     joinpath(
@@ -18,15 +15,7 @@ OUTDIR = normpath(
 
 mkpath(OUTDIR)
 
-# ============================================================
-# 2) USER SETTINGS: DURATION AND g-STD SCANS
-# ============================================================
 
-# For each WURST duration, specify the g standard deviations
-# that should be scanned.
-#
-# duration_us is entered in μs.
-# g_std_Hz is entered in Hz.
 
 SWEEP_PLAN = (
     (
@@ -89,23 +78,15 @@ SWEEP_PLAN = (
     ),
 )
 
-# ============================================================
-# 3) PULSE AND ANALYSIS TIMES
-# ============================================================
 
 SIGNAL_CENTER_S = 15e-6
 SIGNAL_SIGMA_S  = 3e-6
 WURST_CENTER_S  = 120e-6
 
-# Signal center in μs.
 TSIG_US = SIGNAL_CENTER_S * 1e6
 
-# The same half-span is used for input and Echo1 analysis.
 ANALYSIS_HALF_SPAN_US = 10.0
 
-# Expected Echo1 center:
-#
-# t_echo1 = 2*t_WURST - t_signal
 
 ECHO1_CENTER_S =
     2 * WURST_CENTER_S - SIGNAL_CENTER_S
@@ -118,34 +99,24 @@ println("Expected Echo1 center: $ECHO1_CENTER_US μs")
 println("Analysis half-span:    $ANALYSIS_HALF_SPAN_US μs")
 println("Output directory:      $OUTDIR")
 
-# ============================================================
-# 4) BASE SIMULATION SETTINGS
-# ============================================================
 
 SIM_SETTING_BASE = (
-    # --- simulation order ---
     simulation_order = :order1,
 
-    # --- discretization ---
     M_delta = 1000,
     M_g     = 20,
 
-    # --- initial condition ---
     initial_condition = :ground,
 
-    # --- simulation time ---
     Ttotal = 300e-6,
 
-    # --- solver ---
     Nt_save = 5001,
     reltol  = 1e-8,
     abstol  = 1e-8,
 
-    # Replaced separately for every sweep point.
     saved_file_name =
         joinpath(OUTDIR, "temporary.jld2"),
 
-    # --- Echo1 peak detection for phase recording ---
     peak_detection = (
         labels = [:echo1],
         times = [ECHO1_CENTER_S],
@@ -154,20 +125,14 @@ SIM_SETTING_BASE = (
     ),
 )
 
-# ============================================================
-# 5) BASE SYSTEM CONFIGURATION
-# ============================================================
 
 SYSTEM_CONFIG_BASE = (
-    # --- cooperativity ---
     C_ens = 0.6,
 
-    # --- cavity ---
     delta0 = 0.0,
     kappa_e = 2 * pi * 1e6,
     kappa_i = 2 * pi * 0,
 
-    # --- detuning distribution ---
     freq_inhomogeneity = (
         kind = :lorentzian,
         FWHM = 2 * pi * 1e6,
@@ -175,9 +140,6 @@ SYSTEM_CONFIG_BASE = (
         renormalize = false,
     ),
 
-    # --- coupling distribution ---
-    #
-    # std is replaced for every sweep point.
     g_inhomogeneity = (
         kind = :gaussian,
         mean = 2 * pi * 100,
@@ -187,9 +149,6 @@ SYSTEM_CONFIG_BASE = (
     ),
 )
 
-# ============================================================
-# 6) BASE PULSE CONFIGURATION
-# ============================================================
 
 PULSE_CONFIG_BASE = (
     (
@@ -214,7 +173,6 @@ PULSE_CONFIG_BASE = (
 
         t_center = WURST_CENTER_S,
 
-        # Replaced for every duration scan.
         duration = 100e-6,
 
         amp =
@@ -234,9 +192,6 @@ PULSE_CONFIG_BASE = (
     ),
 )
 
-# ============================================================
-# 7) TIME-WINDOW INDICES
-# ============================================================
 
 function time_window_indices(
     t,
@@ -256,9 +211,6 @@ function time_window_indices(
     return idx
 end
 
-# ============================================================
-# 8) PULSE-WINDOW ANALYSIS
-# ============================================================
 
 function pulse_window_analysis(
     t_us,
@@ -313,9 +265,6 @@ function pulse_window_analysis(
     )
 end
 
-# ============================================================
-# 9) FILENAME LABEL
-# ============================================================
 
 function filename_label(x::Real)
     text = @sprintf("%.6g", Float64(x))
@@ -328,9 +277,6 @@ function filename_label(x::Real)
     )
 end
 
-# ============================================================
-# 10) DURATION AND g-STD SWEEP
-# ============================================================
 
 function run_duration_gstd_sweep(
     sweep_plan,
@@ -347,7 +293,6 @@ function run_duration_gstd_sweep(
         for scan in sweep_plan
     )
 
-    # The final summary contains only these three quantities.
     duration_us_results = Float64[]
     g_std_Hz_results    = Float64[]
     ACE_amp_results     = Float64[]
@@ -359,9 +304,6 @@ function run_duration_gstd_sweep(
     println("Total number of simulations: $total_runs")
     println()
 
-    # --------------------------------------------------------
-    # Scan WURST durations
-    # --------------------------------------------------------
 
     for scan in sweep_plan
         duration_us =
@@ -385,7 +327,6 @@ function run_duration_gstd_sweep(
         echo_window_start_us =
             echo1_center_us - analysis_half_span_us
 
-        # Warn when the WURST pulse approaches the input window.
         if wurst_start_us <= input_window_end_us
             @warn(
                 "The WURST pulse overlaps or approaches the input " *
@@ -396,7 +337,6 @@ function run_duration_gstd_sweep(
             )
         end
 
-        # Warn when the WURST pulse approaches the Echo1 window.
         if wurst_end_us >= echo_window_start_us
             @warn(
                 "The WURST pulse overlaps or approaches the Echo1 " *
@@ -407,9 +347,6 @@ function run_duration_gstd_sweep(
             )
         end
 
-        # ----------------------------------------------------
-        # Scan g-distribution standard deviations
-        # ----------------------------------------------------
 
         for g_std_Hz_value in scan.g_std_Hz
             run_index += 1
@@ -417,7 +354,6 @@ function run_duration_gstd_sweep(
             g_std_Hz =
                 Float64(g_std_Hz_value)
 
-            # Convert Hz to rad/s for SYSTEM_CONFIG.
             g_std_rad_s =
                 2 * pi * g_std_Hz
 
@@ -433,9 +369,6 @@ function run_duration_gstd_sweep(
                 "gstd_$(std_label)Hz.jld2",
             )
 
-            # =================================================
-            # UPDATE g-INHOMOGENEITY
-            # =================================================
 
             g_inhomogeneity_run = merge(
                 system_config_base.g_inhomogeneity,
@@ -452,9 +385,6 @@ function run_duration_gstd_sweep(
                 ),
             )
 
-            # =================================================
-            # UPDATE WURST DURATION
-            # =================================================
 
             wurst_pulse_run = merge(
                 pulse_config_base[2],
@@ -468,9 +398,6 @@ function run_duration_gstd_sweep(
                 wurst_pulse_run,
             )
 
-            # =================================================
-            # UPDATE SAVED FILENAME
-            # =================================================
 
             sim_setting_run = merge(
                 sim_setting_base,
@@ -493,9 +420,6 @@ function run_duration_gstd_sweep(
                 "============================================================"
             )
 
-            # =================================================
-            # RUN SIMULATION
-            # =================================================
 
             mgpu_run_simulation(
                 sim_setting_run,
@@ -503,13 +427,6 @@ function run_duration_gstd_sweep(
                 pulse_config_run,
             )
 
-            # =================================================
-            # LOAD SAVED DATA
-            # =================================================
-            #
-            # The simulation saves one top-level object named
-            # `data`, which is a NamedTuple.
-            #
 
             @load saved_file_name data
 
@@ -533,37 +450,22 @@ function run_duration_gstd_sweep(
                 "lengths in:\n$saved_file_name"
             )
 
-            # =================================================
-            # CONSTRUCT INPUT AND OUTPUT FIELDS
-            # =================================================
 
             kappa_e =
                 data.SYSTEM_CONFIG.kappa_e
 
-            # Input field:
-            #
-            # a_in(t) = E(t)
-            #
-            # Input-pulse analysis uses its absolute value.
 
             a_in_abs =
                 abs.(E_of_t_arr)
 
-            # Output field:
-            #
-            # a_out(t) = E(t) - sqrt(kappa_e)*a(t)
 
             a_out =
                 E_of_t_arr .-
                 sqrt(kappa_e) .* a_sol
 
-            # pulse_window_analysis uses a time axis in μs.
             t_us =
                 t_saved .* 1e6
 
-            # =================================================
-            # INPUT-PULSE ANALYSIS FROM a_in_abs
-            # =================================================
 
             input_analysis = pulse_window_analysis(
                 t_us,
@@ -578,9 +480,6 @@ function run_duration_gstd_sweep(
                 "g std = $g_std_Hz Hz"
             )
 
-            # =================================================
-            # ECHO1 ANALYSIS FROM a_out
-            # =================================================
 
             echo1_analysis = pulse_window_analysis(
                 t_us,
@@ -589,22 +488,12 @@ function run_duration_gstd_sweep(
                 a_out,
             )
 
-            # =================================================
-            # NORMALIZED ACE AMPLITUDE
-            # =================================================
-            #
-            # Input norm: calculated from a_in_abs.
-            # Echo1 norm: calculated from a_out.
-            #
 
             ACE_amp = Float64(
                 echo1_analysis.norm /
                 input_analysis.norm
             )
 
-            # =================================================
-            # RECORD SUMMARY RESULT
-            # =================================================
 
             push!(
                 duration_us_results,
@@ -628,16 +517,6 @@ function run_duration_gstd_sweep(
         end
     end
 
-    # ========================================================
-    # 11) SAVE FINAL JLD2 SUMMARY
-    # ========================================================
-    #
-    # This file contains only:
-    #
-    #   duration_us
-    #   g_std_Hz
-    #   ACE_amp
-    #
 
     summary_file = joinpath(
         outdir,
@@ -657,16 +536,6 @@ function run_duration_gstd_sweep(
             ACE_amp_results,
     )
 
-    # ========================================================
-    # 12) SAVE FINAL CSV SUMMARY
-    # ========================================================
-    #
-    # This file also contains only:
-    #
-    #   duration_us
-    #   g_std_Hz
-    #   ACE_amp
-    #
 
     csv_file = joinpath(
         outdir,
@@ -714,9 +583,6 @@ function run_duration_gstd_sweep(
     )
 end
 
-# ============================================================
-# 13) RUN THE SWEEP
-# ============================================================
 
 results = Base.invokelatest(
     run_duration_gstd_sweep,

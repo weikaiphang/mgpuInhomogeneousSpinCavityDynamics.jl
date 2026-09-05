@@ -1,7 +1,3 @@
-# ============================================================
-# ENSEMBLE DISCRETIZATION
-# ============================================================
-
 function bin_means_and_probs(dist, edges)
     Mloc = length(edges) - 1
     probs = zeros(Float64, Mloc)
@@ -75,9 +71,6 @@ function prepare_derived(CONFIG)
 
     sqrt_kappa_e = sqrt(kappa_e)
 
-    # ========================================================
-    # Frequency inhomogeneity
-    # ========================================================
 
     freq_cfg = CONFIG.freq_inhomogeneity
 
@@ -105,9 +98,6 @@ function prepare_derived(CONFIG)
 
     FWHM = freq_info.FWHM
 
-    # ========================================================
-    # Coupling inhomogeneity
-    # ========================================================
 
     g_inhomogeneity = CONFIG.g_inhomogeneity
 
@@ -117,9 +107,6 @@ function prepare_derived(CONFIG)
             M_g,
         )
 
-    # ========================================================
-    # Cooperativity -> total spin number
-    # ========================================================
 
     N = total_spin_number_from_cooperativity(
         C_ens,
@@ -130,9 +117,6 @@ function prepare_derived(CONFIG)
 
     println("Total spin number N = $N")
 
-    # ========================================================
-    # Build 2D bins
-    # ========================================================
 
     Nj, delta_b, g_b, N_total, Nj_2d = build_2d_bins(
         N,
@@ -142,9 +126,6 @@ function prepare_derived(CONFIG)
         p_g,
     )
 
-    # ========================================================
-    # Time grid
-    # ========================================================
 
     timespan = (0.0, CONFIG.Ttotal)
 

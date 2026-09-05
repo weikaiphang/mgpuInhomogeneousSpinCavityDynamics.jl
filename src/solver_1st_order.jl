@@ -1,12 +1,3 @@
-# ============================================================
-# MAIN RUN FUNCTION FOR FIRST-ORDER SIMULATION
-# ============================================================
-
-# Backend trait for `rhs_1st_order!`'s cavity-source reduction. The host
-# fallback (`_is_gpu(::AbstractArray) = false`) lives in `rhs_1st_order.jl`
-# so the CUDA-free test harness compiles; this `true` method is only in
-# scope as part of the full module. Covers `CuArray` and its `SubArray` /
-# `reshape` wrappers (`Sp` is a `SubArray` of the state `CuArray`).
 _is_gpu(::CUDA.AnyCuArray) = true
 
 function run_sim_1st_order(
@@ -15,9 +6,6 @@ function run_sim_1st_order(
     PULSE_CONFIG;
     clean_gpu = true,
 )
-    # ========================================================
-    # BUILD AND VALIDATE CONFIGURATION
-    # ========================================================
 
     CONFIG = build_full_config(
         SIM_SETTING,
@@ -43,9 +31,6 @@ function run_sim_1st_order(
 
     E_of_t = build_E_of_t(PULSE_CONFIG)
 
-    # ========================================================
-    # INITIAL CONDITION AND GPU PARAMETERS
-    # ========================================================
 
     initial_condition = get_initial_condition(CONFIG)
 
@@ -81,9 +66,6 @@ function run_sim_1st_order(
     cb = nothing
 
     try
-    # ========================================================
-    # ENSEMBLE DIMENSIONS
-    # ========================================================
 
     M_delta = length(d.delta_b_1d)
     M_g     = length(d.g_b_1d)
@@ -93,20 +75,10 @@ function run_sim_1st_order(
         "M = $M, while M_delta × M_g = $(M_delta * M_g)."
     )
 
-    # ========================================================
-    # RESONANT-DELTA BIN FOR EVERY g VALUE
-    # ========================================================
 
-    # Select the detuning bin nearest delta = 0.
     idelta_res = argmin(abs.(d.delta_b_1d))
     delta_res  = d.delta_b_1d[idelta_res]
 
-    # The flattened spin arrays follow Julia column-major order:
-    #
-    # flat_index = idelta + (ig - 1) * M_delta
-    #
-    # Therefore, the resonant-delta indices form this strided
-    # range:
     keep_range = idelta_res:M_delta:M
     keep_bins  = collect(keep_range)
 
@@ -120,9 +92,6 @@ function run_sim_1st_order(
     println("  delta_res / 2π = $(delta_res / (2π)) Hz")
     println("  number of g bins = $M_g")
 
-    # ========================================================
-    # OPTIONAL AUTOMATIC PEAK DETECTION
-    # ========================================================
 
     peak_config = prepare_peak_detection(
         SIM_SETTING,
@@ -146,9 +115,6 @@ function run_sim_1st_order(
         end
     end
 
-    # Since the saved-time points are ordered, every search
-    # window corresponds to a contiguous range of callback
-    # indices.
     peak_window_start_indices = if peak_config === nothing
         Int[]
     else
@@ -161,21 +127,12 @@ function run_sim_1st_order(
         [last(indices) for indices in peak_config.window_indices]
     end
 
-    # ========================================================
-    # MAIN SAVE ARRAYS
-    # ========================================================
 
-    # Cavity amplitude at every saved time.
     a_save = Vector{ComplexF64}(undef, Nt)
 
-    # Collective spin values at every saved time.
     Σp_save = Vector{ComplexF64}(undef, Nt)
     Σz_save = Vector{ComplexF64}(undef, Nt)
 
-    # Resonant-delta trajectories.
-    #
-    # Rows:    g bins
-    # Columns: saved times
     Sp_keep = Matrix{ComplexF64}(undef, M_g, Nt)
     Sz_keep = Matrix{ComplexF64}(undef, M_g, Nt)
 
@@ -189,16 +146,7 @@ function run_sim_1st_order(
         idx1_Sz_start(M) + M - 1
     )
 
-    # ========================================================
-    # PEAK-DETECTION BUFFERS
-    # ========================================================
 
-    # These buffers hold only one full spin state per requested
-    # peak: the best state found so far inside that peak's
-    # search window.
-    #
-    # They are GPU arrays, so updating the best peak does not
-    # require transferring every bin to the CPU during solving.
     peak_Sp_gpu = if peak_config === nothing
         nothing
     else
@@ -217,7 +165,6 @@ function run_sim_1st_order(
         ]
     end
 
-    # Best peak information found so far.
     peak_best_amplitudes = if peak_config === nothing
         nothing
     else
@@ -230,9 +177,6 @@ function run_sim_1st_order(
         zeros(Int, Npeaks)
     end
 
-    # ========================================================
-    # CALLBACK
-    # ========================================================
 
     kref = Ref(0)
 
@@ -242,34 +186,19 @@ function run_sim_1st_order(
 
         u = integrator.u
 
-        # ----------------------------------------------------
-        # Save cavity amplitude
-        # ----------------------------------------------------
 
         a_save[k] = Array(
             @view u[IDX1_a:IDX1_a]
         )[1]
 
-        # GPU views of all spin bins.
-        #
-        # Creating these views does not transfer the complete
-        # arrays to the CPU.
         Sp_gpu = @view u[range_Sp]
         Sz_gpu = @view u[range_Sz]
 
-        # ----------------------------------------------------
-        # Collective spin quantities
-        # ----------------------------------------------------
 
         Σp_save[k] = sum(Sp_gpu)
         Σz_save[k] = sum(Sz_gpu)
 
-        # ----------------------------------------------------
-        # Resonant-delta bins for every g
-        # ----------------------------------------------------
 
-        # Only M_g selected values are transferred to the CPU,
-        # rather than all M spin bins.
         Sp_keep[:, k] .= Array(
             @view Sp_gpu[keep_range]
         )
@@ -278,13 +207,8 @@ function run_sim_1st_order(
             @view Sz_gpu[keep_range]
         )
 
-        # ----------------------------------------------------
-        # OPTIONAL ONLINE PEAK DETECTION
-        # ----------------------------------------------------
 
         if peak_config !== nothing
-            # Compute the output amplitude only when the current
-            # saved time belongs to at least one search window.
             a_out_abs_now = 0.0
             a_out_computed = false
 
@@ -307,17 +231,10 @@ function run_sim_1st_order(
                         a_out_computed = true
                     end
 
-                    # If this is the largest output amplitude
-                    # encountered so far in this search window,
-                    # replace the saved peak state.
                     if a_out_abs_now > peak_best_amplitudes[ip]
                         peak_best_amplitudes[ip] = a_out_abs_now
                         peak_best_global_indices[ip] = k
 
-                        # Device-to-device copies.
-                        #
-                        # These save the complete spin state only
-                        # for the current best peak candidate.
                         peak_Sp_gpu[ip] .= Sp_gpu
                         peak_Sz_gpu[ip] .= Sz_gpu
                     end
@@ -334,20 +251,9 @@ function run_sim_1st_order(
         save_positions = (false, false),
     )
 
-    # ========================================================
-    # SOLVE
-    # ========================================================
 
     t0 = time_ns()
 
-    # No `CUDA.allowscalar()` wrapper: `rhs_1st_order!` no longer scalar-
-    # indexes the state (`u[1]` / `du[1]` are 1-element views/broadcasts)
-    # and keeps the collective-source reduction on-device; the callback
-    # only does whole-array reductions, strided gathers and `Array(view)`
-    # copies -- none of which is a scalar index. Any scalar index that
-    # slips back in MUST fail loudly rather than silently resyncing every
-    # RK stage. Set explicitly here (not just relying on noise.jl's
-    # load-time call). Guarded by scripts/rose_reference_harness.jl.
     CUDA.allowscalar(false)
 
     sol_gpu = solve(
@@ -375,9 +281,6 @@ function run_sim_1st_order(
 
     println("Time taken: $elapsed_seconds seconds")
 
-    # ========================================================
-    # POST-PROCESS CAVITY OUTPUT
-    # ========================================================
 
     E_of_t_arr = [
         E_of_t(t)
@@ -393,9 +296,6 @@ function run_sim_1st_order(
     a_out_p   = imag.(a_out)
     a_out_abs = abs.(a_out)
 
-    # ========================================================
-    # BUILD PEAK-DETECTION RESULTS
-    # ========================================================
 
     peak_detection_config = nothing
     peak_detection_results = nothing
@@ -434,11 +334,6 @@ function run_sim_1st_order(
             detected_time      = t_saved[global_peak_index]
             detected_amplitude = a_out_abs[global_peak_index]
 
-            # Transfer only the final best full-bin state from
-            # GPU to CPU, and directly arrange it as:
-            #
-            # rows    = delta bins
-            # columns = g bins
             Sp_at_peak_2d = Array(
                 reshape(
                     peak_Sp_gpu[ip],
@@ -478,9 +373,6 @@ function run_sim_1st_order(
                 a_out_x_at_peak = a_out_x[global_peak_index],
                 a_out_p_at_peak = a_out_p[global_peak_index],
 
-                # Full ensemble state only at the detected peak.
-                #
-                # Shape: M_delta × M_g
                 Sp_at_peak_2d = Sp_at_peak_2d,
                 Sz_at_peak_2d = Sz_at_peak_2d,
             )
@@ -513,9 +405,6 @@ function run_sim_1st_order(
         end
     end
 
-    # ========================================================
-    # SAVE DATA
-    # ========================================================
 
     data = (
         SIM_SETTING = SIM_SETTING,
@@ -539,9 +428,6 @@ function run_sim_1st_order(
         g_b_1d = d.g_b_1d,
         Nj_2d = d.Nj_2d,
 
-        # ----------------------------------------------------
-        # Resonant-delta trajectories for every g
-        # ----------------------------------------------------
 
         idelta_res = idelta_res,
         delta_res = delta_res,
@@ -550,13 +436,9 @@ function run_sim_1st_order(
         g_keep = g_keep,
         delta_keep = delta_keep,
 
-        # Shape: M_g × Nt
         Sp_keep = Sp_keep,
         Sz_keep = Sz_keep,
 
-        # ----------------------------------------------------
-        # Optional peak detection
-        # ----------------------------------------------------
 
         peak_detection_config = peak_detection_config,
         peak_detection_results = peak_detection_results,

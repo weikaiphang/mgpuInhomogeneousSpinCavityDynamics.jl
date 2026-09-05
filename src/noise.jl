@@ -1,16 +1,5 @@
-############################################################
-# GPU-BATCHED QRT NOISE FUNCTIONS
-############################################################
-
 CUDA.allowscalar(false)
 
-"""
-Container for the second-order simulation data required by the GPU QRT
-output-mode noise calculation.
-
-All frequencies and rates stored in fields ending in `_us` use rad/μs.
-The time axis uses μs.
-"""
 struct NoiseSimulationData
     file::String
 
@@ -120,15 +109,6 @@ function _validate_noise_data(d::NoiseSimulationData)
     return nothing
 end
 
-"""
-    load_noise_data(file; verbose=true) -> NoiseSimulationData
-
-Load a saved second-order simulation and prepare all arrays and units required
-by the GPU-batched QRT noise calculation.
-
-The saved file must contain a variable named `data` with the fields used by the
-second-order solver.
-"""
 function load_noise_data(
     file::AbstractString;
     verbose::Bool = true,
@@ -154,8 +134,6 @@ function load_noise_data(
     M_delta = Int(data.SIM_SETTING.M_delta)
     M_g     = Int(data.SIM_SETTING.M_g)
 
-    # Flattening convention:
-    #   delta varies fastest; g varies slowest.
     delta_b = repeat(
         Float64.(data.delta_b_1d),
         M_g,
@@ -201,12 +179,6 @@ function load_noise_data(
     return d
 end
 
-"""
-    print_noise_data_summary(data)
-
-Print the dimensions and constant cavity/ensemble parameters loaded for the
-noise calculation.
-"""
 function print_noise_data_summary(d::NoiseSimulationData)
     println("Loaded file: ", d.file)
     println("M_delta = ", d.M_delta)
@@ -230,8 +202,6 @@ function print_noise_data_summary(d::NoiseSimulationData)
     return nothing
 end
 
-# UTILITIES
-############################################################
 
 _noise_trapz(t, y) = sum(
     0.5 .* (y[1:end-1] .+ y[2:end]) .* diff(t)
@@ -323,9 +293,6 @@ function _noise_make_mode_window(
     return t, f
 end
 
-############################################################
-# GPU RHS
-############################################################
 
 function _noise_qrt_rhs_gpu!(
     da,
@@ -350,14 +317,9 @@ function _noise_qrt_rhs_gpu!(
 )
     B = length(a_col)
 
-    # Reshape the ensemble arrays to M × 1 so that they
-    # broadcast over all B QRT columns.
     delta_col = reshape(delta_b_gpu, :, 1)
     g_col     = reshape(g_b_gpu, :, 1)
 
-    ########################################################
-    # Cavity QRT equations
-    ########################################################
 
     sum_g_Sm = vec(
         sum(
@@ -389,9 +351,6 @@ function _noise_qrt_rhs_gpu!(
         1im .* sum_g_Sp
     ) .* active_vec
 
-    ########################################################
-    # Spin QRT equations
-    ########################################################
 
     adag_mean = conj(a_mean)
 
@@ -437,9 +396,6 @@ function _noise_qrt_rhs_gpu!(
     return nothing
 end
 
-############################################################
-# GPU RK4 STEP
-############################################################
 
 function _noise_rk4_step_gpu!(
     a_col,
@@ -471,9 +427,6 @@ function _noise_rk4_step_gpu!(
     k4a, k4ad, k4Sp, k4Sm, k4Sz,
     ta, tad, tSp, tSm, tSz = tmp
 
-    ########################################################
-    # RK4 stage 1
-    ########################################################
 
     _noise_qrt_rhs_gpu!(
         k1a,
@@ -503,9 +456,6 @@ function _noise_rk4_step_gpu!(
     tSm   .= Sm_col   .+ 0.5h .* k1Sm
     tSz   .= Sz_col   .+ 0.5h .* k1Sz
 
-    ########################################################
-    # RK4 stage 2
-    ########################################################
 
     _noise_qrt_rhs_gpu!(
         k2a,
@@ -535,9 +485,6 @@ function _noise_rk4_step_gpu!(
     tSm   .= Sm_col   .+ 0.5h .* k2Sm
     tSz   .= Sz_col   .+ 0.5h .* k2Sz
 
-    ########################################################
-    # RK4 stage 3
-    ########################################################
 
     _noise_qrt_rhs_gpu!(
         k3a,
@@ -567,9 +514,6 @@ function _noise_rk4_step_gpu!(
     tSm   .= Sm_col   .+ h .* k3Sm
     tSz   .= Sz_col   .+ h .* k3Sz
 
-    ########################################################
-    # RK4 stage 4
-    ########################################################
 
     _noise_qrt_rhs_gpu!(
         k4a,
@@ -593,9 +537,6 @@ function _noise_rk4_step_gpu!(
         Sz_mean2,
     )
 
-    ########################################################
-    # RK4 state update
-    ########################################################
 
     a_col .+= h / 6 .* (
         k1a .+
@@ -635,9 +576,6 @@ function _noise_rk4_step_gpu!(
     return nothing
 end
 
-############################################################
-# GPU STREAMING QRT
-############################################################
 
 function _noise_EdE_QRT_streaming_gpu(
     tgrid_us::Vector{Float64},
@@ -673,9 +611,6 @@ function _noise_EdE_QRT_streaming_gpu(
     Sz_grid = CuArray(Sz_grid_cpu)
 
     try
-    ########################################################
-    # Diagonal contribution
-    ########################################################
 
     total = sum(
         (v .* v) .* n_grid
@@ -686,9 +621,6 @@ function _noise_EdE_QRT_streaming_gpu(
         total,
     )
 
-    ########################################################
-    # Process QRT start times in batches
-    ########################################################
 
     for jb in 1:batch_size:Ng
         je = min(
@@ -709,9 +641,6 @@ function _noise_EdE_QRT_streaming_gpu(
             Ng,
         )
 
-        ####################################################
-        # Initial QRT columns on CPU
-        ####################################################
 
         a0_cpu = zeros(
             ComplexF64,
@@ -768,9 +697,6 @@ function _noise_EdE_QRT_streaming_gpu(
                 adag_mean .* Sz_grid_cpu[:, j]
         end
 
-        ####################################################
-        # Move the QRT columns to GPU
-        ####################################################
 
         a_col    = CuArray(a0_cpu)
         adag_col = CuArray(adag0_cpu)
@@ -779,9 +705,6 @@ function _noise_EdE_QRT_streaming_gpu(
         Sm_col = CuArray(Sm0_cpu)
         Sz_col = CuArray(Sz0_cpu)
 
-        ####################################################
-        # Temporary arrays for RK4
-        ####################################################
 
         tmp = (
             similar(a_col),
@@ -823,9 +746,6 @@ function _noise_EdE_QRT_streaming_gpu(
             conj.(a_grid[js]),
         )
 
-        ####################################################
-        # Time propagation
-        ####################################################
 
         for i in jb:(Ng - 1)
             h = tgrid_us[i+1] - tgrid_us[i]
@@ -844,9 +764,6 @@ function _noise_EdE_QRT_streaming_gpu(
                 B,
             )
 
-            ################################################
-            # Mean fields at the start, midpoint, and end
-            ################################################
 
             a1 = a_grid[i]
             a2 = a_grid[i+1]
@@ -886,9 +803,6 @@ function _noise_EdE_QRT_streaming_gpu(
                 Sz2
             )
 
-            ################################################
-            # Constant kappa_t and permanent g couplings
-            ################################################
 
             _noise_rk4_step_gpu!(
                 a_col,
@@ -915,14 +829,6 @@ function _noise_EdE_QRT_streaming_gpu(
                 tmp,
             )
 
-            ################################################
-            # Accumulate the off-diagonal contribution
-            #
-            # corr_c = ⟨a†(tj) a(ti+1)⟩
-            #
-            #        = C_a(tj,ti+1)
-            #          + ⟨a†(tj)⟩⟨a(ti+1)⟩
-            ################################################
 
             active_pair_cpu = Float64.(
                 js .< (i + 1)
@@ -969,9 +875,6 @@ function _noise_EdE_QRT_streaming_gpu(
     end
 end
 
-############################################################
-# WRAPPER
-############################################################
 
 function _noise_mode_QRT_gpu_complex(
     times_us::AbstractVector,
@@ -1001,12 +904,8 @@ function _noise_mode_QRT_gpu_complex(
     center_us = Float64(center_us)
     Tc_us     = Float64(Tc_us)
 
-    # Constant total cavity decay rate
     kappa_t_us = kappa_e_us + kappa_i_us
 
-    ########################################################
-    # Select analysis window
-    ########################################################
 
     idx_win = _noise_slice_window(
         times_us,
@@ -1033,18 +932,11 @@ function _noise_mode_QRT_gpu_complex(
         idx,
     )
 
-    ########################################################
-    # Integration weights and output-mode prefactor
-    ########################################################
 
     w = _noise_trapz_weights(tgrid)
 
-    # kappa_e_us is a scalar constant.
     v = w .* f .* sqrt(kappa_e_us)
 
-    ########################################################
-    # Restrict the saved mean fields to the QRT window
-    ########################################################
 
     a_grid = ComplexF64.(
         a_sol[idx]
@@ -1078,9 +970,6 @@ function _noise_mode_QRT_gpu_complex(
         @view adSz_sol[:, idx]
     )
 
-    ########################################################
-    # QRT two-time output photon number
-    ########################################################
 
     EdE = _noise_EdE_QRT_streaming_gpu(
         tgrid,
@@ -1101,9 +990,6 @@ function _noise_mode_QRT_gpu_complex(
         batch_size = batch_size,
     )
 
-    ########################################################
-    # Coherent output mode
-    ########################################################
 
     Emean = sum(
         w .*
@@ -1116,9 +1002,6 @@ function _noise_mode_QRT_gpu_complex(
 
     mean_term = abs2(Emean)
 
-    ########################################################
-    # Vacuum-normalized output variance
-    ########################################################
 
     output_total_variance =
         (
@@ -1131,9 +1014,6 @@ function _noise_mode_QRT_gpu_complex(
         w .* f.^2
     )
 
-    # Since kappa_e is constant:
-    #
-    # κe_eff = κe ∫ |f(t)|² dt
     kappa_e_eff =
         kappa_e_us *
         norm_f
@@ -1154,26 +1034,8 @@ function _noise_mode_QRT_gpu_complex(
     )
 end
 
-############################################################
 
-############################################################
-# PUBLIC API
-############################################################
 
-"""
-    compute_output_mode_noise(data, center_us, Tc_us;
-                              Nkeep=5000, batch_size=64)
-
-Compute the output temporal-mode noise around `center_us` using the saved
-second-order moments and GPU-batched QRT propagation.
-
-Returns a NamedTuple containing:
-- `output_total_variance`: vacuum-normalized total quadrature variance;
-- `noise_photon_number`: incoherent output-mode photon number;
-- `EdE`: total output-mode photon number before coherent subtraction;
-- `mean_term`: coherent contribution `|⟨E⟩|²`;
-- the selected time grid and normalized box mode.
-"""
 function compute_output_mode_noise(
     d::NoiseSimulationData,
     center_us::Real,
@@ -1219,13 +1081,6 @@ function compute_output_mode_noise(
     )
 end
 
-"""
-    compute_noise_windows(data, centers_us, Tc_us;
-                          Nkeep=5000, batch_size=500)
-
-Compute the output-mode noise for several window centers while loading and
-converting the simulation data only once.
-"""
 function compute_noise_windows(
     d::NoiseSimulationData,
     centers_us,
@@ -1245,13 +1100,6 @@ function compute_noise_windows(
     ]
 end
 
-"""
-    compute_noise_from_file(file, centers_us, Tc_us;
-                            Nkeep=5000, batch_size=64, verbose=true)
-
-Convenience function that loads a saved file and computes one or more noise
-windows.
-"""
 function compute_noise_from_file(
     file::AbstractString,
     centers_us,
@@ -1271,11 +1119,6 @@ function compute_noise_from_file(
     )
 end
 
-"""
-    print_noise_result(label, result)
-
-Print the main quantities returned by `compute_output_mode_noise`.
-"""
 function print_noise_result(
     label,
     result,

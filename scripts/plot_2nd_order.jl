@@ -1,46 +1,13 @@
-# ============================================================
-# retrieve_2nd_order_pm.jl
-#
-# Load saved second-order simulation data using:
-#
-# data = (
-#     SIM_SETTING,
-#     SYSTEM_CONFIG,
-#     PULSE_CONFIG,
-#     t_saved,
-#     a_sol,
-#     n_sol,
-#     adad_sol,
-#     Sp_sol,
-#     Sz_sol,
-#     adSp_sol,
-#     adSm_sol,
-#     adSz_sol,
-#     E_of_t_arr,
-#     delta_b_1d,
-#     g_b_1d,
-#     Nj_2d,
-#     N_total,
-#     elapsed_seconds,
-# )
-# ============================================================
-
 using JLD2
 using Plots
 using Printf
 using Measures
 
-# ============================================================
-# 0) USER SETTINGS
-# ============================================================
 
 FILE = "data/demo.jld2"
 
 FIG_DIR = "fig"
 
-# ============================================================
-# 1) LOAD DATA
-# ============================================================
 
 data = JLD2.load(FILE, "data")
 
@@ -48,10 +15,8 @@ SIM_SETTING   = data.SIM_SETTING
 SYSTEM_CONFIG = data.SYSTEM_CONFIG
 PULSE_CONFIG = data.PULSE_CONFIG
 
-# Saved time is in seconds.
 t_saved = Float64.(data.t_saved)
 
-# Use microseconds for all plots.
 times = t_saved .* 1e6
 
 a_sol = ComplexF64.(data.a_sol)
@@ -69,7 +34,6 @@ N_total = Float64(data.N_total)
 
 elapsed_seconds = Float64(data.elapsed_seconds)
 
-# Ensemble dimensions.
 M_delta = hasproperty(SIM_SETTING, :M_delta) ?
           Int(SIM_SETTING.M_delta) :
           size(Nj_2d, 1)
@@ -78,23 +42,13 @@ M_g = hasproperty(SIM_SETTING, :M_g) ?
       Int(SIM_SETTING.M_g) :
       size(Nj_2d, 2)
 
-# Flatten Nj using the same Julia column-major ordering used when
-# flattening the two-dimensional ensemble into one-dimensional bins.
 Nj = vec(Nj_2d)
 
 M = length(Nj)
 
 Nt = length(t_saved)
 
-# ============================================================
-# 2) CHECK AND ORIENT SAVED BIN ARRAYS
-# ============================================================
 
-"""
-Convert a saved bin-dependent array to the shape:
-
-    number of bins × number of saved times
-"""
 function as_bin_time_matrix(A, M, Nt, name)
     B = ComplexF64.(Array(A))
 
@@ -155,7 +109,6 @@ adSz = as_bin_time_matrix(
     "adSz_sol",
 )
 
-# Check one-dimensional saved arrays.
 for (name, array) in (
     ("a_sol", a_sol),
     ("n_sol", n_sol),
@@ -170,11 +123,7 @@ for (name, array) in (
     end
 end
 
-# ============================================================
-# 3) RECONSTRUCT TOTAL SPIN VARIABLES
-# ============================================================
 
-# Sum over all detuning-g bins at every saved time.
 Σp = vec(sum(Sp, dims=1))
 Σz = vec(sum(Sz, dims=1))
 
@@ -182,14 +131,10 @@ end
 Σy = imag.(Σp)
 Σz_real = real.(Σz)
 
-# Normalize collective spin variables by N_total / 2.
 sx_avg = Σx ./ (N_total / 2)
 sy_avg = Σy ./ (N_total / 2)
 sz_avg = Σz_real ./ (N_total / 2)
 
-# ============================================================
-# 4) RECONSTRUCT INPUT AND OUTPUT FIELDS
-# ============================================================
 
 kappa_e = Float64(SYSTEM_CONFIG.kappa_e)
 kappa_i = Float64(SYSTEM_CONFIG.kappa_i)
@@ -197,10 +142,6 @@ kappa_t = kappa_e + kappa_i
 
 sqrt_kappa_e = sqrt(kappa_e)
 
-# Input-output relation:
-#
-# a_out(t) = E(t) - sqrt(kappa_e) * a(t)
-#
 a_out = E_of_t_arr .- sqrt_kappa_e .* a_sol
 
 E_in_x = real.(E_of_t_arr)
@@ -210,9 +151,6 @@ a_out_x = real.(a_out)
 a_out_p = imag.(a_out)
 a_out_abs = abs.(a_out)
 
-# ============================================================
-# 5) GENERAL INFORMATION
-# ============================================================
 
 println("Loaded file: $FILE")
 println("Simulation order: $(SIM_SETTING.simulation_order)")
@@ -236,9 +174,6 @@ if !isapprox(N_from_bins, N_total; rtol=1e-8, atol=1e-8)
     )
 end
 
-# ============================================================
-# 6) PLOT SETTINGS
-# ============================================================
 
 default(
     size = (900, 600),
@@ -254,9 +189,6 @@ default(
 
 mkpath(FIG_DIR)
 
-# ============================================================
-# 7) HELPER FUNCTIONS
-# ============================================================
 
 function trapz(x, y)
     length(x) == length(y) ||
@@ -351,9 +283,6 @@ function zoom_scalar(
     return plt, mask
 end
 
-# ============================================================
-# 8) TOTAL SPIN DYNAMICS
-# ============================================================
 
 plot_spins = plot(
     times,
@@ -394,9 +323,6 @@ savefig(
     joinpath(FIG_DIR, "plot_spins_pm.png"),
 )
 
-# ============================================================
-# 9) INPUT / OUTPUT FIELD
-# ============================================================
 
 plot_io = plot(
     times,
@@ -405,8 +331,6 @@ plot_io = plot(
     label="Re[E(t)]",
 )
 
-# Include Im[E(t)] only when the input has a non-negligible
-# imaginary component.
 if maximum(abs.(E_in_p)) > 1e-12
     plot!(
         plot_io,
@@ -444,18 +368,7 @@ savefig(
     joinpath(FIG_DIR, "plot_io_pm.png"),
 )
 
-# ============================================================
-# 10) SELECT BINS FOR SINGLE-BIN PLOTS
-# ============================================================
 
-# The original choice was:
-#
-#   first bin
-#   two central bins
-#   final bin
-#
-# This version also works when M = 1 and excludes zero-population
-# bins to avoid division by zero.
 mid_left  = max(1, fld(M, 2))
 mid_right = min(M, mid_left + 1)
 
@@ -477,9 +390,6 @@ end
 
 println("Selected bins: $keep_bins")
 
-# ============================================================
-# 11) SELECTED-BIN Sz PLOT
-# ============================================================
 
 first_bin = keep_bins[1]
 
@@ -511,9 +421,6 @@ savefig(
     joinpath(FIG_DIR, "plot_selected_bins_pm.png"),
 )
 
-# ============================================================
-# 12) SELECTED-BIN S+ PLOT
-# ============================================================
 
 plot_sp_bins = plot(
     times,
@@ -543,9 +450,6 @@ savefig(
     joinpath(FIG_DIR, "plot_selected_bins_Sp_real_pm.png"),
 )
 
-# ============================================================
-# 13) PHOTON NUMBER
-# ============================================================
 
 plot_n = plot(
     times,
@@ -565,29 +469,7 @@ savefig(
     joinpath(FIG_DIR, "photon_number_pm.png"),
 )
 
-# ============================================================
-# 14) QUADRATURE VARIANCES
-# ============================================================
 
-# X = (a + a†)/2
-# Y = (a - a†)/(2i)
-#
-# Var(X) =
-# 1/4 [
-#     <aa> + <a†a†> + 2<a†a> + 1
-#     - (<a> + <a†>)²
-# ]
-#
-# Var(Y) =
-# 1/4 [
-#     -<aa> - <a†a†> + 2<a†a> + 1
-#     + (<a> - <a†>)²
-# ]
-#
-# Here:
-# adad_sol = <a†a†>
-# conj(adad_sol) = <aa>
-#
 Dx = 0.25 .* (
     adad_sol
     .+ conj.(adad_sol)

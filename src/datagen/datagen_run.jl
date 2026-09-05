@@ -1,15 +1,3 @@
-# PINN first-order datagen orchestrator.
-# Does not modify package physics. Full documentation: src/datagen/README.md
-#
-#   julia --project=. src/datagen/datagen_run.jl --help
-#   julia --project=. src/datagen/datagen_run.jl --phase configs --dry-run
-#   julia --project=. src/datagen/datagen_run.jl --phase configs
-#   julia -t auto --project=. src/datagen/datagen_run.jl --phase simulate
-#
-# --phase is required (configs|simulate|all).
-# Resume a crashed simulate with --phase simulate, never --phase configs.
-# Self-test: julia --project=. src/datagen/datagen_selftest.jl
-
 module DataGen
 
 using InhomogeneousSpinCavityDynamics
@@ -197,7 +185,7 @@ function main(args)
     return nothing
 end
 
-end # module
+end
 
 if abspath(PROGRAM_FILE) == @__FILE__
     DataGen.main(ARGS)

@@ -2,17 +2,9 @@ using InhomogeneousSpinCavityDynamics
 using Plots
 using Measures
 
-# ============================================================
-# 1) USER SETTINGS
-# ============================================================
 
-# A file, a folder, or multiple files/folders.
 INPUTS = joinpath(@__DIR__, "..", "data")
 
-# Examples:
-# INPUTS = joinpath(@__DIR__, "..", "data", "fig_3_d")
-# INPUTS = ["data/run1.jld2", "data/run2.jld2"]
-# INPUTS = ["data/folder1", "data/folder2", "data/run3.jld2"]
 
 Tpi_us = 75.0
 T1_us = 25.0
@@ -23,9 +15,6 @@ SAVE_PLOTS = false
 
 FIGDIR = joinpath(@__DIR__, "..", "fig", "correlations")
 
-# ============================================================
-# 2) CORRELATION SETTINGS
-# ============================================================
 
 settings = CorrelationSettings(
     tpi_us = Tpi_us,
@@ -43,14 +32,10 @@ settings = CorrelationSettings(
     tau_max_us = 20.0,
     dtau_us = 0.01,
 
-    # Used only for adaptive Tsit5 in ASE-RASE.
     reltol = 1e-8,
     abstol = 1e-8,
 )
 
-# ============================================================
-# 3) FILE HELPERS
-# ============================================================
 
 function find_input_files(inputs)
     paths = inputs isa AbstractString ? (inputs,) : inputs
@@ -78,7 +63,6 @@ function find_input_files(inputs)
         end
     end
 
-    # Do not process previously generated correlation files.
     filter!(
         file -> !endswith(lowercase(file), "_correlation.jld2"),
         files,
@@ -100,9 +84,6 @@ function correlation_output_file(input_file)
     )
 end
 
-# ============================================================
-# 4) PLOTTING
-# ============================================================
 
 if PLOT_CORRELATIONS
     default(
@@ -250,9 +231,6 @@ function plot_all_correlations(data, input_file)
     return nothing
 end
 
-# ============================================================
-# 5) PROCESS ONE FILE
-# ============================================================
 
 function process_file(input_file, settings)
     println("\nProcessing: ", input_file)
@@ -280,9 +258,6 @@ function process_file(input_file, settings)
     return nothing
 end
 
-# ============================================================
-# 6) RUN ALL FILES
-# ============================================================
 
 input_files = find_input_files(INPUTS)
 

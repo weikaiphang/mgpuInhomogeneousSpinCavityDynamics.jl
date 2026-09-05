@@ -17,60 +17,44 @@ default(
     bottom_margin = 3mm,
 )
 
-# ============================================================
-# 1) USER SETTINGS
-# ============================================================
 
-#SWEEP_OUTDIR = joinpath(@__DIR__, "data", "rabi")
 SWEEP_OUTDIR = joinpath("/scratch", ENV["USER"], "rose_runs", "rabi_sweep_km004_real_g")
 mkpath(SWEEP_OUTDIR)
 
-# Uniform sweep of the second-pulse alpha amplitude.
 SECOND_PULSE_ALPHA_MIN = 0.0
 SECOND_PULSE_ALPHA_MAX = 10_000.0
 N_SWEEP_POINTS = 101
 
-# Horizontal-axis normalization requested for the final plot.
 SECOND_PULSE_ALPHA_NORMALIZATION = 9523.0
 
-# The user changes only this value to set the pulse/echo time sequence.
 PULSE_TIME_INTERVAL_S = 80e-6
 
-# Fixed timing definitions.
 PULSE_6SIGMA_DURATION_S = 20e-6
 FIRST_PULSE_CENTER_S = 10e-6
 
-# 20 us + time_interval + 10 us.
 SECOND_PULSE_CENTER_S = (
     PULSE_6SIGMA_DURATION_S +
     PULSE_TIME_INTERVAL_S +
     FIRST_PULSE_CENTER_S
 )
 
-# 20 us + 20 us + 10 us + 2*time_interval.
 ECHO_CENTER_S = (
     2 * PULSE_6SIGMA_DURATION_S +
     FIRST_PULSE_CENTER_S +
     2 * PULSE_TIME_INTERVAL_S
 )
 
-# 20 us + 20 us + 20 us + 30 us + 2*time_interval.
 T_TOTAL_S = (
     3 * PULSE_6SIGMA_DURATION_S +
     3 * FIRST_PULSE_CENTER_S +
     2 * PULSE_TIME_INTERVAL_S
 )
 
-# Temporal-mode window used to extract the echo amplitude.
 ECHO_WINDOW_HALF_SPAN_S = 40e-6
 
-# Existing output files are loaded and included in the plot.
 SKIP_EXISTING = true
 
 
-# ============================================================
-# 2) BASE SIMULATION SETTINGS
-# ============================================================
 
 BASE_SIM_SETTING = (
     simulation_order = :order1,
@@ -86,9 +70,6 @@ BASE_SIM_SETTING = (
 )
 
 
-# ============================================================
-# 3) FIXED SYSTEM PARAMETERS
-# ============================================================
 
 SYSTEM_CONFIG = (
     C_ens = 0.1,
@@ -104,7 +85,6 @@ SYSTEM_CONFIG = (
         renormalize = false,
     ),
 
-    # User-defined CPW coupling distribution with g/(2pi) from 1 Hz to 15 kHz.
     g_inhomogeneity = (
         kind = :user_defined,
         filename = expanduser(
@@ -115,16 +95,11 @@ SYSTEM_CONFIG = (
 )
 
 
-# ============================================================
-# 4) PULSE-CONFIGURATION HELPER
-# ============================================================
 
-# First Gaussian pulse: 6*sigma = 20 us and alpha = second-pulse alpha / 2.
 FIRST_PULSE_SIGMA_S = PULSE_6SIGMA_DURATION_S / 6
 FIRST_PULSE_OMEGA_RAD_S = 0.0
 FIRST_PULSE_PHASE_RAD = 0.0
 
-# Second Gaussian pulse with swept alpha amplitude.
 SECOND_PULSE_SIGMA_S = PULSE_6SIGMA_DURATION_S / 6
 SECOND_PULSE_OMEGA_RAD_S = 0.0
 SECOND_PULSE_PHASE_RAD = 0.0
@@ -159,9 +134,6 @@ function build_pulse_config(system_config, second_pulse_alpha)
 end
 
 
-# ============================================================
-# 5) OUTPUT-FILENAME HELPER
-# ============================================================
 
 function make_alpha_tag(alpha)
     text = @sprintf("%.6g", Float64(alpha))
@@ -169,9 +141,6 @@ function make_alpha_tag(alpha)
 end
 
 
-# ============================================================
-# 6) TEMPORAL-MODE ECHO AMPLITUDE
-# ============================================================
 
 trapz(t, y) = sum(
     0.5 .* (y[1:end-1] .+ y[2:end]) .* diff(t)
@@ -181,7 +150,6 @@ trapz(t, y) = sum(
 function echo_box_mode_amplitude(data, echo_center_s, half_span_s)
     t = Float64.(data.t_saved)
 
-    # Input-output relation: a_out(t) = E(t) - sqrt(kappa_e)*a(t).
     a_out = (
         data.E_of_t_arr .-
         sqrt(data.SYSTEM_CONFIG.kappa_e) .* data.a_sol
@@ -199,18 +167,13 @@ function echo_box_mode_amplitude(data, echo_center_s, half_span_s)
     t_window = t[indices]
     a_out_window = a_out[indices]
 
-    # Constant box mode normalized by integral |f(t)|^2 dt = 1.
     mode_f = ones(ComplexF64, length(t_window))
     mode_f ./= sqrt(real(trapz(t_window, abs2.(mode_f))))
 
-    # Coherent mode amplitude |integral f*(t) a_out(t) dt|.
     return abs(trapz(t_window, conj.(mode_f) .* a_out_window))
 end
 
 
-# ============================================================
-# 7) TODO VALIDATION
-# ============================================================
 
 function check_todo_settings(n_sweep_points, base_sim_setting, system_config)
     required = Pair{String, Any}[
@@ -277,9 +240,6 @@ function check_todo_settings(n_sweep_points, base_sim_setting, system_config)
 end
 
 
-# ============================================================
-# 8) SECOND-PULSE AMPLITUDE SWEEP
-# ============================================================
 
 function run_rabi_sweep(
     alpha_min,
@@ -398,9 +358,6 @@ function run_rabi_sweep(
 end
 
 
-# ============================================================
-# 9) RUN THE SWEEP
-# ============================================================
 
 run_rabi_sweep(
     SECOND_PULSE_ALPHA_MIN,

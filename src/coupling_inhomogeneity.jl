@@ -1,24 +1,3 @@
-# ============================================================
-# Coupling inhomogeneity
-#
-# Supported choices:
-#
-#     :gaussian
-#     :powerlaw_g
-#     :user_defined
-#
-# For :user_defined, the JLD2 file must contain:
-#
-#     edges_g
-#     g_b_1d_tmp
-#     p_g_tmp
-# ============================================================
-
-
-# ============================================================
-# Utilities
-# ============================================================
-
 function coupling_renormalize_enabled(g_inhomogeneity)
     if hasproperty(g_inhomogeneity, :renormalize)
         return g_inhomogeneity.renormalize
@@ -60,9 +39,6 @@ function weighted_g_stats_from_bins(g_b_1d, p_g)
 end
 
 
-# ============================================================
-# User-defined JLD2 loader
-# ============================================================
 
 function load_user_g_distribution(filename; renormalize=true)
     data = load(filename)
@@ -105,9 +81,6 @@ function load_user_g_distribution(filename; renormalize=true)
 end
 
 
-# ============================================================
-# Validation
-# ============================================================
 
 function validate_coupling_inhomogeneity(g_inhomogeneity)
     if !hasproperty(g_inhomogeneity, :kind)
@@ -130,9 +103,6 @@ function validate_coupling_inhomogeneity(g_inhomogeneity)
         )
     end
 
-    # ========================================================
-    # Constant coupling
-    # ========================================================
 
     if kind == :constant
         if !hasproperty(g_inhomogeneity, :g_value)
@@ -159,9 +129,6 @@ function validate_coupling_inhomogeneity(g_inhomogeneity)
             error("For constant coupling, g_value must be positive.")
         end
 
-    # ========================================================
-    # Gaussian coupling distribution
-    # ========================================================
 
     elseif kind == :gaussian
         if !hasproperty(g_inhomogeneity, :mean)
@@ -188,9 +155,6 @@ function validate_coupling_inhomogeneity(g_inhomogeneity)
             error("g_inhomogeneity.span_sigma must be positive.")
         end
 
-    # ========================================================
-    # Power-law coupling distribution
-    # ========================================================
 
     elseif kind == :powerlaw_g
         if !hasproperty(g_inhomogeneity, :alpha)
@@ -226,9 +190,6 @@ function validate_coupling_inhomogeneity(g_inhomogeneity)
             end
         end
 
-    # ========================================================
-    # User-defined coupling distribution
-    # ========================================================
 
     elseif kind == :user_defined
         if !hasproperty(g_inhomogeneity, :filename)
@@ -245,9 +206,6 @@ function validate_coupling_inhomogeneity(g_inhomogeneity)
         end
     end
 
-    # ========================================================
-    # Optional common setting
-    # ========================================================
 
     if hasproperty(g_inhomogeneity, :renormalize)
         if !(g_inhomogeneity.renormalize isa Bool)
@@ -259,9 +217,6 @@ function validate_coupling_inhomogeneity(g_inhomogeneity)
 end
 
 
-# ============================================================
-# Gaussian g distribution
-# ============================================================
 
 function build_gaussian_coupling_bins(g_inhomogeneity, M_g)
     g_mean_input = g_inhomogeneity.mean
@@ -316,18 +271,8 @@ function build_gaussian_coupling_bins(g_inhomogeneity, M_g)
 end
 
 
-# ============================================================
-# Power-law g distribution
-#
-# p(g) ∝ g^(-alpha)
-#
-# on:
-#
-# g_min <= g <= g_max
-# ============================================================
 
 function powerlaw_integral(g_low, g_high, power)
-    # Integral of g^power from g_low to g_high.
     if abs(power + 1) < 1e-14
         return log(g_high / g_low)
     else
@@ -342,7 +287,6 @@ function powerlaw_bin_means_and_probs(edges_g, alpha)
     g_b_1d = zeros(Float64, M_g)
     p_g    = zeros(Float64, M_g)
 
-    # Normalization for p(g) ∝ g^(-alpha)
     norm = powerlaw_integral(first(edges_g), last(edges_g), -alpha)
 
     if norm <= 0
@@ -432,9 +376,6 @@ function build_powerlaw_coupling_bins(g_inhomogeneity, M_g)
     return edges_g, g_b_1d, p_g, g_mean, g_std, g2_avg, g_info
 end
 
-# ============================================================
-# Constant g
-# ============================================================
 
 function build_constant_coupling_bins(g_inhomogeneity, M_g)
     @assert hasproperty(g_inhomogeneity, :g_value) """
@@ -451,7 +392,6 @@ function build_constant_coupling_bins(g_inhomogeneity, M_g)
     @assert isfinite(g_value) "g_value must be finite."
     @assert g_value >= 0.0 "g_value must be nonnegative."
 
-    # A constant coupling needs only one effective g bin.
     if M_g != 1
         @warn """
         kind = :constant uses one effective g bin.
@@ -459,18 +399,14 @@ function build_constant_coupling_bins(g_inhomogeneity, M_g)
         """
     end
 
-    # One bin containing the full ensemble probability.
     g_b_1d = [g_value]
     p_g    = [1.0]
 
-    # Degenerate distribution centered at g_value.
-    # prevfloat/nextfloat keep the two edges strictly ordered.
     edges_g = [
         prevfloat(g_value),
         nextfloat(g_value),
     ]
 
-    # Distribution statistics.
     g_mean = g_value
     g_std  = 0.0
     g2_avg = abs2(g_value)
@@ -493,9 +429,6 @@ function build_constant_coupling_bins(g_inhomogeneity, M_g)
     )
 end
 
-# ============================================================
-# User-defined g distribution
-# ============================================================
 
 function build_user_defined_coupling_bins(g_inhomogeneity, M_g)
     filename = g_inhomogeneity.filename
@@ -534,9 +467,6 @@ function build_user_defined_coupling_bins(g_inhomogeneity, M_g)
 end
 
 
-# ============================================================
-# Main selector
-# ============================================================
 
 function build_coupling_bins(g_inhomogeneity, M_g)
     validate_coupling_inhomogeneity(g_inhomogeneity)

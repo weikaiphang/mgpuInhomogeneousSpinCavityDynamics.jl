@@ -1,37 +1,3 @@
-# ============================================================
-# 1ST-ORDER PARAMETER SWEEP
-#
-# Runs N_RUNS independent 1st-order simulations built around the
-# same two-WURST photon-echo sequence used in
-# examples/rose_1st_order.jl and paper/fig_3_b/ace_under_various_c.jl.
-#
-# STRICTLY 1ST ORDER:
-#   simulation_order is hardcoded to :order1 below and is never
-#   overwritten by the random draws. A runtime @assert right
-#   before every run_simulation() call additionally refuses to
-#   proceed if it is ever anything else.
-#
-# PHYSICS-CONSISTENT RANGES:
-#   Every value below is either held fixed at the exact value
-#   used throughout paper/, or drawn from the exact range that
-#   paper/ validates as swept. Nothing is drawn from an invented
-#   or extrapolated range. See the comment above each field for
-#   its source. Where a parameter is fixed in every paper script
-#   (e.g. kappa_e, the WURST amp/bandwidth/n/chirp_sign, the
-#   Gaussian-input pulse shape), it is fixed here too — the paper
-#   gives no evidence that other values are physically valid for
-#   this model, so it is not swept.
-#
-# Each run is saved to its own .jld2 file under
-# data/sweep_1st_order/, and a JSON manifest recording the drawn
-# parameters and pass/fail status for every run is written to
-# data/sweep_1st_order/manifest.json.
-#
-# Re-running this script skips any run whose output file already
-# exists, so an interrupted sweep (e.g. a GPU driver crash) can
-# simply be restarted.
-# ============================================================
-
 using InhomogeneousSpinCavityDynamics
 using Random
 using Printf
@@ -47,62 +13,21 @@ const MANIFEST_FILE = joinpath(OUTDIR, "manifest.json")
 
 Random.seed!(SEED)
 
-# ============================================================
-# RANDOM-DRAW HELPERS
-# ============================================================
 
 rand_in(lo, hi)   = lo + rand() * (hi - lo)
 rand_choice(opts) = opts[rand(1:length(opts))]
 
-# ============================================================
-# VALIDATED SWEEP RANGES (cited to paper/)
-# ============================================================
 
-# C_ens: paper/fig_3_b/ace_under_various_c.jl sweeps 0.1-0.6 (and
-# its own comment gives range(0.1, 1.0) as a valid alternative
-# scan); paper/fig_3_d/*.jl (2nd-order, same C_ens meaning)
-# extends the validated lower end to 0.05 and upper end to 0.8.
-# Union of both: [0.05, 1.0].
 const C_ENS_RANGE = (0.05, 1.0)
 
-# M_delta: the only two values used for 1st-order runs anywhere
-# in paper/ are 1000 (fig_3_c/silencing_factor.jl) and 3000
-# (fig_3_b/ace_under_various_c.jl). Only these two are drawn from.
 const M_DELTA_OPTIONS = [1000, 3000]
 
-# g_inhomogeneity std (Gaussian coupling spread), in Hz (converted
-# to rad/s below): paper/fig_3_c/silencing_factor.jl sweeps
-# g_std_Hz up to 0.6 Hz at WURST duration = 100 us — the closest
-# validated duration to the 400 us WURST used in this sequence
-# (paper/fig_3_b, examples/rose_1st_order.jl). Since fig_3_c shows
-# the tolerable g_std shrinking as WURST duration grows (2.4 Hz at
-# 10 us -> 1.4 Hz at 30 us -> 0.6 Hz at 100 us), 0.6 Hz is used
-# here as a conservative upper bound for the even longer 400 us
-# pulse, rather than extrapolating past what was measured.
 const G_STD_HZ_RANGE = (1e-6, 0.6)
 
-# ============================================================
-# CONFIG BUILDER
-#
-# All pulse timing/shape parameters (Gaussian input sigma/amp,
-# WURST t_center/duration/amp/bandwidth/n/chirp_sign/edge_frac),
-# Ttotal, the cavity (kappa_e, kappa_i, delta0), the detuning
-# distribution (freq_inhomogeneity), initial_condition, and the
-# solver tolerances are held fixed at the exact values shared by
-# every 1st-order script in paper/ and examples/rose_1st_order.jl.
-# Only C_ens, the coupling-distribution kind/spread, and M_delta
-# are randomized, using the validated ranges above.
-# ============================================================
 
 function build_configs(run_id)
     Ttotal = 1100e-6
 
-    # --- coupling distribution ---
-    # kind and g_value/mean are the only forms paper/ validates
-    # for 1st-order runs (fig_3_b/fig_3_d use :constant with
-    # g_value = 2pi*100; fig_3_c/fig_3_d use :gaussian with
-    # mean = 2pi*100). :powerlaw_g and :user_defined are never
-    # used anywhere in paper/, so they are not sampled here.
     g_kind = rand_choice([:constant, :gaussian])
 
     g_inhomogeneity, M_g = if g_kind == :constant
@@ -124,12 +49,6 @@ function build_configs(run_id)
                 span_sigma = 3.0,
                 renormalize = true,
             ),
-            # M_g = 20 matches the only 1st-order Gaussian-coupling
-            # run in paper/ (fig_3_c/silencing_factor.jl). M_g is a
-            # discretization resolution for the g-distribution, not
-            # itself a physical parameter, so reusing it here for a
-            # different pulse topology is a numerical choice, not a
-            # physics extrapolation.
             20,
         )
     end
@@ -218,9 +137,6 @@ function build_configs(run_id)
     return SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG
 end
 
-# ============================================================
-# MANIFEST HELPERS
-# ============================================================
 
 function load_manifest()
     if isfile(MANIFEST_FILE)
@@ -240,14 +156,6 @@ function save_manifest(manifest)
     return nothing
 end
 
-# ============================================================
-# MAIN SWEEP LOOP
-#
-# Wrapped in a function (rather than left at top-level) so the
-# loop body is a normal function scope: run_id, n_ok, n_skipped,
-# and n_failed are then unambiguous locals, avoiding Julia's
-# top-level soft-scope warnings for loop-local assignment.
-# ============================================================
 
 function run_sweep()
     manifest = load_manifest()
@@ -261,8 +169,6 @@ function run_sweep()
 
         SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG = build_configs(run_id)
 
-        # Hard safety check: this sweep must only ever run 1st-order
-        # simulations, regardless of any future edit to build_configs.
         @assert SIM_SETTING.simulation_order === :order1 (
             "sweep_1st_order.jl must only run :order1 simulations, " *
             "got simulation_order = $(SIM_SETTING.simulation_order)"

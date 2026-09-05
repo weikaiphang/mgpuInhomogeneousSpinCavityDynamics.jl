@@ -1,24 +1,5 @@
-# ============================================================
-# FUSED CUDA KERNELS
-#
-# The single-GPU package expresses the right-hand side as several dozen
-# broadcast statements over M × M arrays, plus three GEMVs and four mask
-# multiplications.  Every one of those is a separate pass over device memory,
-# and the problem is entirely bandwidth bound.
-#
-# Here the whole O(M²) block is one kernel: five loads and five stores per
-# ensemble pair, with the row sums that the vector equations need accumulated
-# in registers during the same pass (so the GEMVs are free), and the
-# zero-diagonal handled by a branch instead of a stored mask array.
-# ============================================================
+@inline muli(z::Complex) = Complex(-imag(z), real(z))
 
-@inline muli(z::Complex) = Complex(-imag(z), real(z))   # i * z, without a multiply
-
-# ------------------------------------------------------------
-# Deterministic block reduction of three complex accumulators.
-# Warp shuffles, then a serial pass over at most 32 warp results, so the
-# summation order is fixed and results are reproducible run to run.
-# ------------------------------------------------------------
 
 @inline function warp_reduce3(v1::Complex{T}, v2::Complex{T}, v3::Complex{T}) where {T}
     o = 16
@@ -96,13 +77,6 @@ end
 end
 
 
-# ============================================================
-# 1) CROSS-BIN BLOCK  (the O(M²) work)
-#
-# grid  = (nchunk, mloc):  one block per (k-chunk, owned bin)
-# Column jl of the shard is contiguous in k, so the loads are coalesced and
-# the row-sum reduction runs over contiguous memory.
-# ============================================================
 
 function cross_rhs_kernel!(du, u, part, delta_b, g_b,
                            M::Int, mloc::Int, joff::Int, lo::Int,
@@ -140,8 +114,8 @@ function cross_rhs_kernel!(du, u, part, delta_b, g_b,
     cadSmj = conj(adSmj)
     cadSzj = conj(adSzj)
 
-    bs      = M * mloc                    # distance between the five matrices
-    colbase = lo + (jl - 1) * M           # + k -> element (k, jl) of matrix 1
+    bs      = M * mloc
+    colbase = lo + (jl - 1) * M
 
     kstart = (ch - 1) * chunk_len + 1
     kend   = min(ch * chunk_len, M)
@@ -181,12 +155,10 @@ function cross_rhs_kernel!(du, u, part, delta_b, g_b,
             cadSmk = conj(adSmk)
             cadSzk = conj(adSzk)
 
-            # ---- <S⁺_j S⁺_k> ----
             W  = Spk * adSzj + ca * Z  + adSpk * Szj - 2 * Spk * ca * Szj
             Ws = Spj * adSzk + ca * ZT + adSpj * Szk - 2 * Spj * ca * Szk
             du[i1] = muli((dj + dk) * P - 2 * gj * W - 2 * gk * Ws)
 
-            # ---- <Sz_j S⁺_k> and its transpose replica <Sz_k S⁺_j> ----
             U1  = Spk * cadSmj + Spj * cadSmk + a * P - 2 * Spk * Spj * a
             U2  = Spk * adSmj + ca * Mm       + adSpk * cSpj - 2 * Spk * ca * cSpj
             U2s = Spj * adSmk + ca * conj(Mm) + adSpj * cSpk - 2 * Spj * ca * cSpk
@@ -195,7 +167,6 @@ function cross_rhs_kernel!(du, u, part, delta_b, g_b,
             du[i1 + bs]  = muli(dk * Z  - gj * U1 + gj * U2  - 2 * gk * U3)
             du[i1 + 2bs] = muli(dj * ZT - gk * U1 + gk * U2s - 2 * gj * U3)
 
-            # ---- <S⁻_j S⁺_k> and <Sz_j Sz_k> ----
             Y1  = cadSzj * Spk + cadSmk * Szj + a * Z  - 2 * Spk * a * Szj
             Y1s = cadSzk * Spj + cadSmj * Szk + a * ZT - 2 * Spj * a * Szk
             Y2  = ca * conj(ZT) + Szk * adSmj + cSpj * adSzk - 2 * ca * Szk * cSpj
@@ -204,7 +175,6 @@ function cross_rhs_kernel!(du, u, part, delta_b, g_b,
             du[i1 + 3bs] = muli((dk - dj) * Mm + 2 * gj * Y1 - 2 * gk * Y2)
             du[i1 + 4bs] = muli(gj * (Y2 - Y1s) + gk * (Y2s - Y1))
 
-            # ---- row sums for the vector equations (free: data already loaded) ----
             accP += gk * P
             accM += gk * Mm
             accZ += gk * Z
@@ -226,12 +196,6 @@ function cross_rhs_kernel!(du, u, part, delta_b, g_b,
 end
 
 
-# ============================================================
-# 2) ROW-SUM FINALISATION
-# Reduce the per-chunk partials into this shard's slice of the globally
-# indexed row-sum buffer (3 consecutive entries per bin, so the owned slice
-# is contiguous and ships to peers in a single copy).
-# ============================================================
 
 function rowsum_finalize_kernel!(rowsum, part, mloc::Int, nchunk::Int, joff::Int)
     jl = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -258,12 +222,6 @@ function rowsum_finalize_kernel!(rowsum, part, mloc::Int, nchunk::Int, joff::Int
 end
 
 
-# ============================================================
-# 3) GLOBAL COUPLING SUMS
-#     Σ₁ = Σ g_j conj(S⁺_j),  Σ₂ = Σ g_j <a†S⁺_j>,  Σ₃ = Σ g_j <a†S⁻_j>
-# Computed redundantly on every shard from the replicated small block, so no
-# communication is needed for the cavity equations.
-# ============================================================
 
 function global_sums_kernel!(gsums, u, g_b, M::Int)
     sh = CuStaticSharedArray(Complex{eltype(g_b)}, 96)
@@ -296,14 +254,6 @@ function global_sums_kernel!(gsums, u, g_b, M::Int)
 end
 
 
-# ============================================================
-# 4) SMALL BLOCK (scalars, first-order spins, same-bin correlations)
-#
-# Evaluated redundantly on every shard.  It costs O(M) work, needs the
-# gathered row sums, and produces bit-identical output everywhere, which is
-# what keeps the replicated part of the state exactly in sync without any
-# further communication.
-# ============================================================
 
 function small_rhs_kernel!(du, u, rowsum, gsums, delta_b, g_b, Et::Complex{T},
                            delta0::T, kappa_t::T, sqrt_ke::T, M::Int) where {T}
@@ -329,7 +279,6 @@ function small_rhs_kernel!(du, u, rowsum, gsums, delta_b, g_b, Et::Complex{T},
     cEt = conj(Et)
     half = T(0.5)
 
-    # ---- cavity (one thread does the three scalars) ----
     if j == 1
         @inbounds begin
             S1 = gsums[1]
@@ -372,11 +321,9 @@ function small_rhs_kernel!(du, u, rowsum, gsums, delta_b, g_b, Et::Complex{T},
     cadSz = conj(adSz)
 
     @inbounds begin
-        # ---- first-order spin ----
         du[oSp + j] = muli(dj * Sp - 2 * gj * adSz)
         du[oSz + j] = muli(gj * adSm - gj * cadSm)
 
-        # ---- cavity-spin correlations ----
         du[oadSp + j] = muli(delta0 * adSp + dj * adSp + sum_gSpSp -
                              2 * gj * (2 * ca * adSz + ad_ad * Sz - 2 * ca * ca * Sz)) -
                         half * kappa_t * adSp + sqrt_ke * cEt * Sp
@@ -390,7 +337,6 @@ function small_rhs_kernel!(du, u, rowsum, gsums, delta_b, g_b, Et::Complex{T},
                              gj * (2 * ca * adSm + ad_ad * cSp - 2 * ca * ca * cSp)) -
                         half * kappa_t * adSz + sqrt_ke * cEt * Sz
 
-        # ---- same-bin spin correlations ----
         du[oSpSp_s + j] = muli(2 * dj * SpSp_s + 2 * gj * adSp -
                                4 * gj * (Sp * adSz + SzSp_s * ca + adSp * Sz -
                                          2 * Sp * ca * Sz))
@@ -412,16 +358,7 @@ function small_rhs_kernel!(du, u, rowsum, gsums, delta_b, g_b, Et::Complex{T},
 end
 
 
-# ============================================================
-# 5) RUNGE-KUTTA VECTOR OPERATIONS
-#
-# All registers are single contiguous vectors covering the small and large
-# blocks at once, so each stage combination is one kernel over the whole
-# shard state instead of one per state component.
-# ============================================================
 
-# Compile-time unrolled Σ_s cs[s]*ks[s][i]; recursion keeps the tuple in
-# registers instead of spilling it to local memory.
 @inline function combo(ks::Tuple{Any}, cs::Tuple{Any}, i)
     @inbounds return cs[1] * ks[1][i]
 end
@@ -429,11 +366,6 @@ end
     @inbounds return cs[1] * ks[1][i] + combo(Base.tail(ks), Base.tail(cs), i)
 end
 
-"""
-    combine_kernel!(uout, ubase, ks, cs, dt, n)
-
-`uout[i] = ubase[i] + dt * Σ_s cs[s] * ks[s][i]` for `i in 1:n`.
-"""
 function combine_kernel!(uout, ubase, ks::NTuple{NK,Any}, cs::NTuple{NK,T},
                          dt::T, n::Int) where {NK,T}
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -445,18 +377,6 @@ function combine_kernel!(uout, ubase, ks::NTuple{NK,Any}, cs::NTuple{NK,T},
     return nothing
 end
 
-"""
-    lowstorage_kernel!(stage, accum, err, k, base, dt, cA, cB, cE, n, write_stage, first)
-
-The three register updates of a 2R+ low-storage stage, fused into one pass:
-
-    stage = base + dt*cA*k       (skipped on the final stage)
-    accum = base + dt*cB*k
-    err   = err  + dt*cE*k
-
-`base` is the running solution accumulator, which on the first stage is the
-previous step's state, so no register has to be pre-copied.
-"""
 function lowstorage_kernel!(stage, accum, err, k, base, dt::T, cA::T, cB::T, cE::T,
                             n::Int, write_stage::Bool, first::Bool) where {T}
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -484,13 +404,6 @@ function fill_kernel!(x, v, n::Int)
     return nothing
 end
 
-"""
-    errnorm_kernel!(partial, uprev, u, ks, es, dt, atol, rtol, istart, iend)
-
-Sum of `abs2(err_i / (atol + rtol*max(|uprev_i|,|u_i|)))` with the error
-estimate `err = dt * Σ es[s] * ks[s]` formed on the fly, so the embedded
-solution never has to be materialised.
-"""
 function errnorm_kernel!(partial, uprev, u, ks::NTuple{NK,Any}, es::NTuple{NK,T},
                          dt::T, atol::T, rtol::T, istart::Int, iend::Int,
                          skip_a::Int, skip_b::Int) where {NK,T}
@@ -518,13 +431,6 @@ function errnorm_kernel!(partial, uprev, u, ks::NTuple{NK,Any}, es::NTuple{NK,T}
     return nothing
 end
 
-"""
-    diffnorm_kernel!(partial, x, y, uref, atol, rtol, istart, iend)
-
-Sum of `abs2((x_i - y_i) / (atol + rtol*|uref_i|))`, used by the low-storage
-stepper (whose error register is explicit) and by the initial step-size
-heuristic.  Passing `y = nothing` measures `x` itself.
-"""
 function diffnorm_kernel!(partial, x, y, uref, atol::T, rtol::T,
                           istart::Int, iend::Int, skip_a::Int, skip_b::Int) where {T}
     sh = CuStaticSharedArray(T, 32)
@@ -551,12 +457,6 @@ function diffnorm_kernel!(partial, x, y, uref, atol::T, rtol::T,
     return nothing
 end
 
-"""
-    init_szsz_cross_kernel!(u, Nj, M, mloc, joff, lo)
-
-Fill the sharded `<Sz_j Sz_k>` block with `Nj[j]*Nj[k]/4` off the diagonal.
-Done on device so that no O(M²) host buffer is ever allocated.
-"""
 function init_szsz_cross_kernel!(u, Nj, M::Int, mloc::Int, joff::Int, lo::Int)
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     stride = blockDim().x * gridDim().x
@@ -573,13 +473,6 @@ function init_szsz_cross_kernel!(u, Nj, M::Int, mloc::Int, joff::Int, lo::Int)
     return nothing
 end
 
-"""
-    init_nj_scale_cross_kernel!(u, Nj, scale_j, scale_k, block, M, mloc, joff, lo)
-
-Fill large-block `block` (1-based, `B_SpSp`…`B_SzSz`) with
-`(scale_j * Nj[j]) * (scale_k * Nj[k])` off the diagonal. Same layout as
-[`init_szsz_cross_kernel!`](@ref): owned bin `j = joff+jl`, partner `k`.
-"""
 function init_nj_scale_cross_kernel!(
     u, Nj, scale_j, scale_k, block::Int, M::Int, mloc::Int, joff::Int, lo::Int,
 )

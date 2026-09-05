@@ -1,43 +1,32 @@
-# The run_demo.jl file serves as demo to check whether the package has been properly installed.
-
 using InhomogeneousSpinCavityDynamics
 
 OUTDIR = joinpath(@__DIR__, "..", "data")
 mkpath(OUTDIR)
 
 SIM_SETTING = (
-    # --- simulation order ---
-    simulation_order = :order1,   # :order1 (first-order), :order2 (second-order)
+    simulation_order = :order1,
 
-    # --- discretization ---
     M_delta = 250,
     M_g     = 1,
 
-    # --- initial condition ---
-    initial_condition = :ground,        # :ground, :inverted, or :custom
+    initial_condition = :ground,
 
-    # --- simulation time ---
     Ttotal = 100e-6,
 
-    # --- solver ---
     Nt_save = 5001,
     reltol  = 1e-8,
     abstol  = 1e-8,
 
-    # --- saving ---
     saved_file_name = joinpath(OUTDIR, "demo_mgpu.jld2"),
 )
 
 SYSTEM_CONFIG = (
-    # --- cooperativity ---
     C_ens   = 0.6,
 
-    # --- cavity ---
     delta0 = 0.0,
     kappa_e = 2*pi*1e6,
     kappa_i = 2*pi*0,
 
-    # --- detuning distribution ---
     freq_inhomogeneity = (
         kind = :lorentzian,
         FWHM = 2*pi*1e6,
@@ -45,7 +34,6 @@ SYSTEM_CONFIG = (
         renormalize = false,
     ),
 
-    # --- coupling distribution ---
     g_inhomogeneity = (
         kind = :constant,
         g_value = 2*pi*100,

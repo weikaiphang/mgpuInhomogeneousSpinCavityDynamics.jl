@@ -1,14 +1,3 @@
-# ============================================================
-# 2nd-order cumulant state layout
-#
-# State:
-#     u = [a, a†a†, a†a,
-#          S⁺, Sz,
-#          a†S⁺, a†S⁻, a†Sz,
-#          same-bin spin correlations,
-#          cross-bin spin correlations]
-# ============================================================
-
 const IDX2_a     = 1
 const IDX2_ad_ad = 2
 const IDX2_ad_a  = 3
@@ -21,11 +10,11 @@ idx2_adSm_start(M) = idx2_adSp_start(M) + M
 idx2_adSz_start(M) = idx2_adSm_start(M) + M
 
 state_length_2nd_order(M) =
-    3 +      # a, a†a†, a†a
-    2M +     # S+, Sz
-    3M +     # a†S+, a†S-, a†Sz
-    4M +     # same-bin S+S+, SzS+, S-S+, SzSz
-    4M*M     # cross-bin S+S+, SzS+, S-S+, SzSz
+    3 +
+    2M +
+    3M +
+    4M +
+    4M*M
 
 function make_diag_mask(M)
     return CuArray(ComplexF64.(.!Matrix(I, M, M)))
@@ -67,10 +56,6 @@ end
 function unpack_state_2nd_order_du(du, M)
     idx = 1
 
-    # Skip scalar derivatives:
-    #     du[IDX2_a]
-    #     du[IDX2_ad_ad]
-    #     du[IDX2_ad_a]
     idx += 3
 
     dSp = @view du[idx:idx+M-1]; idx += M
