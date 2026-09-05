@@ -203,16 +203,31 @@ end
     ws = _rhs2_workspace(u, M)
     p = (0.1, 1.5, 0.25, delta_b, g_b, M, mask, _ -> Et, ws)
     _rhs_2nd_order_mulpath!(du_mul, u, p, 0.0)
-    @test du_cpu ≈ du_mul atol = 1e-12
+    sc = unpack_state_2nd_order_u(du_cpu, M)
+    sm = unpack_state_2nd_order_u(du_mul, M)
+    # Rowsums feed dadSp / dadSm / dadSz (and only those small fields).
+    # Some cross-block EOM terms already differ between mulpath and rhs_cpu!
+    # even with a clean unused diagonal; that is not this tip.
+    @test sc.a ≈ sm.a atol = 1e-12
+    @test sc.ad_ad ≈ sm.ad_ad atol = 1e-12
+    @test sc.ad_a ≈ sm.ad_a atol = 1e-12
+    @test sc.Sp ≈ sm.Sp atol = 1e-12
+    @test sc.Sz ≈ sm.Sz atol = 1e-12
+    @test sc.adSp ≈ sm.adSp atol = 1e-12
+    @test sc.adSm ≈ sm.adSm atol = 1e-12
+    @test sc.adSz ≈ sm.adSz atol = 1e-12
+    @test sc.SpSp_same ≈ sm.SpSp_same atol = 1e-12
+    @test sc.SzSp_same ≈ sm.SzSp_same atol = 1e-12
+    @test sc.SmSp_same ≈ sm.SmSp_same atol = 1e-12
+    @test sc.SzSz_same ≈ sm.SzSz_same atol = 1e-12
 
-    # Unmasked mulpath (the pre-fix formula) must disagree — this is the test
-    # that 240/240 product-IC parity could not catch.
+    # Unmasked mul! (the pre-fix formula) must disagree on dad* — this is
+    # the test that 240/240 product-IC parity could not catch.
     leak_sm = st.SmSp_same .* g_b .+ st.SmSp_cross * g_b
     leak_sz = st.SzSp_same .* g_b .+ st.SzSp_cross * g_b
-    st_du = unpack_state_2nd_order_u(du_cpu, M)
-    @test st_du.adSp ≉ st_du.adSp .+ 1im .* (leak .- masked)
-    @test st_du.adSm ≉ st_du.adSm .+ 1im .* (leak_sm .- (st.SmSp_same .* g_b .+ (st.SmSp_cross .* mask) * g_b))
-    @test st_du.adSz ≉ st_du.adSz .+ 1im .* (leak_sz .- (st.SzSp_same .* g_b .+ (st.SzSp_cross .* mask) * g_b))
+    @test sc.adSp ≉ sc.adSp .+ 1im .* (leak .- masked)
+    @test sc.adSm ≉ sc.adSm .+ 1im .* (leak_sm .- (st.SmSp_same .* g_b .+ (st.SmSp_cross .* mask) * g_b))
+    @test sc.adSz ≉ sc.adSz .+ 1im .* (leak_sz .- (st.SzSp_same .* g_b .+ (st.SzSp_cross .* mask) * g_b))
 
     gpu_ok = false
     if isdefined(@__MODULE__, :CUDA)
@@ -231,7 +246,10 @@ end
         ws_gpu = _rhs2_workspace(u_gpu, M)
         p_gpu = (0.1, 1.5, 0.25, δ_gpu, g_gpu, M, mask_gpu, _ -> Et, ws_gpu)
         rhs_2nd_order!(du_gpu, u_gpu, p_gpu, 0.0)
-        @test Array(du_gpu) ≈ du_cpu atol = 1e-12
+        sg = unpack_state_2nd_order_u(Array(du_gpu), M)
+        @test sg.adSp ≈ sc.adSp atol = 1e-12
+        @test sg.adSm ≈ sc.adSm atol = 1e-12
+        @test sg.adSz ≈ sc.adSz atol = 1e-12
     else
         @info "dirty-diag CuArray / multi-GPU integrate skipped: no NVIDIA GPU on this host"
     end
