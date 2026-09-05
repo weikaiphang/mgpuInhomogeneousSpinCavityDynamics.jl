@@ -524,9 +524,18 @@ function local_rhs!(du_dst::CuVector{ComplexF64},
 
 
 
+    # Same-bin + off-diagonal cross only (kernels skip k==j). The unused
+    # cross diagonal is not a chimera merge — just the same diag_mask idea.
     sumgSpSp_jk = SpSp_s_loc .* g_t_loc .+ SpSp_x_loc * g_t_full
     sumgSmSp_jk = SmSp_s_loc .* g_t_loc .+ SmSp_x_loc * g_t_full
     sumgSzSp_jk = SzSp_s_loc .* g_t_loc .+ SzSp_x_loc * g_t_full
+    @inbounds for jl in 1:M_LOCAL
+        j = gd.offset + jl
+        gj = g_t_full[j]
+        sumgSpSp_jk[jl] -= SpSp_x_loc[jl, j] * gj
+        sumgSmSp_jk[jl] -= SmSp_x_loc[jl, j] * gj
+        sumgSzSp_jk[jl] -= SzSp_x_loc[jl, j] * gj
+    end
 
     dadSp_loc .= (
         1im * delta0 .* adSp_loc .+ 1im .* δ_loc .* adSp_loc

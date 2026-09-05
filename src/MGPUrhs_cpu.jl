@@ -66,6 +66,7 @@ function rhs_cpu!(du::AbstractVector{Complex{T}}, u::AbstractVector{Complex{T}},
         dSp[j] = im * dj * Sp[j] - 2im * gj * adSz[j]
         dSz[j] = -im * gj * conj(adSm[j]) + im * gj * adSm[j]
 
+        # Same-bin + off-diagonal cross only (k==j is unused in the cross block).
         sumP = gj * SpSp_s[j]
         sumM = gj * SmSp_s[j]
         sumZ = gj * SzSp_s[j]

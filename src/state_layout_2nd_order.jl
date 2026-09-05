@@ -17,8 +17,14 @@ state_length_2nd_order(M) =
     4M +
     4M*M
 
+# Off-diagonal ones; unused cross[j,j] is zero so same-bin + cross rowsums
+# do not double-count k==j (kernels skip that slot).
+function make_diag_mask_cpu(M)
+    return ComplexF64.(.!Matrix(I, M, M))
+end
+
 function make_diag_mask(M)
-    return CuArray(ComplexF64.(.!Matrix(I, M, M)))
+    return CuArray(make_diag_mask_cpu(M))
 end
 
 function unpack_state_2nd_order_u(u, M)

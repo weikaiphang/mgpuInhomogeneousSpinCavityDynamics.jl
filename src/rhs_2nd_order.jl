@@ -19,6 +19,15 @@ function _rhs2_workspace(u, M)
     return RHS2Workspace(alloc(M), alloc(M), alloc(M), alloc(M), alloc(M), alloc(M))
 end
 
+# Cross[j,j] is unused (same-bin lives in *_same). Kernels skip k==j.
+# mul!(sumg, cross, g) + same .* g would double-count a dirty diagonal.
+@inline function _rowsum_same_plus_cross!(sumg, same, cross, g, diag_mask)
+    diag_mask === nothing && error("diag_mask is required for monolith row-sums")
+    mul!(sumg, cross .* diag_mask, g)
+    @. sumg = same * g + sumg
+    return nothing
+end
+
 function rhs_2nd_order!(du, u, p, t)
     delta0, kappa_e, kappa_i, delta_b_gpu, g_b_gpu, M = p[1], p[2], p[3], p[4], p[5], p[6]
     E_of_t = p[8]
@@ -31,6 +40,13 @@ function rhs_2nd_order!(du, u, p, t)
         return rhs_cpu!(du, u, T(delta0), T(kappa_e), T(kappa_i),
                         delta_b_gpu, g_b_gpu, Complex{T}(E_t))
     end
+    return _rhs_2nd_order_mulpath!(du, u, p, t)
+end
+
+# Broadcast / mul! monolith body (CuArray in production; Array in dirty-diag tests).
+function _rhs_2nd_order_mulpath!(du, u, p, t)
+    delta0, kappa_e, kappa_i, delta_b_gpu, g_b_gpu, M = p[1], p[2], p[3], p[4], p[5], p[6]
+    E_t = p[8](t)
 
     (
         a, ad_ad, ad_a,
@@ -67,12 +83,9 @@ function rhs_2nd_order!(du, u, p, t)
     du[IDX2_ad_a] = 1im * sum(conj, ws.g_adSm) - 1im * sum(ws.g_adSm) - κt * ad_a +
                     sqrt(κe) * E_t * conj(a) + sqrt(κe) * conj(E_t) * a
 
-    mul!(ws.sumgSpSp, SpSp_cross, g_b_gpu)
-    mul!(ws.sumgSmSp, SmSp_cross, g_b_gpu)
-    mul!(ws.sumgSzSp, SzSp_cross, g_b_gpu)
-    @. ws.sumgSpSp = SpSp_same * g_b_gpu + ws.sumgSpSp
-    @. ws.sumgSmSp = SmSp_same * g_b_gpu + ws.sumgSmSp
-    @. ws.sumgSzSp = SzSp_same * g_b_gpu + ws.sumgSzSp
+    _rowsum_same_plus_cross!(ws.sumgSpSp, SpSp_same, SpSp_cross, g_b_gpu, diag_mask)
+    _rowsum_same_plus_cross!(ws.sumgSmSp, SmSp_same, SmSp_cross, g_b_gpu, diag_mask)
+    _rowsum_same_plus_cross!(ws.sumgSzSp, SzSp_same, SzSp_cross, g_b_gpu, diag_mask)
 
     @. dadSp = (
         1im * delta0 * adSp + 1im * delta_b_gpu * adSp + 1im * ws.sumgSpSp

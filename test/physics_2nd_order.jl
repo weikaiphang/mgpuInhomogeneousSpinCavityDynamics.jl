@@ -161,6 +161,82 @@ end
     @test du_a ≈ du_b atol = 1e-14
 end
 
+@testset "dirty-diag rowsum: monolith mulpath ↔ rhs_cpu!" begin
+    # Product ICs zero cross[j,j], so the old unmasked mul! never showed the leak.
+    M = 3
+    Random.seed!(2)
+    u = randn(ComplexF64, state_length_2nd_order(M))
+    st = unpack_state_2nd_order_u(u, M)
+    for j in 1:M
+        st.SpSp_cross[j, j] = 0.41 + 0.13im
+        st.SmSp_cross[j, j] = 0.29 - 0.21im
+        st.SzSp_cross[j, j] = -0.33 + 0.07im
+        st.SzSz_cross[j, j] = 0.17
+    end
+    delta_b = Float64[0.4, -0.2, 0.1]
+    g_b = Float64[1.1, 0.9, 1.0]
+    Et = 0.3 + 0.2im
+    mask = make_diag_mask_cpu(M)
+
+    leak = st.SpSp_same .* g_b .+ st.SpSp_cross * g_b
+    masked = st.SpSp_same .* g_b .+ (st.SpSp_cross .* mask) * g_b
+    @test leak ≉ masked
+    @test maximum(abs.(leak .- masked)) > 1e-6
+
+    cpu_sum = zeros(ComplexF64, M)
+    for j in 1:M
+        s = st.SpSp_same[j] * g_b[j]
+        for k in 1:M
+            k == j && continue
+            s += st.SpSp_cross[j, k] * g_b[k]
+        end
+        cpu_sum[j] = s
+    end
+    @test masked ≈ cpu_sum
+    ws_sum = zeros(ComplexF64, M)
+    _rowsum_same_plus_cross!(ws_sum, st.SpSp_same, st.SpSp_cross, g_b, mask)
+    @test ws_sum ≈ cpu_sum
+
+    du_cpu = zero(u)
+    du_mul = zero(u)
+    rhs_cpu!(du_cpu, u, 0.1, 1.5, 0.25, delta_b, g_b, Et)
+    ws = _rhs2_workspace(u, M)
+    p = (0.1, 1.5, 0.25, delta_b, g_b, M, mask, _ -> Et, ws)
+    _rhs_2nd_order_mulpath!(du_mul, u, p, 0.0)
+    @test du_cpu ≈ du_mul atol = 1e-12
+
+    # Unmasked mulpath (the pre-fix formula) must disagree — this is the test
+    # that 240/240 product-IC parity could not catch.
+    leak_sm = st.SmSp_same .* g_b .+ st.SmSp_cross * g_b
+    leak_sz = st.SzSp_same .* g_b .+ st.SzSp_cross * g_b
+    st_du = unpack_state_2nd_order_u(du_cpu, M)
+    @test st_du.adSp ≉ st_du.adSp .+ 1im .* (leak .- masked)
+    @test st_du.adSm ≉ st_du.adSm .+ 1im .* (leak_sm .- (st.SmSp_same .* g_b .+ (st.SmSp_cross .* mask) * g_b))
+    @test st_du.adSz ≉ st_du.adSz .+ 1im .* (leak_sz .- (st.SzSp_same .* g_b .+ (st.SzSp_cross .* mask) * g_b))
+
+    gpu_ok = false
+    if isdefined(@__MODULE__, :CUDA)
+        gpu_ok = try
+            CUDA.functional()
+        catch
+            false
+        end
+    end
+    if gpu_ok
+        u_gpu = CuArray(u)
+        du_gpu = similar(u_gpu)
+        mask_gpu = CuArray(mask)
+        δ_gpu = CuArray(delta_b)
+        g_gpu = CuArray(g_b)
+        ws_gpu = _rhs2_workspace(u_gpu, M)
+        p_gpu = (0.1, 1.5, 0.25, δ_gpu, g_gpu, M, mask_gpu, _ -> Et, ws_gpu)
+        rhs_2nd_order!(du_gpu, u_gpu, p_gpu, 0.0)
+        @test Array(du_gpu) ≈ du_cpu atol = 1e-12
+    else
+        @info "dirty-diag CuArray / multi-GPU integrate skipped: no NVIDIA GPU on this host"
+    end
+end
+
 @testset "H4: :constant coupling rejects M_g ≠ 1" begin
     gcfg = (kind = :constant, g_value = 2π * 100)
     @test_throws ErrorException build_constant_coupling_bins(gcfg, 4)

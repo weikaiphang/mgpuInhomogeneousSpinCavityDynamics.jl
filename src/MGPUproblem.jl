@@ -213,6 +213,7 @@ function exchange_rowsums!(prob::MGPUProblem{T}, rb) where {T}
         return nothing
     end
 
+    @warn "exchange_rowsums!: NCCL and P2P unavailable; staging 3M row-sums through the HOST" maxlog=1
     M = prob.M
     host = prob.hostbuf
     for s in shards
