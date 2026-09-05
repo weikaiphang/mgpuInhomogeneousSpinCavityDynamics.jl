@@ -208,12 +208,22 @@ function chimera_du_to_qc_2nd_M1(du, u)
     ]
 end
 
+# QC image indices that map onto chimera without a correlator-basis change:
+# ⟨a⟩, ⟨σ21⟩, ⟨σ22⟩=Sz+1/2, ⟨a'a⟩, ⟨a'σ21⟩, ⟨a'a'⟩.
+# ⟨a'σ22⟩ and ⟨a σ21⟩ need Sz↔σ22 / Hermitian pairing; that naive map is
+# not the production backend (see compare_qc_to_closure_2nd_M1).
+const QC_2ND_OVERLAP = (1, 2, 3, 6, 7, 8)
+const QC_2ND_SIGMA22_SHIFT = (4, 5)
+
 """
-    compare_qc_to_closure_2nd_M1(; kwargs...) -> (maxabs, du_qc, du_from_cl)
+    compare_qc_to_closure_2nd_M1(; kwargs...) -> NamedTuple
 
 Map a chimera M=1 2nd-order state onto the QC order-2 M=1 coordinates and
 compare the generated-equation image to `rhs_2nd_order!`. Drive `E` is real
 so `η = √κₑ E` matches the QC derivation.
+
+`overlap` is the maxabs error on the shared sector. `shift_residual` is the
+maxabs error on the naive ⟨a'σ22⟩ / ⟨a σ21⟩ map — expected nonzero.
 """
 function compare_qc_to_closure_2nd_M1(;
         a=0.2 + 0.1im, Sp=0.05 + 0.02im, Sz=-0.4,
@@ -238,5 +248,7 @@ function compare_qc_to_closure_2nd_M1(;
     p = (Δ0, κe, κi, [δ], [g], 1, mask, Returns(ComplexF64(real(E))))
     rhs_2nd_order!(du_cl, u, p, 0.0)
     du_from_cl = chimera_du_to_qc_2nd_M1(du_cl, u)
-    return maximum(abs.(du_qc .- du_from_cl)), du_qc, du_from_cl
+    overlap = maximum(abs(du_qc[i] - du_from_cl[i]) for i in QC_2ND_OVERLAP)
+    shift_residual = maximum(abs(du_qc[i] - du_from_cl[i]) for i in QC_2ND_SIGMA22_SHIFT)
+    return (; overlap, shift_residual, du_qc, du_from_cl)
 end

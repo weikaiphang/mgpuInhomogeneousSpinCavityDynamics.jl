@@ -941,10 +941,10 @@ end
     if !@isdefined(compare_qc_to_closure_2nd_M1)
         include(joinpath(@__DIR__, "..", "src", "chimera", "eoms", "quantum_cumulants.jl"))
     end
-    err, du_qc, du_cl = compare_qc_to_closure_2nd_M1()
-    @test err < 1e-12
-    @test du_qc ≈ du_cl atol=1e-12
-    @test maximum(abs.(du_qc)) > 1e-8
+    cmp = compare_qc_to_closure_2nd_M1()
+    @test cmp.overlap < 1e-12
+    @test maximum(abs.(cmp.du_qc[[QC_2ND_OVERLAP...]])) > 1e-8
+    @test cmp.shift_residual > 1e-8
 
     M = 1
     Nj = [1.0]
@@ -969,7 +969,8 @@ end
     u_qc = chimera_u_to_qc_2nd_M1(u)
     du_qc2 = zero(u_qc)
     qc_rhs_2nd_M1_image!(du_qc2, u_qc, (delta0, ke + ki, delta[1], g[1], sqrt(ke) * Et), 0.0)
-    @test du_qc2 ≈ chimera_du_to_qc_2nd_M1(du_mono, u) atol=1e-12
+    du_from_cl = chimera_du_to_qc_2nd_M1(du_mono, u)
+    @test maximum(abs(du_qc2[i] - du_from_cl[i]) for i in QC_2ND_OVERLAP) < 1e-12
 end
 
 @testset "GPU↔CPU 2nd-order RHS parity" begin

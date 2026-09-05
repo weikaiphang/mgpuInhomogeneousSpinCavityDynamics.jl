@@ -79,15 +79,30 @@ The one equation set is already `rhs_2nd_order!`. A package-backed multi-GPU cut
 2. Evaluate **that** vector field (or a thin KernelAbstractions/CUDA port of it), not a second algebra.
 3. Hand the stages to OrdinaryDiffEq or DiffEqGPU. Delete the homemade Tsit5.
 
-No correctness rewrite is required for this audit. The CPU-sharded replica already matches the monolith, and the QC order-2 M=1 image matches the overlapping fields.
+No correctness rewrite is required for this audit. The CPU-sharded replica matches the monolith. The QC order-2 M=1 image matches the shared sector (`⟨a⟩`, `⟨σ21⟩`, `⟨σ22⟩`, `⟨a'a⟩`, `⟨a'σ21⟩`, `⟨a'a'⟩`). A naive `Sz↔σ22` map of `⟨a'σ22⟩` / `⟨a σ21⟩` does **not** match — that is the cut: do not `eval` the QC 8-vector as the production RHS.
 
 ## Hardware on this worker
 
 - `nvidia-smi`: absent
-- CUDA devices: 0
+- CUDA devices: 0 (`CUDA.functional() == false`)
 - Live ≥2-GPU NCCL Allreduce / P2P / device `rhs!` was **not executed**
 - CPU mirrors (`assemble_rowsums_*`, `_stress_mgpu_rhs`) remain the gate
-- `physics_correctness` GPU test stays an explicit `@test_skip`
+- Explicit skips: hardware inventory (`ndev < 2`) and `GPU↔CPU 2nd-order RHS parity`
+
+## Tests on this revision (Julia 1.10.10, CPU)
+
+PR #6 claimed: package_first 61, QC 5, oracle 2, physics 2905 + 1 GPU skip.
+
+This run:
+
+| Suite | Result vs claim |
+| --- | --- |
+| `test/package_first.jl` | **78 pass** (61 prior + 17 NIH ownership) |
+| `test/quantum_cumulants.jl` | **8 pass** (5 prior + 3 generated-file checks) |
+| `test/oracle_quantumtoolbox.jl` | **2 pass** (matches claim) |
+| `test/physics_correctness.jl` | **2912 pass + 2 skip** (2905 prior + 1 hardware pass + 6 QC/MGPU parity; skips = `<2 GPU` + `!CUDA.functional`) |
+
+C1, H1, and `diag_mask` row-sum exclusion all passed. No production RHS rewrite.
 
 ## Sacred physics (do not regress)
 
