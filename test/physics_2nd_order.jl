@@ -355,3 +355,30 @@ end
     rhs_cpu!(du_t, u, 0.0, 2.0, 3.0, δ, g_b, 0.0im)
     @test real(du_t[1] - du_e[1]) ≈ -0.5 * 3.0 * real(u[1]) atol = 1e-14
 end
+
+@testset "rhs_cpu! serial ↔ threaded; full-du vs mulpath; no-alloc" begin
+    M = 20
+    u = _dirty_random_u(M; seed=4, dirty_diag=true)
+    delta_b = Float64[0.1 * (j - 10) for j in 1:M]
+    g_b = Float64[0.8 + 0.02 * j for j in 1:M]
+    Et = 0.2 + 0.1im
+    du_s = zero(u)
+    du_t = zero(u)
+    rhs_cpu!(du_s, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
+    rhs_cpu!(du_t, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=true)
+    _assert_full_du_parity(du_s, du_t, M)
+
+    du_mul = zero(u)
+    du_ker = zero(u)
+    mask = make_diag_mask_cpu(M)
+    ws = _rhs2_workspace(u, M)
+    p = (0.1, 1.5, 0.25, delta_b, g_b, M, mask, _ -> Et, ws)
+    _rhs_2nd_order_mulpath!(du_mul, u, p, 0.0)
+    rhs_kernel_replica!(du_ker, u, 0.1, 1.5, 0.25, delta_b, g_b, Et)
+    _assert_full_du_parity(du_s, du_mul, M)
+    _assert_full_du_parity(du_s, du_ker, M)
+
+    rhs_cpu!(du_s, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
+    alloc = @allocated rhs_cpu!(du_s, u, 0.1, 1.5, 0.25, delta_b, g_b, Et; threaded=false)
+    @test alloc == 0
+end

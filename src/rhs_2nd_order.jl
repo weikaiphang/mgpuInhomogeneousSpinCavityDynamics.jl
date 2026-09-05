@@ -23,8 +23,17 @@ end
 # mul!(sumg, cross, g) + same .* g would double-count a dirty diagonal.
 @inline function _rowsum_same_plus_cross!(sumg, same, cross, g, diag_mask)
     diag_mask === nothing && error("diag_mask is required for monolith row-sums")
-    mul!(sumg, cross .* diag_mask, g)
-    @. sumg = same * g + sumg
+    # CPU: GEMV + O(M) diag correction (no M×M temporary).
+    # GPU: keep (cross .* diag_mask) — no scalar indexing.
+    if cross isa Array
+        mul!(sumg, cross, g)
+        @inbounds for j in eachindex(sumg)
+            sumg[j] += (same[j] - cross[j, j]) * g[j]
+        end
+    else
+        mul!(sumg, cross .* diag_mask, g)
+        @. sumg = same * g + sumg
+    end
     return nothing
 end
 
