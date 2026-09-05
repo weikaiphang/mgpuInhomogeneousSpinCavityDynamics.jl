@@ -833,7 +833,7 @@ end
     @test isempty(offenders)
 
     rose = read(joinpath(repo, "scripts", "rose_reference_harness.jl"), String)
-    @test occursin("PAPER_G_RENORMALIZE", rose)
+    @test occursin(r"renormalize\s*=\s*PAPER_G_RENORMALIZE", rose)
 
     arp = read(joinpath(repo, "src", "composite_arp_pulses.jl"), String)
     @test occursin("coupling_rms", arp)
