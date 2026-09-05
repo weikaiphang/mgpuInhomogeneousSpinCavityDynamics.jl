@@ -1,10 +1,3 @@
-# ============================================================
-# PULSE_SPEC design tables, system binding, and Ttotal derivation.
-#
-# Pulse-intrinsic times (leading delays, durations, gaps) are catalogued
-# first. Ttotal is derived afterwards from drive support, echo times
-# (if any), and a short SYSTEM-dependent settling tail.
-# ============================================================
 
 const N_SIGMA_SUPPORT = 5.0
 const ECHO_HALF_WINDOW = 10e-6
@@ -16,9 +9,6 @@ const PAPER_WURST_AMP_PREFACTOR = 2.0e4
 const PAPER_SIGNAL_AMP_PREFACTOR = 0.332
 const WURST_EDGE_FRAC = 1e-4
 
-# ============================================================
-# Physical helpers from SYSTEM_CONFIG
-# ============================================================
 
 function system_fwhm(sys)
     return sys.freq_inhomogeneity.FWHM
@@ -43,9 +33,6 @@ function default_3arp_omega_max(sys)
     return pi * kappa_t / (4 * g_mean * sqrt(sys.kappa_e)) * system_fwhm(sys)
 end
 
-# ============================================================
-# Drive support and Ttotal
-# ============================================================
 
 function segment_support(seg)
     kind = seg.kind
@@ -129,9 +116,6 @@ function derive_ttotal(sys, PULSE_SPEC)
     return Ttotal
 end
 
-# ============================================================
-# Binding analytic pulses to SYSTEM_CONFIG
-# ============================================================
 
 function wurst_segment(;
     name,
@@ -457,9 +441,6 @@ function bind_pulse(design, sys)
     end
 end
 
-# ============================================================
-# Solver-legal PULSE_CONFIG (closures built only here)
-# ============================================================
 
 function materialize_pulse_config(PULSE_SPEC)
     segs = Any[]
@@ -485,9 +466,6 @@ function pulse_config_is_valid(PULSE_CONFIG)
     end
 end
 
-# ============================================================
-# Design tables
-# ============================================================
 
 function rase_designs()
     out = Any[]

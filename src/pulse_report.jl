@@ -1,17 +1,4 @@
-# ============================================================================
-#  pulse_report.jl  --  seed-vs-optimised pulse report (self-contained HTML)
-#
-#  write_pulse_report(<stem-or-.jld2-path>; data_dir=<auto>, out_dir=<auto>,
-#                     log_dir=<data_dir>, param_budget=120, runtime_s=nothing,
-#                     verbose=true) -> outpath
-#
-#  Reads  <data_dir>/<stem>.jld2 (+ <log_dir>/_optrunlog.jld2 + _opt_pulsepara.jld2 if present)
-#  and writes a standalone page to  <out_dir>/<stem>.html  (see module docs).
-#  Called automatically at the end of optimise_control_pulse_from_jld2 (and by
-#  scripts/pulse_report.jl on the CLI). Uses only names already in the module.
-# ============================================================================
 
-# minimal JSON encoder for the exact payload shapes this file produces
 _jsonval(::Nothing) = "null"
 _jsonval(x::Bool) = x ? "true" : "false"
 _jsonval(x::Integer) = string(x)
@@ -25,7 +12,6 @@ _jsonval(x::AbstractVector) = string("[", join((_jsonval(v) for v in x), ","), "
 _jsonval(x::AbstractDict) =
     string("{", join((string(_jsonval(String(k)), ":", _jsonval(v)) for (k, v) in x), ","), "}")
 
-# seconds -> "6h 48m 12s" / "48m 12s" / "12.3s"
 function fmt_dur(s)
     s === nothing && return "—"
     s = Float64(s)
@@ -35,13 +21,11 @@ function fmt_dur(s)
               @sprintf("%.1fs", sec)
 end
 
-# ------------------------------------------------------------- helpers --------
 sig(x, n=5) = x === nothing ? "—" : (isfinite(x) ? string(round(x; sigdigits=n)) : string(x))
-us(x)       = @sprintf("%.2f", x * 1e6)               # seconds -> microseconds string
+us(x)       = @sprintf("%.2f", x * 1e6)
 twopi_mhz(x)= @sprintf("2π × %.4g MHz", x / (2π * 1e6))
 twopi_hz(x) = @sprintf("2π × %.4g Hz",  x / (2π))
 
-# unwrap a phase vector in place-ish, return new
 function _unwrap(ph)
     out = copy(ph)
     @inbounds for k in 2:length(out)
@@ -52,7 +36,7 @@ function _unwrap(ph)
     return out
 end
 
-"""sample a t->Complex drive: returns (A, re, im, f) with f masked (NaN) where |E|<1e-3·peak."""
+
 function sample_drive(E, tgrid)
     z  = ComplexF64.(E.(tgrid))
     A  = abs.(z); re = real.(z); im = imag.(z)
@@ -68,10 +52,7 @@ function sample_drive(E, tgrid)
     return A, re, im, f
 end
 
-"""raw per-segment B-spline amplitude A_spline(t) -- the physical cA envelope
-   BEFORE the C∞ edge taper (build_E_of_t applies |E| = A_spline · taper).
-   Returns NaN in the inter-segment silence so the plotted trace BREAKS there
-   instead of diving to zero and back (which reads as a spike)."""
+
 function amp_bspline_of_t(cp, u)
     ts, te, _, cA, _ = decode(cp, u)
     kn = [make_clamped_knots(cp.n_coeff_A, ts[i], te[i], cp.degree) for i in 1:cp.k]
@@ -83,9 +64,7 @@ function amp_bspline_of_t(cp, u)
     end
 end
 
-"""exact instantaneous-frequency spline f(t) (build_A_f_of_t's own f_of_t), NaN
-   outside every sub-pulse -- the honest curve, vs a numerical d/dt of angle(E)
-   which blows up wherever the taper drives |E| toward zero."""
+
 function freq_spline_of_t(cp, u)
     ts, te, _, _, _ = decode(cp, u)
     ffun = build_A_f_of_t(cp, u)[2]
@@ -97,7 +76,7 @@ function freq_spline_of_t(cp, u)
     end
 end
 
-"""per-segment (duration, peak|E|, chirp span, chirp rate) from a sampled drive, edges trimmed."""
+
 function seg_stats(E, segwins)
     rows = NTuple{4,Float64}[]
     for (a, b) in segwins
@@ -112,12 +91,11 @@ function seg_stats(E, segwins)
     return rows
 end
 
-# --------------------------------------------------- load run + build pulses --
 struct Bundle
     stem::String
-    ref                # load_jld2_reference output
-    d                  # prepare_derived
-    raw                # raw `data` NamedTuple from <stem>.jld2
+    ref
+    d
+    raw
     k::Int; nA::Int; nf::Int; degree::Int; taper::Float64
     T_max::Float64; amp_scale::Float64; freq_scale::Float64
     seed_pulse; seed_u::Vector{Float64}
@@ -146,7 +124,7 @@ function load_bundle(stem, data_dir, param_budget, runtime_cli, log_dir=nothing)
     runlog = isfile(logp) ? JLD2.load(logp, "data") : nothing
     para   = isfile(parp) ? JLD2.load(parp, "data") : nothing
 
-    # ---- pulse shape params ----
+
     if para !== nothing
         k, nA, nf = para.k, para.n_coeff_A, para.n_coeff_f
         degree, taper = para.degree, para.taper_frac
@@ -165,7 +143,7 @@ function load_bundle(stem, data_dir, param_budget, runtime_cli, log_dir=nothing)
     ascl  = cp.amp_scale
     fscl  = cp.freq_scale
 
-    # ---- seed u (warm start) ----
+
     seed_kind = "linear seed (fresh fit)"
     if runlog !== nothing && hasproperty(runlog, :initial_u)
         seed_u = collect(Float64, runlog.initial_u)
@@ -177,7 +155,7 @@ function load_bundle(stem, data_dir, param_budget, runtime_cli, log_dir=nothing)
     end
     seed_pulse = cp
 
-    # ---- optimised u ----
+
     opt_u = para !== nothing ? collect(Float64, para.final_u) :
             (runlog !== nothing && hasproperty(runlog, :final_u) ? collect(Float64, runlog.final_u) : nothing)
     opt_pulse = cp
@@ -189,9 +167,9 @@ function load_bundle(stem, data_dir, param_budget, runtime_cli, log_dir=nothing)
     opt_settings  = runlog !== nothing ? runlog.optimizer_settings : nothing
     history       = runlog !== nothing && hasproperty(runlog, :history) ? collect(runlog.history) : nothing
 
-    # ---- total run-time: --runtime, then a stored field, else nothing ----
-    # (a field may be PRESENT but nothing -- save_optimisation_run_log's own
-    # default -- so test the value, not just hasproperty/haskey.)
+
+
+
     runtime_s = runtime_cli === nothing ? nothing : Float64(runtime_cli)
     if runtime_s === nothing && runlog !== nothing
         for f in (:elapsed_seconds, :runtime_seconds, :elapsed)
@@ -214,7 +192,6 @@ function load_bundle(stem, data_dir, param_budget, runtime_cli, log_dir=nothing)
                   seed_kind, have_opt)
 end
 
-# ------------------------------------------------------------- HTML bits ------
 const CSS = raw"""
   :root{
     --bg:#f0f0ee; --surface:#fbfbfa; --surface-2:#f5f5f2;
@@ -571,7 +548,6 @@ const JS = raw"""
 
 esc(s) = replace(string(s), "&"=>"&amp;", "<"=>"&lt;", ">"=>"&gt;")
 
-# key/value <dl> rows from pairs
 kv(pairs) = join(("      <dt>$(esc(k))</dt><dd>$(esc(v))</dd>" for (k,v) in pairs), "\n")
 
 function cfg_section(b::Bundle)
@@ -676,7 +652,6 @@ $(seed_block)
   </section>"""
 end
 
-# ------------------------------------------------------------- assemble -------
 function build_report(b::Bundle)
     d = b.d
     Eseed = build_E_of_t(b.seed_pulse, b.seed_u)
@@ -701,29 +676,29 @@ function build_report(b::Bundle)
     As, _, _, _ = sample_drive(Eseed, tg)
     Ao, _, _, _ = b.have_opt ? sample_drive(Eopt, tg) : (As, nothing, nothing, nothing)
 
-    # instantaneous frequency = the EXACT f-spline (build_A_f_of_t), NaN in the
-    # gaps. Not a numerical d/dt of angle(E): that explodes at every tapered
-    # edge (|E| -> 0, phase undefined) and across each sub-pulse phi0 jump.
+
+
+
     fseed = freq_spline_of_t(b.seed_pulse, b.seed_u)
     fs = fseed.(tg)
     fo = b.have_opt ? freq_spline_of_t(b.opt_pulse, b.opt_u).(tg) : fs
 
-    # raw B-spline amplitude A(t) (pre-taper); clip display at 3× the |E| peak
+
     Aspl_s = amp_bspline_of_t(b.seed_pulse, b.seed_u).(tg)
     Aspl_o = b.have_opt ? amp_bspline_of_t(b.opt_pulse, b.opt_u).(tg) : Aspl_s
     aclip  = 3 * max(maximum(As), maximum(Ao))
     clipped = any(>(aclip), Aspl_s) || any(>(aclip), Aspl_o)
     As_raw = min.(Aspl_s, aclip); Ao_raw = min.(Aspl_o, aclip)
 
-    # ---- drive power: avg over EACH pulse's own segment span; energy over all ----
+
     dts = tg[2] - tg[1]
     lo_s = minimum(first.(segwin_s)); hi_s = maximum(last.(segwin_s))
     lo_o = minimum(first.(segwin_o)); hi_o = maximum(last.(segwin_o))
     ms = (tg .>= lo_s) .& (tg .<= hi_s)
     mo = (tg .>= lo_o) .& (tg .<= hi_o)
-    pow_s = sum((As[ms] ./ b.amp_scale) .^ 2) / max(count(ms), 1)   # ⟨|E/amp_scale|²⟩ while on
+    pow_s = sum((As[ms] ./ b.amp_scale) .^ 2) / max(count(ms), 1)
     pow_o = b.have_opt ? sum((Ao[mo] ./ b.amp_scale) .^ 2) / max(count(mo), 1) : pow_s
-    en_s  = sum(As .^ 2) * dts                                       # ∫|E|² dt over the whole trace
+    en_s  = sum(As .^ 2) * dts
     en_o  = b.have_opt ? sum(Ao .^ 2) * dts : en_s
 
     step = 2
@@ -749,7 +724,7 @@ function build_report(b::Bundle)
     end
     json = _jsonval(payload)
 
-    # ---- stat tiles ----
+
     im = b.init_metrics; fm = b.final_metrics
     function tile(name, i0, i1; pct=true, fmtf=x->sig(x,5))
         v0 = im === nothing ? nothing : im[i0]
@@ -766,12 +741,12 @@ function build_report(b::Bundle)
     <div class="stat"><div class="k">$(esc(name))</div>
       <div class="v">$ff<span>$vv</span></div>$chg</div>"""
     end
-    # metrics tuple order: (cost, inversion, silencing, duration, coherence, ...)
+
     dur_tiles = tile("Duration", 4, 4; fmtf=x->x===nothing ? "—" : @sprintf("%.1f µs", x*1e6))
     inv_tiles = tile("Inversion", 2, 2)
     sil_tiles = tile("Silencing |F|⋆", 3, 3)
 
-    # power tile (not in the metrics tuple -- computed from the sampled drive)
+
     function tile2(name, v0, v1, ff)
         dp  = 100*(v1/v0 - 1)
         cls = abs(dp) < 0.5 ? "held" : (dp < 0 ? "drop" : "rise")
@@ -914,16 +889,7 @@ $body
 """
 end
 
-"""
-    write_pulse_report(stem_or_path; data_dir=nothing, out_dir=nothing, log_dir=nothing,
-                       param_budget=120, runtime_s=nothing, verbose=true) -> outpath
 
-Generate `<out_dir>/<stem>.html`. `stem_or_path` may be a bare stem or a
-`<stem>.jld2` path; when it is a path, `data_dir`/`out_dir` default from it
-(`out_dir` -> a sibling `html/` of the data dir's parent). `log_dir` is where
-the `_optrunlog.jld2`/`_opt_pulsepara.jld2` siblings live (defaults to the
-data dir) — pass it when the optimiser wrote its log to a separate directory.
-"""
 function write_pulse_report(stem_or_path::AbstractString;
                             data_dir::Union{Nothing,AbstractString}=nothing,
                             out_dir::Union{Nothing,AbstractString}=nothing,

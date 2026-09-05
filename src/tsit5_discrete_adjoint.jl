@@ -1,15 +1,3 @@
-# ============================================================
-# Discrete Tsit5 adjoint on a frozen accepted mesh.
-#
-# The forward map of one forced step is the same 6-stage Tsitouras 5(4)
-# tableau OrdinaryDiffEq.Tsit5 uses for the 5th-order solution (FSAL k7
-# is not part of Φ). Adaptive OrdinaryDiffEq is used only to RECORD the
-# accepted (t_n, dt_n) sequence; replay and the discrete VJP use this
-# explicit Φ, so the frozen-mesh finite-difference gold and the adjoint
-# differentiate the same map.
-#
-# This file does not change rhs_1st_order! or the Dual production path.
-# ============================================================
 
 struct Tsit5DiscAdjTableau{T}
     c1::T
@@ -40,9 +28,9 @@ struct Tsit5DiscAdjTableau{T}
 end
 
 function Tsit5DiscAdjTableau(::Type{T}=Float64) where {T}
-    # OrdinaryDiffEqTsit5 Tsit5ConstantCacheActual (CompiledFloats branch):
-    # c1..c4 as in tsit_tableaus.jl; k6 is evaluated at t+dt (c5=1);
-    # 5th-order weights are a71..a76 (b7=0, k7 is FSAL only).
+
+
+
     return Tsit5DiscAdjTableau{T}(
         T(0.161),
         T(0.327),
@@ -74,21 +62,7 @@ end
 
 const TSIT5_DISC_ADJ_TAB = Tsit5DiscAdjTableau(Float64)
 
-"""
-    FrozenTsit5Mesh
 
-`mutable` (not `immutable`) specifically so `.u` -- the full per-accepted-
-step state list, `state_length_1st_order(M)` complex numbers per step,
-i.e. `O(M)` per step and `O(steps)` steps for a long/stiff solve, easily
-hundreds of MB at a real ensemble size -- can be DROPPED (reassigned to an
-empty vector) by a caller once it has confirmed `.u` won't be read again
-(see [`_adjoint_one_track`](@ref)'s own use: `reverse_tsit5_on_checkpoints!`
-never reads `mesh.u`, only `mesh.t`/`mesh.dt`/`stack.u`, so once checkpointed
-reversal is confirmed to apply, `.u` is pure waste held across the
--- also allocation-heavy -- backward sweep). `.t`/`.dt` are left as
-plain `Vector{Float64}` fields (small, `O(steps)` scalars, not worth the
-same treatment) -- only `.u` is ever cleared in practice.
-"""
 mutable struct FrozenTsit5Mesh
     t::Vector{Float64}
     dt::Vector{Float64}
@@ -111,15 +85,15 @@ struct Tsit5DiscAdjWorkspace
     λu::Vector{Float64}
     λy::Vector{Float64}
     λk::NTuple{6,Vector{Float64}}
-    # Cache for _accumulate_drive_grad!'s ForwardDiff.GradientConfig -- see
-    # that function's own comment for why this is safe to reuse across
-    # calls/stages despite each call building a fresh closure. Keyed by `n`
-    # (Base.RefValue, not a Dict) since a single workspace is only ever used
-    # by ONE pulse/n_params at a time within a track's reverse sweep; `n`
-    # only actually changes across an RJMCMC k-hop reusing the same cached
-    # (M-keyed) workspace, in which case the mismatch is detected and the
-    # config is rebuilt once. `Any`-typed so this struct's own type doesn't
-    # have to encode ForwardDiff's tag/chunk type parameters.
+
+
+
+
+
+
+
+
+
     drive_grad_n::Base.RefValue{Int}
     drive_grad_cfg::Base.RefValue{Any}
     drive_grad_result::Base.RefValue{Vector{Float64}}
@@ -140,47 +114,7 @@ function Tsit5DiscAdjWorkspace(M::Integer)
                                   Ref(-1), Ref{Any}(nothing), Ref(Float64[]))
 end
 
-# ============================================================
-# TASK-LOCAL WORKSPACE CACHE
-#
-# _adjoint_one_track (pulse_adjoint.jl) builds a fresh Tsit5DiscAdjWorkspace
-# on every call -- once per initial-condition TRACK, once per OPTIMISER
-# EPOCH -- 13 Vector{ComplexF64}(undef,N) + 10 Vector{Float64}(undef,nR)
-# each time (~15MB at a real M=20000 ensemble). None of that is needed
-# fresh: every field is fully overwritten (never read-before-write) on
-# each use inside tsit5_step_vjp!, so reusing the SAME buffers across
-# calls avoids that repeated allocate-then-GC churn.
-#
-# Keyed by (current Task, M), via `task_local_storage` -- NOT by
-# `Threads.threadid()` (an EARLIER version of this cache used that keying
-# and had a real, silent-corruption bug: under Julia's default `:dynamic`
-# `Threads.@threads` scheduling, a Task can migrate to a DIFFERENT OS
-# thread at any yield point -- including the `GC.gc(false)` calls this
-# same reverse sweep already makes once per checkpoint window
-# (pulse_adjoint.jl) -- so `threadid()` is not a stable per-task identity
-# for the DURATION of one gradient call. Two concurrent tasks (e.g. two
-# `k`'s in `optimise_composite_pulse_over_k`'s own `Threads.@threads`, both
-# using `grad_mode=:adjoint` on the SAME ensemble `M`) could transiently
-# report the SAME `threadid()` at different moments and be handed the
-# SAME cached workspace while both are still mid-flight through it,
-# interleaving writes into `ws.k`/`ws.y`/... with no synchronization --
-# silently wrong gradients, not a crash. `task_local_storage` has no such
-# gap: it is bound to the TASK object itself, which the Julia runtime
-# guarantees stays associated with that storage regardless of which OS
-# thread is currently executing it, and needs no locking at all (each
-# task owns its own storage exclusively) -- simpler AND correct, unlike
-# the `Threads.threadid()`-keyed version this replaced.
-"""
-    _tsit5_adj_workspace(M) -> Tsit5DiscAdjWorkspace
 
-Task-local cached [`Tsit5DiscAdjWorkspace`](@ref), reused across calls for
-the same `M` within the SAME `Task` instead of allocating a fresh one
-every time -- see this section's own module comment for the full safety
-reasoning (every field is fully overwritten before being read on each use,
-and the cache is keyed per-`Task` via `task_local_storage`, which stays
-valid even if that task migrates between OS threads mid-call, unlike
-`Threads.threadid()`).
-"""
 function _tsit5_adj_workspace(M::Integer)
     tls = task_local_storage()
     cache = get!(tls, :InhomogeneousSpinCavityDynamics_tsit5_adj_ws_cache) do
@@ -195,7 +129,7 @@ end
     i == 3 && return t + tab.c2 * dt
     i == 4 && return t + tab.c3 * dt
     i == 5 && return t + tab.c4 * dt
-    return t + dt  # i == 6
+    return t + dt
 end
 
 function _tsit5_combine_stage!(y, u, k, tab::Tsit5DiscAdjTableau, dt, i::Int)
@@ -242,13 +176,7 @@ function _tsit5_combine_solution!(u_np1, u, k, tab::Tsit5DiscAdjTableau, dt)
     return u_np1
 end
 
-"""
-    tsit5_forced_step(u, p, t, dt; tab=TSIT5_DISC_ADJ_TAB) -> u_np1
 
-One forced Tsit5 step Φ(u, t, dt) using `rhs_1st_order!`. Generic in
-`eltype(u)` so ForwardDiff Dual pulse parameters can flow through `p`'s
-`E_of_t` (and Dual-promoted state) for the one-step verification test.
-"""
 function tsit5_forced_step(u::AbstractVector, p, t, dt, tab::Tsit5DiscAdjTableau=TSIT5_DISC_ADJ_TAB)
     k = ntuple(_ -> similar(u), 6)
     y = similar(u)
@@ -274,29 +202,7 @@ function tsit5_forced_step!(u_np1, k, y_scratch, u, p, t, dt,
     return u_np1
 end
 
-"""
-    _accumulate_drive_grad!(gθ, λx, t, pulse, u_pulse, sqrt_κe, ws)
 
-`gθ .+= ∇_θ[sqrt_κe*(λar*real(E(t,θ)) + λai*imag(E(t,θ)))]` via ForwardDiff,
-called once per RK stage (6x per accepted adjoint step). The
-`ForwardDiff.GradientConfig` and output buffer are cached on `ws`
-(`ws.drive_grad_cfg`/`ws.drive_grad_result`, keyed by `ws.drive_grad_n`)
-rather than rebuilt on every call -- building a fresh `Chunk`+closure+
-`GradientConfig` per stage was previously the dominant allocation/setup
-cost of the whole `:adjoint` backend, paid 6x per step for no reason: the
-closure `s` defined below has the SAME TYPE on every call (a nested
-function's type is fixed at compile time of the ENCLOSING method, not
-per-invocation -- only its captured field VALUES, i.e. `t`/`pulse`/
-`u_pulse`/`sqrt_κe`/`λar`/`λai`, differ), so a `GradientConfig` built
-against one instance of `s` remains valid for `ForwardDiff.gradient!` calls
-against any later instance of `s` with the same `n = length(u_pulse)` --
-reused via `ForwardDiff.gradient!(result, s, u_pulse, cfg)` (in place, no
-per-call allocation of the output vector either). Rebuilt only when `n`
-itself changes (an RJMCMC k-hop changing `n_params(pulse)` on a workspace
-whose `M`-keyed cache slot was already warm from a previous `k`) --
-detected via the `ws.drive_grad_n[] != n` check, so this is correctness-
-preserving for every caller, not merely typical-case-preserving.
-"""
 function _accumulate_drive_grad!(gθ::AbstractVector, λx::AbstractVector, t,
                                  pulse::CompositePulse, u_pulse::AbstractVector, sqrt_κe,
                                  ws::Tsit5DiscAdjWorkspace)
@@ -321,14 +227,7 @@ function _accumulate_drive_grad!(gθ::AbstractVector, λx::AbstractVector, t,
     return nothing
 end
 
-"""
-    tsit5_step_vjp!(λ_n, gθ, λ_np1, u_n, t, dt, p, pulse, u_pulse, ws; tab=...)
 
-Discrete adjoint of one `tsit5_forced_step`. `λ_*` and `ws.λ*` are the
-real-split adjoint (length 2N). `gθ` accumulates ∇_θ of the scalar loss
-through this step's stages (control `E(t,θ)` only). Overwrites `λ_n`
-(may alias `λ_np1` only after `λ_np1` has been copied into `ws.λu`).
-"""
 function tsit5_step_vjp!(
     λ_n::AbstractVector,
     gθ::AbstractVector,
@@ -399,24 +298,8 @@ end
     return zero(tab.a21)
 end
 
-"""
-    _host_ode_p(d, E_of_t) -> p
 
-Adjoint-side ODE parameter tuple. `delta_b`/`g_b` are asserted real before
-truncation: every OTHER backend (`rhs_1st_order!`'s own forward solves via
-`run_sim_1st_order_pure`, `_pulse_cost_grad_threaded`'s Dual ODEs) consumes
-`d.delta_b`/`d.g_b` as given, complex or not, while this function has
-always silently discarded any imaginary part via `real.(...)` -- currently
-a no-op (every ensemble this package builds via `ensemble.jl` produces
-real-valued `delta_b`/`g_b`), but a silent one: if a future ensemble
-construction path ever produced complex detunings/couplings,
-`pulse_cost_grad_adjoint` would differentiate a DIFFERENT (real-truncated)
-ODE than `pulse_cost`/`_pulse_cost_grad_threaded` actually evaluate, with
-no error to flag the mismatch. The assertion converts that into a loud,
-immediate failure instead, and is exact-no-op on every currently-tested
-input (all real).
-"""
-function _host_ode_p(d, E_of_t)
+function _host_ode_p(d, E_of_t, frame::Symbol=:lab)
     M = Int(d.M)
     all(iszero, imag.(d.delta_b)) || error(
         "_host_ode_p: d.delta_b has nonzero imaginary part(s) -- the adjoint " *
@@ -430,19 +313,11 @@ function _host_ode_p(d, E_of_t)
     )
     delta_b = collect(Float64, real.(d.delta_b))
     g_b = collect(Float64, real.(d.g_b))
-    return (Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i), delta_b, g_b, M, E_of_t)
+    base = (Float64(d.delta0), Float64(d.kappa_e), Float64(d.kappa_i), delta_b, g_b, M, E_of_t)
+    return frame === :ip ? (base..., :ip) : base
 end
 
-"""
-    _checkpoint_indices(n, stride) -> Vector{Int}
 
-1-based node indices `{1, 1+stride, 1+2*stride, ..., n}` into an
-`n`-node trajectory (`n >= 2`): node 1 (the initial condition) and node
-`n` (the final state) are always included; every other checkpoint is
-`stride` nodes apart. Shared by both [`record_adaptive_tsit5_mesh`](@ref)
-recording modes so a caller sees the IDENTICAL checkpoint set regardless
-of which one ran.
-"""
 function _checkpoint_indices(n::Integer, stride::Integer)
     idxs = Int[1]
     if stride < n
@@ -456,44 +331,7 @@ function _checkpoint_indices(n::Integer, stride::Integer)
     return idxs
 end
 
-"""
-    record_adaptive_tsit5_mesh(u0, p, tspan; reltol, abstol, tstops, checkpoint_stride, record_full_u=true)
-        -> (mesh, stack, u_end)
 
-Adaptive `Tsit5()` solve of `rhs_1st_order!` (same solver as production),
-logging every accepted node. CPU only. `stack` downsamples the recorded
-nodes every `checkpoint_stride` nodes (always including the first and
-last, see [`_checkpoint_indices`](@ref)); `mesh.t`/`mesh.dt` always hold
-every node's time/step (`O(steps)` `Float64` scalars, cheap even at tens
-of thousands of steps -- [`reverse_tsit5_on_checkpoints!`](@ref) needs the
-FULL `dt` sequence to replay each window, not just the checkpoint times).
-
-`record_full_u=true` (default) additionally materialises `mesh.u`, every
-node's FULL state (`state_length_1st_order(M)` complex numbers per node --
-`O(M)` per node, `O(steps)` nodes, "easily hundreds of MB at a real
-ensemble size" per [`FrozenTsit5Mesh`](@ref)'s own docstring, and far more
-than that at `M` in the tens of thousands over a fine adaptive solve).
-This is required by [`reverse_tsit5_on_states!`](@ref) (the non-
-checkpointed reverse sweep, `use_checkpoints=false`), which needs every
-intermediate state directly, not replayed.
-
-`record_full_u=false` instead uses a `DiffEqCallbacks.FunctionCallingCallback`
-firing on every accepted step to build `mesh.t`/`mesh.dt` incrementally
-WITHOUT ever storing the full per-node state list: only the checkpoint
-nodes' own states are copied out of the integrator (`O(steps/stride)`
-memory instead of `O(steps)`), directly into `stack.u`. `mesh.u` comes
-back an EMPTY vector in this mode -- only [`reverse_tsit5_on_checkpoints!`](@ref)
-(never `reverse_tsit5_on_states!`) can consume the result; this is exactly
-what fixes the checkpointed adjoint path actually OOMing during the
-forward recording pass itself (an earlier version of this function always
-built the full `mesh.u` regardless of `checkpoint_stride`/`use_checkpoints`,
-so `record_full_u=false` was never reachable and a large-ensemble
-`grad_mode=:adjoint, use_checkpoints=true` run paid the full O(steps)
-memory cost anyway, before checkpointing ever got a chance to help).
-Both recording modes produce the IDENTICAL `mesh.t`/`mesh.dt`/`stack`
-content for the same trajectory -- only which states get materialised
-differs.
-"""
 function record_adaptive_tsit5_mesh(
     u0::AbstractVector,
     p,
@@ -534,16 +372,16 @@ function record_adaptive_tsit5_mesh(
         return mesh, stack, copy(u[end])
     end
 
-    # Memory-bounded recording: never materialises the full per-node state
-    # list. `step[]` counts accepted steps (node 1 is u0, recorded below
-    # before the solve starts); a node `n>=2` is a checkpoint exactly when
-    # `_checkpoint_indices` would include it, i.e. `(n-1) % stride == 0` --
-    # the periodic part of that same arithmetic sequence, evaluated live
-    # instead of from a known final `n`. The final node is topped up
-    # afterward if it didn't already land on that periodic schedule,
-    # reproducing `_checkpoint_indices(n, stride)` exactly either way (see
-    # that function: the trailing `idxs[end] != n && push!(idxs, n)` step
-    # has the same effect).
+
+
+
+
+
+
+
+
+
+
     t_log = Float64[Float64(tspan[1])]
     u_stack = Vector{ComplexF64}[ComplexF64.(u0c)]
     idx_stack = Int[1]
@@ -577,12 +415,7 @@ function record_adaptive_tsit5_mesh(
     return mesh, stack, copy(u_stack[end])
 end
 
-"""
-    replay_tsit5_window(u_start, p, t_start, dts; tab=...) -> Vector of states
 
-Forced-Φ replay from `u_start` through `dts`. Returns `length(dts)+1`
-snapshots (including the start).
-"""
 function replay_tsit5_window(u_start::AbstractVector, p, t_start, dts::AbstractVector,
                              tab::Tsit5DiscAdjTableau=TSIT5_DISC_ADJ_TAB)
     M = p[6]

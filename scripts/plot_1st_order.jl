@@ -1,64 +1,36 @@
-# ============================================================
-# General retrieval and plotting script for first-order
-# spin-cavity simulations.
-# ============================================================
 
 using JLD2
 using Plots
 using Measures
 using Printf
 
-# ============================================================
-# 0) USER SETTINGS
-# ============================================================
 
-# Saved JLD2 file.
 load_file = "data/demo.jld2"
 
-# Directory used for saving figures.
 figdir = "fig"
 mkpath(figdir)
 
-# Optional time range used for all time-domain plots.
-# Units: μs
-#
-# Set both to nothing to plot the complete simulation.
 time_plot_min_us = nothing
 time_plot_max_us = nothing
 
-# Optional y-axis range for the limited input-output plot.
-#
-# Set both to nothing to skip the limited-y plot.
 whole_plot_ymin = -2000.0
 whole_plot_ymax =  2000.0
 
-# Plot the real and imaginary components of the input drive.
 plot_drive_components = true
 
-# Plot the real and imaginary components of the cavity field.
 plot_cavity_components = true
 
-# Plot the real and imaginary components of the output field.
 plot_output_components = true
 
-# ============================================================
-# 1) HELPER FUNCTIONS
-# ============================================================
 
-"""
-Display a plot and save it in the selected figure directory.
-"""
+
 function display_and_save(plt, filename, figdir)
     display(plt)
     savefig(plt, joinpath(figdir, filename))
     return plt
 end
 
-"""
-Return the indices inside a selected plotting interval.
 
-The supplied time axis must be in microseconds.
-"""
 function select_time_indices(
     t_us,
     time_min_us,
@@ -84,11 +56,7 @@ function select_time_indices(
     return idx
 end
 
-"""
-Load an optional field from the saved data.
 
-Return `default_value` when the field is not present.
-"""
 function optional_field(data, field_name::Symbol, default_value)
     if hasproperty(data, field_name)
         return getproperty(data, field_name)
@@ -97,13 +65,9 @@ function optional_field(data, field_name::Symbol, default_value)
     return default_value
 end
 
-# ============================================================
-# 2) LOAD DATA
-# ============================================================
 
 data = JLD2.load(load_file, "data")
 
-# Configuration information.
 SIM_SETTING = optional_field(
     data,
     :SIM_SETTING,
@@ -122,27 +86,22 @@ PULSE_CONFIG = optional_field(
     nothing,
 )
 
-# Time axis.
 t_s  = Float64.(collect(data.t_saved))
 t_us = t_s .* 1e6
 
 Nt = length(t_s)
 
-# Cavity and collective-spin solutions.
 a_sol = ComplexF64.(collect(data.a_sol))
 
 Σp = ComplexF64.(collect(data.Σp_sol))
 Σz = real.(ComplexF64.(collect(data.Σz_sol)))
 
-# Applied drive.
 E_of_t_arr = ComplexF64.(collect(data.E_of_t_arr))
 
-# Ensemble discretization.
 delta_b_1d = Float64.(collect(data.delta_b_1d))
 g_b_1d     = Float64.(collect(data.g_b_1d))
 Nj_2d      = Float64.(Array(data.Nj_2d))
 
-# Infer dimensions from the saved axes when explicit fields are absent.
 M_delta = hasproperty(data, :M_delta) ?
           Int(data.M_delta) :
           length(delta_b_1d)
@@ -163,13 +122,7 @@ elapsed_seconds = hasproperty(data, :elapsed_seconds) ?
                   Float64(data.elapsed_seconds) :
                   NaN
 
-# ============================================================
-# 3) RECONSTRUCT OUTPUT FIELD
-# ============================================================
 
-# Input-output relation:
-#
-#     a_out(t) = E(t) - sqrt(kappa_e) * a(t)
 
 hasproperty(SYSTEM_CONFIG, :kappa_e) || error(
     "SYSTEM_CONFIG contains no kappa_e."
@@ -179,14 +132,10 @@ kappa_e = Float64(SYSTEM_CONFIG.kappa_e)
 
 a_out = E_of_t_arr .- sqrt(kappa_e) .* a_sol
 
-# Output-field components.
 a_out_x   = real.(a_out)
 a_out_p   = imag.(a_out)
 a_out_abs = abs.(a_out)
 
-# ============================================================
-# 4) VALIDATE DATA DIMENSIONS
-# ============================================================
 
 M_total == M_delta * M_g || error(
     "M_total = $M_total, but M_delta * M_g = $(M_delta * M_g)."
@@ -235,56 +184,32 @@ if !isapprox(N_from_bins, N_total; rtol=1e-8, atol=1e-8)
     )
 end
 
-# ============================================================
-# 5) DERIVED QUANTITIES
-# ============================================================
 
-# Frequency axes in Hz.
 delta_axis_Hz = delta_b_1d ./ (2π)
 g_axis_Hz     = g_b_1d ./ (2π)
 
-# Number of spins in each detuning bin.
 N_vs_delta = vec(sum(Nj_2d; dims=2))
 
-# Number of spins in each coupling bin.
 N_vs_g = vec(sum(Nj_2d; dims=1))
 
-# Collective normalized Bloch components.
-#
-# Σp = Σj ⟨Sj+⟩
-#
-# sx = Re(Σp)/(N/2)
-# sy = Im(Σp)/(N/2)
-# sz = Σz/(N/2)
-#
 normalization = N_total / 2
 
 sx_avg = real.(Σp) ./ normalization
 sy_avg = imag.(Σp) ./ normalization
 sz_avg = Σz ./ normalization
 
-# Input-drive components.
 a_in_x   = real.(E_of_t_arr)
 a_in_p   = imag.(E_of_t_arr)
 a_in_abs = abs.(E_of_t_arr)
 
-# Intracavity-field components.
 a_x   = real.(a_sol)
 a_p   = imag.(a_sol)
 a_abs = abs.(a_sol)
 
-# Coherent intracavity photon number.
-#
-# A first-order simulation only provides the coherent contribution:
-#
-#     n_coh = |⟨a⟩|²
-#
 n_coh = abs2.(a_sol)
 
-# Coherent output-field intensity.
 a_out_intensity = abs2.(a_out)
 
-# Select the time interval used for plotting.
 idx_time = select_time_indices(
     t_us,
     time_plot_min_us,
@@ -293,9 +218,6 @@ idx_time = select_time_indices(
 
 t_plot = t_us[idx_time]
 
-# ============================================================
-# 6) PRINT SAVED-DATA SUMMARY
-# ============================================================
 
 println()
 println("============================================================")
@@ -334,9 +256,6 @@ println(
 println("============================================================")
 println()
 
-# ============================================================
-# 7) PLOT DEFAULTS
-# ============================================================
 
 default(
     size = (900, 600),
@@ -351,9 +270,6 @@ default(
     bottom_margin = 3mm,
 )
 
-# ============================================================
-# 8) DETUNING HISTOGRAM
-# ============================================================
 
 plot_delta = bar(
     delta_axis_Hz,
@@ -370,9 +286,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 9) COUPLING-STRENGTH HISTOGRAM
-# ============================================================
 
 plot_g = bar(
     g_axis_Hz,
@@ -389,9 +302,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 10) GLOBAL SPIN DYNAMICS
-# ============================================================
 
 plot_spins = plot(
     t_plot,
@@ -423,9 +333,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 11) APPLIED DRIVE
-# ============================================================
 
 plot_drive = plot(
     t_plot,
@@ -459,9 +366,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 12) INTRACAVITY FIELD
-# ============================================================
 
 plot_cavity = plot(
     t_plot,
@@ -495,9 +399,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 13) COHERENT CAVITY PHOTON NUMBER
-# ============================================================
 
 plot_n_coh = plot(
     t_plot,
@@ -515,9 +416,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 14) INPUT-OUTPUT FIELD
-# ============================================================
 
 plot_io = plot(
     t_plot,
@@ -574,9 +472,6 @@ display_and_save(
     figdir,
 )
 
-# ============================================================
-# 15) INPUT-OUTPUT FIELD WITH OPTIONAL Y LIMIT
-# ============================================================
 
 if whole_plot_ymin !== nothing &&
    whole_plot_ymax !== nothing
@@ -600,9 +495,6 @@ if whole_plot_ymin !== nothing &&
     )
 end
 
-# ============================================================
-# 16) OUTPUT FIELD INTENSITY
-# ============================================================
 
 plot_output_intensity = plot(
     t_plot,

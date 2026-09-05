@@ -1,11 +1,3 @@
-# ============================================================
-# SYSTEM_CONFIG design tables and physics gate.
-#
-# Combinations are built in physical coordinates, mapped to the
-# package NamedTuple, then admitted only if they pass both
-# InhomogeneousSpinCavityDynamics validators and the Er³⁺:CaWO₄
-# microwave-cavity gate below.
-# ============================================================
 
 const G_OVER_KAPPA_MAX = 1e-2
 const G_OVER_FWHM_MAX = 1e-2
@@ -15,7 +7,6 @@ const C_ENS_RANGE = (0.05, 1.0)
 const N_IMPLIED_RANGE = (1e4, 1e16)
 const GAUSSIAN_G_SPAN_SIGMA = 3.0
 
-# Paper / package defaults used as the canonical cavity+ensemble point.
 const CANONICAL_KAPPA_T_HZ = 1.0e6
 const CANONICAL_R = 1.0
 const CANONICAL_GAMMA = 1.0
@@ -239,7 +230,6 @@ function canonical_system()
     )
 end
 
-# Dense ensemble product at the canonical cavity.
 const C_ENS_GRID = [0.05, 0.2, 0.4, 0.6, 0.8, 1.0]
 const FREQ_KIND_GRID = [:lorentzian, :gaussian]
 const GAMMA_GRID = [0.5, 1.0, 2.0]
@@ -251,7 +241,6 @@ const G_SPEC_GRID = (
     (:gaussian, 0.15),
 )
 
-# Cavity / detuning / single-spin g richness around the canonical ensemble.
 const KAPPA_T_HZ_GRID = [0.5e6, 1.0e6, 2.0e6]
 const R_GRID = [1.0, 0.9, 0.7]
 const DELTA0_OVER_KT_GRID = [0.0, 0.5, -0.5]
@@ -261,7 +250,7 @@ function enumerate_system_catalog()
     out = Any[]
     seen = Set{Any}()
 
-    # (1) C_ens × line shape × g-spec × FWHM/κ  at canonical cavity.
+
     for C_ens in C_ENS_GRID, freq_kind in FREQ_KIND_GRID, (g_kind, eta) in G_SPEC_GRID, gamma in GAMMA_GRID
         push_unique_system!(out, seen, system_from_physical(;
             kappa_t_hz = CANONICAL_KAPPA_T_HZ,
@@ -276,7 +265,7 @@ function enumerate_system_catalog()
         ))
     end
 
-    # (2) κ_t × overcoupling × detuning at the canonical ensemble.
+
     for kappa_t_hz in KAPPA_T_HZ_GRID, r in R_GRID, dlt in DELTA0_OVER_KT_GRID
         push_unique_system!(out, seen, system_from_physical(;
             kappa_t_hz = kappa_t_hz,
@@ -291,7 +280,7 @@ function enumerate_system_catalog()
         ))
     end
 
-    # (3) g × C_ens × line shape at canonical cavity (constant g).
+
     for g_hz in G_HZ_GRID, C_ens in C_ENS_GRID, freq_kind in FREQ_KIND_GRID
         push_unique_system!(out, seen, system_from_physical(;
             kappa_t_hz = CANONICAL_KAPPA_T_HZ,

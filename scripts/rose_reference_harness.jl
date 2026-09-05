@@ -1,62 +1,8 @@
-# ============================================================
-# ROSE REFERENCE HARNESS  --  trajectory-identity gate for the
-# 1st-order GPU solver hot-path optimisation work.
-#
-# Runs a FROZEN, deterministic ROSE case through `run_sim_1st_order`
-# and either
-#
-#   * saves the trajectory outputs as a reference    (`save` mode), or
-#   * re-runs and compares against a saved reference  (`check` mode),
-#     field by field, reporting max |Δ|, max relative Δ and max ULP
-#     distance, and exiting non-zero on any mismatch outside tolerance.
-#
-# Compared quantities (everything the run actually produces / that a
-# downstream analysis reads):
-#
-#   a_sol            cavity amplitude a(t)          at every saved time
-#   Sigma_p, Sigma_z collective spin Σ⁺(t), Σᶻ(t)   at every saved time
-#   Sp_keep, Sz_keep resonant-δ bin per g           (M_g × Nt)
-#   E_of_t_arr       drive samples                  (sanity: config identity)
-#   peak_*           per-peak detected index / time / amplitude / state
-#
-# TOLERANCE POLICY
-#   Default: BIT-IDENTICAL ComplexF64 for every trajectory field, and
-#   EXACT equality for every detected peak index. This is the gate for
-#   "safe" patches (step 1: 1-element views instead of scalar u[1]/du[1];
-#   step 2: pre-allocated but identical `sum(g .* conj.(Sp))` buffer).
-#
-#   `--tol-ulp N` relaxes the trajectory fields to a max ULP distance of
-#   N (peak indices stay EXACT). Use only for a later reduction-kernel
-#   step whose `da` is summed on-device and so cannot be bit-identical;
-#   such a run must still show unchanged peak indices and only a few-ULP
-#   drift at every save point.
-#
-# USAGE
-#   julia --project=. scripts/rose_reference_harness.jl save  [path.jld2]
-#   julia --project=. scripts/rose_reference_harness.jl check [path.jld2] [--tol-ulp N] [--quiet]
-#
-#   default path: data/rose_reference.jld2
-#
-#   Frozen-case knobs (must match between `save` and `check`; override
-#   both runs identically or not at all):
-#     ROSE_REF_M_DELTA   (default 101)
-#     ROSE_REF_M_G       (default 101)
-#     ROSE_REF_NT_SAVE   (default 2001)
-#     ROSE_REF_TTOTAL_US (default 1100.0)
-#
-# Requires a functional CUDA device (the 1st-order solver is GPU-only).
-# ============================================================
 
 using InhomogeneousSpinCavityDynamics
 using JLD2
 using Printf
 
-# ------------------------------------------------------------
-# Frozen ROSE configuration (deterministic: no RNG anywhere in the
-# ensemble construction -- Lorentzian detunings and Gaussian couplings
-# are built by quadrature / ranges, verified in
-# frequency_inhomogeneity.jl / coupling_inhomogeneity.jl).
-# ------------------------------------------------------------
 
 _env_int(k, d)   = haskey(ENV, k) ? parse(Int, ENV[k])     : d
 _env_float(k, d) = haskey(ENV, k) ? parse(Float64, ENV[k]) : d
@@ -91,6 +37,10 @@ function frozen_case(; outdir)
         simulation_order  = :order1,
         M_delta           = M_delta,
         M_g               = M_g,
+
+
+
+        ensemble_method   = :histogram,
         initial_condition = :ground,
         Ttotal            = Ttotal_us * 1e-6,
         Nt_save           = Nt_save,
@@ -145,9 +95,6 @@ function frozen_case(; outdir)
     return SIM_SETTING, SYSTEM_CONFIG, PULSE_CONFIG
 end
 
-# ------------------------------------------------------------
-# Run + extract the comparison record
-# ------------------------------------------------------------
 
 function run_case()
     outdir = mktempdir()
@@ -191,12 +138,7 @@ function extract_record(data)
     )
 end
 
-# ------------------------------------------------------------
-# Numeric comparison
-# ------------------------------------------------------------
 
-# ULP distance between two Float64s. 0 == identical bits. Inf if signs
-# differ / either is NaN (a genuine, not-just-rounding disagreement).
 function ulp_distance(a::Float64, b::Float64)
     (isnan(a) || isnan(b)) && return Inf
     a === b && return 0.0
@@ -257,21 +199,21 @@ function check_reference(path::AbstractString; tol_ulp::Real = 0, quiet::Bool = 
 
     results = FieldResult[]
 
-    # --- config / shape identity ---
+
     push!(results, check_scalar_exact("meta.M_delta", new.meta.M_delta, ref.meta.M_delta))
     push!(results, check_scalar_exact("meta.M_g",     new.meta.M_g,     ref.meta.M_g))
     push!(results, check_scalar_exact("meta.Nt",      new.meta.Nt,      ref.meta.Nt))
     push!(results, check_array("t_saved",    new.t_saved,    ref.t_saved,    0))
     push!(results, check_array("E_of_t_arr", new.E_of_t_arr, ref.E_of_t_arr, 0))
 
-    # --- trajectory fields (tolerance-governed) ---
+
     push!(results, check_array("a_sol",   new.a_sol,   ref.a_sol,   tol_ulp))
     push!(results, check_array("Sigma_p", new.Sigma_p, ref.Sigma_p, tol_ulp))
     push!(results, check_array("Sigma_z", new.Sigma_z, ref.Sigma_z, tol_ulp))
     push!(results, check_array("Sp_keep", new.Sp_keep, ref.Sp_keep, tol_ulp))
     push!(results, check_array("Sz_keep", new.Sz_keep, ref.Sz_keep, tol_ulp))
 
-    # --- peak detection ---
+
     if length(new.peaks) != length(ref.peaks)
         push!(results, FieldResult("peaks.count", false,
             "MISMATCH new=$(length(new.peaks)) ref=$(length(ref.peaks))"))
@@ -327,15 +269,12 @@ end
 
 now_iso() = Base.Libc.strftime("%Y-%m-%dT%H:%M:%S", time())
 
-# ------------------------------------------------------------
-# CLI
-# ------------------------------------------------------------
 
 function main(args)
     mode = isempty(args) ? "" : args[1]
     rest = length(args) >= 2 ? args[2:end] : String[]
 
-    # positional path (first non-flag after mode), else default
+
     path = "data/rose_reference.jld2"
     tol_ulp = 0.0
     quiet = false

@@ -1,97 +1,5 @@
-# ============================================================
-# DETERMINISTIC BEAM-SEARCH K-HOPPING EXTENSION
-#
-# Like pulse_optimizer2_RJMCMC.jl, this file is a THIN, ADDITIVE extension
-# that does NOT redefine any shared physics/local-descent machinery. It
-# reuses, by direct reference:
-#   from pulse_optimizer2.jl -- `optimise_composite_pulse` (the fixed-k
-#     Adam + basin-hopping continuous optimiser), `pulse_cost`,
-#     `CompositePulse`, `_forbid_initial_condition`, `_normalise_k_specs`,
-#     `k_of_seed_kind`;
-#   from pulse_optimizer2_RJMCMC.jl -- `_grow_pulse`/`_shrink_pulse` (the
-#     longest-silence-gap / smallest-area k-change seeding heuristics) and
-#     `_extract_physics_cost` (the k-invariant cost used for all cross-k
-#     comparisons, for exactly the power-penalty-dilution reason documented
-#     on `_extract_physics_cost`'s own docstring in that file).
-# Must therefore be loaded AFTER both of those files, into the SAME
-# namespace, e.g. `using InhomogeneousSpinCavityDynamics` (which already
-# includes pulse_optimizer2.jl and pulse_optimizer2_RJMCMC.jl) followed by
-# `Base.include(InhomogeneousSpinCavityDynamics, "pulse_optimizer2_BEAMSEARCH.jl")`.
-# This file is NOT added to the package's own include list and does not
-# modify pulse_optimizer2.jl, pulse_optimizer2_RJMCMC.jl,
-# multi_seed_pulse_optimizer.jl, or InhomogeneousSpinCavityDynamics.jl --
-# every piece of logic a deterministic beam search needs beyond what those
-# files already provide lives entirely in THIS file.
-#
-# WHAT THIS FILE ADDS: a genuinely different outer search strategy from
-# pulse_optimizer2_RJMCMC.jl's single-walker, Metropolis-accepted k-hopping.
-# Here, every hop-equivalent ("stage") deterministically tries ALL of:
-# stay (re-optimise every currently live branch at its own k), grow (spawn
-# one new k+1 branch from whichever live branch currently has the HIGHEST
-# k), and shrink (spawn one new k-1 branch from whichever live branch
-# currently has the LOWEST k) -- never a probabilistic choice between them,
-# and never a Metropolis accept/reject on the result. Instead, after every
-# stage, all live branches (refreshed "stay" branches plus any newly grown/
-# shrunk ones) are ranked by `_extract_physics_cost` and only the best
-# `beam_width` survive to the next stage -- classic beam search, with `k`
-# as the dimension being searched breadth-first rather than depth-first.
-# See `optimise_composite_pulse_beamsearch`'s own docstring for the full
-# per-stage mechanics, stopping rule, and the k-distinctness invariant
-# that makes pruning safe without any branch-merging logic.
-#
-# WHY CPU-THREAD PARALLEL, NOT GPU: exactly the same reason
-# multi_seed_pulse_optimizer.jl's own module docstring gives at length --
-# every branch's own continuous optimisation runs through
-# `run_sim_1st_order_pure` (pulse_optimizer2.jl), which is deliberately,
-# explicitly CPU-only (plain `Vector`/`Array` state, no `CuArray`
-# anywhere) so `ForwardDiff.gradient` can differentiate through the ODE
-# solve at all. There is no GPU work anywhere in this call chain for a
-# multi-GPU dispatcher to schedule, on this machine or any other -- this
-# was confirmed explicitly before writing this file, rather than adding
-# CUDA device-pinning scaffolding that would sit inertly on top of a
-# CPU-only pipeline. The real, already-CPU-bound parallelism lever is
-# across INDEPENDENT branches, and this file exploits it at TWO levels:
-#   (1) within one beam search, across the several sibling branches
-#       (stay/grow/shrink children) that must each run their own
-#       `optimise_composite_pulse` call in a given stage -- see
-#       `optimise_composite_pulse_beamsearch`'s own `threaded` kwarg;
-#   (2) across several independent beam searches started from different
-#       starting `k0` -- see `optimise_composite_pulse_over_k_beamsearch`,
-#       mirroring `optimise_composite_pulse_over_k`/`_rjmcmc`'s own
-#       per-k `Threads.@threads` dispatch one level further out.
-# Nesting two `Threads.@threads` loops (level 2 outer, level 1 inner)
-# would oversubscribe `Threads.nthreads()`, so `optimise_composite_pulse_over_k_beamsearch`
-# disables level 1 inside each of its own dispatched calls whenever IT is
-# the level actually spreading work across threads (and vice versa) --
-# see that function's own docstring. Both levels pin `LinearAlgebra.BLAS`
-# to 1 thread for their own duration while dispatching in parallel, same
-# discipline multi_seed_pulse_optimizer.jl already applies, via this
-# file's own small `_with_blas_pinned` helper (kept local rather than
-# reused from that file, since duplicating one ~10-line try/finally idiom
-# carries none of the ~500-line-copy drift risk pulse_optimizer2_RJMCMC.jl's
-# own header warns about, and avoids adding a load-order dependency on
-# multi_seed_pulse_optimizer.jl for something this small).
-# ============================================================
 
-"""
-    BeamBranch
 
-One live (or formerly-live, once logged) node in the beam-search tree.
-`id` is a globally unique, monotonically increasing integer assigned the
-moment a branch is CREATED (including every "stay" refinement -- a stay
-child gets a fresh `id`, not its parent's, so `branch_log` rows form a
-proper parent-pointer chain regardless of move type; walk `parent_id`
-backward to reconstruct any branch's full stage-by-stage trajectory,
-stay-refinements included). `k`/`pulse`/`u`/`cost` are this branch's own
-best point from its OWN `optimise_composite_pulse` call (fixed-`k` Adam +
-basin-hopping); `phys_cost` is `_extract_physics_cost` of that same point
--- ALL cross-branch comparisons (pruning, extreme-badness, global best)
-use `phys_cost`, never raw `cost`, for the same k-dilution reason
-`pulse_optimizer2_RJMCMC.jl`'s `_extract_physics_cost` docstring explains
-at length. `stage`/`move`/`parent_id` record how this branch's CURRENT
-state was produced (`move ∈ (:root, :stay, :up, :down)`, `parent_id=0`
-only for the root).
-"""
 struct BeamBranch
     id::Int
     k::Int
@@ -113,18 +21,7 @@ _branch_log_row(b::BeamBranch) = (
     silencing=b.silencing, duration=b.duration,
 )
 
-"""
-    _with_blas_pinned(f, active::Bool)
 
-Runs `f()` with `LinearAlgebra.BLAS` pinned to 1 thread for the duration
-(restored afterward, even on error) when `active`; otherwise just runs
-`f()` unchanged. `active` should be true exactly when the caller is about
-to dispatch more than one concurrently-running `ForwardDiff`/ODE job across
-Julia threads -- each such job could otherwise ALSO spawn BLAS's own
-(multi-threaded by default) pool underneath it, oversubscribing the
-machine's actual cores, the same concern `multi_seed_pulse_optimizer.jl`
-already documents and handles for its own single level of parallelism.
-"""
 function _with_blas_pinned(f::F, active::Bool) where {F}
     if !active
         return f()
@@ -138,132 +35,7 @@ function _with_blas_pinned(f::F, active::Bool) where {F}
     end
 end
 
-"""
-    optimise_composite_pulse_beamsearch(k0, n_coeff_A, n_coeff_f, d;
-        beam_width=3, max_stages=6, stage_patience=2, extreme_factor=5.0,
-        new_branch_epoch_multiplier=2.0, new_branch_hop_multiplier=1.5,
-        k_max=nothing, num_epochs=30, learning_rate=0.05, patience=5,
-        tol=1e-3, n_hops=3, hop_patience=2, hop_step_size=0.5,
-        temperature=1.0, degree=3, taper_frac=0.1, w_tmax=1.0, w_power=0.05,
-        target_F=1.0, w_time=0.15, seed=42,
-        warm_start_u=nothing, threaded=true, label_prefix="", solve_kwargs...)
-        -> NamedTuple
 
-Deterministic beam search over sub-pulse count `k`, breadth-first rather
-than pulse_optimizer2_RJMCMC.jl's single-walker Metropolis hopping:
-
-  0. STAGE 0 (root): one branch at the input `k0`, seeded from
-     `warm_start_u` if given, else a fresh `initial_guess` (exactly as
-     `optimise_composite_pulse` itself defaults), run through ONE
-     `optimise_composite_pulse` call (fixed-`k0` Adam + basin-hopping,
-     `num_epochs`/`n_hops` budget below).
-
-  1. EVERY subsequent stage, from the current set of live branches
-     (initially just the root), deterministically builds this stage's
-     children -- no probabilistic move choice, no Metropolis test:
-       - STAY: every live branch spawns exactly one stay child, seeded by
-         perturbing that branch's own current `u` with isotropic Gaussian
-         noise (`hop_step_size`, in raw/pre-softplus units -- same noise
-         scale pulse_optimizer2_RJMCMC.jl's own "stay" hop uses), same `k`.
-       - GROW (k+1): the live branch with the CURRENTLY HIGHEST `k` spawns
-         one up child, seeded via `_grow_pulse` (splice a near-zero
-         sub-pulse into the longest silence gap; no noise added on top).
-         Skipped if `k_max !== nothing` and that branch is already at
-         `k_max`.
-       - SHRINK (k-1): the live branch with the CURRENTLY LOWEST `k`
-         spawns one down child, seeded via `_shrink_pulse` (drop the
-         smallest-area sub-pulse; no noise added on top). Skipped when
-         that branch's `k < 2` (`_shrink_pulse` requires `k >= 2`).
-     Every child then runs its OWN `optimise_composite_pulse` call at its
-     own (possibly new) `k`, warm-started from that seed -- i.e. each
-     child gets the FULL "Adam + local basin-hopping" continuous
-     optimiser pulse_optimizer2.jl already implements, not a single Adam
-     descent; this file adds no new local-descent code of its own. STAY
-     children run at the "mature" budget (`num_epochs`/`n_hops`); GROW/
-     SHRINK children run at a BOOSTED budget
-     (`round(num_epochs*new_branch_epoch_multiplier)`,
-     `round(n_hops*new_branch_hop_multiplier)`) since they start farther
-     from a local optimum than a branch merely continuing its own
-     refinement.
-
-  2. PRUNING: after a stage's children all finish, every live branch is
-     REPLACED by its own stay child (same lineage, new `id` -- see
-     [`BeamBranch`](@ref)), and any grow/shrink children join as brand-new
-     branches; the combined set is ranked by `_extract_physics_cost` and
-     only the best `beam_width` survive into the next stage. Because GROW
-     always targets `(current max k)+1` and SHRINK always targets
-     `(current min k)-1` -- strictly outside every live branch's own `k`
-     -- no two live branches can ever collide on the same `k`, at any
-     stage, with or without pruning in between (pruning can only ever
-     shrink the live-k set, never create a k that already existed
-     elsewhere); this file relies on that invariant to prune by simple
-     top-`beam_width` truncation, with no branch-merging logic, and
-     asserts it after every stage as a loud, cheap sanity check rather
-     than trusting it silently.
-
-  3. GLOBAL BEST: tracked continuously across every branch ever evaluated
-     (by `phys_cost`, independent of pruning -- a branch that gets pruned
-     away this stage is still eligible to have been the global best), and
-     is what gets returned; its own `k` need not match `k0`, nor the `k`
-     of any branch still alive at the end.
-
-  4. STOPPING: after each stage, this stage's newly created grow/shrink
-     children (if any were possible to create) are checked against the
-     global best: "significantly worse" means EVERY grow/shrink child
-     this stage has `phys_cost > global_best.phys_cost +
-     extreme_factor*tol` (vacuously true if neither move was possible,
-     e.g. every live branch already at `k=1` with none `>= 2` and no
-     `k_max` headroom). Separately, a stage counts as a "stay
-     improvement" if ANY stay child improved on ITS OWN parent's
-     `phys_cost` by more than `tol`; `stages_since_improve` counts
-     consecutive stages without one. Stops (before `max_stages`) once
-     BOTH: this stage's extremes are significantly worse AND
-     `stages_since_improve >= stage_patience` -- mirroring the
-     `hop_patience`/`tol` early-stop pattern already used by
-     `optimise_composite_pulse`/`optimise_composite_pulse_rjmcmc`, just
-     with two conditions instead of one since a beam has both a "still
-     finding better k" axis and a "still improving within k" axis to
-     exhaust. `max_stages` is the hard backstop regardless (analogous to
-     `n_hops` there), so a run always terminates even if the heuristic
-     stopping rule never fires.
-
-`d`, `degree`/`taper_frac`, and every `w_*`/`target_F` cost-weight keyword
-are forwarded to `CompositePulse`/`pulse_cost` exactly as in
-`optimise_composite_pulse`/`optimise_composite_pulse_rjmcmc` -- same
-defaults, same meaning. `num_epochs`/`learning_rate`/`patience`/`tol`/
-`n_hops`/`hop_patience`/`hop_step_size`/`temperature` are this run's
-MATURE (stay-child) budget; see point 1 above for the newborn multiplier
-on `num_epochs`/`n_hops`. Do not pass `initial_condition` -- forbidden the
-same way as elsewhere in this package.
-
-`threaded`: when true (default) and `Threads.nthreads() > 1` and a given
-stage has more than one child to run, that stage's children are dispatched
-across Julia threads (`BLAS` pinned to 1 thread meanwhile, see
-[`_with_blas_pinned`](@ref)) -- see this file's own module docstring for
-why this is CPU-thread, not GPU, parallelism, and why
-`optimise_composite_pulse_over_k_beamsearch` (the level above this one)
-passes `threaded=false` into calls of THIS function whenever it is itself
-the level spreading work across threads.
-
-Returns a `NamedTuple`: `best_u`/`best_cost`/`best_k`/`pulse` (the global
-best, `pulse` matching `best_u`'s own `k`), `u0`/`initial_metrics` (the
-root branch's own starting point/metrics -- the full `pulse_cost` return
-`(cost, inversion, silencing, duration, coherence, field_amp,
-weak_seed_retention)`, everything after `silencing` diagnostic-only),
-`final_metrics` (same shape,
-recomputed fresh at `best_u`, NOT necessarily equal to the global best
-branch's own cached `cost` since that branch's own `optimise_composite_pulse`
-call may have used different `solve_kwargs` -- mirrors
-`optimise_composite_pulse_rjmcmc`'s own `final_metrics` convention),
-`history` (every branch's own `run_local_adam` per-epoch log, concatenated,
-each row additionally tagged `stage`/`move`/`branch_id`/`parent_id`),
-`branch_log` (one row per branch EVER created --
-`id`/`parent_id`/`stage`/`move`/`k`/`cost`/`phys_cost`/`inversion`/
-`silencing`/`duration`/`alive_at_end` -- the full beam tree, independent of
-`history`'s finer per-epoch granularity), and `optimizer_settings` (every
-setting that affected this run, same spirit as the other two entry
-points' own `optimizer_settings`).
-"""
 function optimise_composite_pulse_beamsearch(
     k0::Integer, n_coeff_A::Integer, n_coeff_f::Integer, d;
     beam_width::Integer=3, max_stages::Integer=6, stage_patience::Integer=2,
@@ -303,7 +75,7 @@ function optimise_composite_pulse_beamsearch(
             _, seed_u = _grow_pulse(parent.pulse, parent.u, d)
             k_child = parent.k + 1
             budget = newborn_budget
-        else # :down
+        else
             _, seed_u = _shrink_pulse(parent.pulse, parent.u, d)
             k_child = parent.k - 1
             budget = newborn_budget
@@ -454,49 +226,7 @@ function optimise_composite_pulse_beamsearch(
     )
 end
 
-"""
-    optimise_composite_pulse_over_k_beamsearch(n_coeff_A, n_coeff_f, d;
-        kinds=(:hs1, :corpse, :bb1), specs=nothing, threaded=true,
-        Omega_max=nothing, beta=nothing, mu=nothing, seed=42,
-        beamsearch_kwargs...)
-        -> NamedTuple
 
-Second, OUTER level of CPU-thread parallelism (see this file's own module
-docstring): launches one independent
-[`optimise_composite_pulse_beamsearch`](@ref) run per starting `k0`, each
-warm-started from a canonical [`seed_canonical`](@ref) seed for that `k0`
--- same `kinds`/`specs`/duplicate-`k0`/`Omega_max`/`beta`/`mu` semantics as
-[`optimise_composite_pulse_over_k`](@ref) and
-[`optimise_composite_pulse_over_k_rjmcmc`](@ref) (`specs=((k0, kind), ...)`
-to choose both explicitly, `:random` for a fresh `initial_guess`). Each
-spec's own beam search can still drift its OWN branches away from `k0` via
-grow/shrink stages, exactly as `optimise_composite_pulse_over_k_rjmcmc`'s
-per-spec RJMCMC runs can -- `k0` only fixes where THAT spec's search tree
-starts growing from, not where its winning branch ends up; `per_k0[i].best_k`
-reports the winning branch's own actual `k`.
-
-Threading is dispatched at EXACTLY ONE of the two available levels per
-call, never both nested: when `threaded=true`, `Threads.nthreads() > 1`,
-and more than one spec is given, THIS function spreads the `n` independent
-beam searches across threads (`BLAS` pinned to 1 thread meanwhile) and
-passes `threaded=false` into every one of those `optimise_composite_pulse_beamsearch`
-calls, so each spec's own per-stage sibling-branch dispatch runs serially
-within its own thread. Otherwise (a single spec, `threaded=false`, or
-`Threads.nthreads() == 1`), no parallelism happens at this level and each
-spec's OWN `threaded` behaviour (forwarded from `beamsearch_kwargs` as
-ordinary keywords, since `threaded` is this function's own named
-parameter and therefore never present in `beamsearch_kwargs` to begin
-with) is left as `optimise_composite_pulse_beamsearch`'s own default,
-i.e. that single run can still spread ITS sibling branches across
-threads. Either way, only one `Threads.@threads` loop is ever active at
-once, avoiding the oversubscription two nested loops would cause.
-
-Do not pass `warm_start_u` (the seed is built per `k0`, same restriction as
-the two existing `_over_k` entry points). Returns the winning spec's own
-`optimise_composite_pulse_beamsearch` NamedTuple, merged with `start_k0`
-and `kind`, plus `per_k0` (one such merged NamedTuple per spec, in input
-order).
-"""
 function optimise_composite_pulse_over_k_beamsearch(
     n_coeff_A::Integer, n_coeff_f::Integer, d;
     kinds=(:hs1, :corpse, :bb1),

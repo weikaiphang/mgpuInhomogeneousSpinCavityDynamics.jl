@@ -1,12 +1,12 @@
 function validate_config(CONFIG)
-    @assert CONFIG.M_delta > 0 "M_delta must be positive."
-    @assert CONFIG.M_g > 0 "M_g must be positive."
-    @assert CONFIG.Ttotal > 0 "Ttotal must be positive."
-    @assert CONFIG.kappa_e >= 0 "kappa_e must be non-negative."
-    @assert CONFIG.kappa_i >= 0 "kappa_i must be non-negative."
-    @assert CONFIG.Nt_save > 1 "Nt_save must be larger than 1."
-    @assert CONFIG.reltol > 0 "reltol must be positive."
-    @assert CONFIG.abstol > 0 "abstol must be positive."
+    @assert CONFIG.M_delta > 0
+    @assert CONFIG.M_g > 0
+    @assert CONFIG.Ttotal > 0
+    @assert CONFIG.kappa_e >= 0
+    @assert CONFIG.kappa_i >= 0
+    @assert CONFIG.Nt_save > 1
+    @assert CONFIG.reltol > 0
+    @assert CONFIG.abstol > 0
     validate_simulation_order(CONFIG)
     validate_frequency_inhomogeneity(CONFIG.freq_inhomogeneity)
     validate_coupling_inhomogeneity(CONFIG.g_inhomogeneity)
@@ -16,14 +16,14 @@ end
 
 function validate_pulse_config(PULSE_CONFIG)
     for cfg in PULSE_CONFIG
-        @assert hasproperty(cfg, :kind) "Each pulse must have a kind."
+        @assert hasproperty(cfg, :kind)
 
         if cfg.kind == :gaussian
             @assert cfg.sigma > 0 "Gaussian sigma must be positive."
 
         elseif cfg.kind == :wurst
-            @assert cfg.duration > 0 "WURST duration must be positive."
-            @assert cfg.bandwidth > 0 "WURST bandwidth must be positive."
+            @assert cfg.duration > 0
+            @assert cfg.bandwidth > 0
             @assert cfg.n > 0 "WURST n must be positive."
 
         elseif cfg.kind == :custom
