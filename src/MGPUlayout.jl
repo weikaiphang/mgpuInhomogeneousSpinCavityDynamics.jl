@@ -141,3 +141,82 @@ function max_bins(bytes_per_gpu::Real, ns::Integer; integrator::Symbol = :tsit5,
     end
     return lo
 end
+
+
+# Backend picker used by `_setup_rowsum_exchange`. Kept pure so the
+# NCCL → P2P → host ladder can be stress-tested without a GPU.
+function choose_rowsum_exchange(ns::Integer;
+                                have_nccl::Bool,
+                                nunique_devices::Integer,
+                                nccl_ok::Bool,
+                                p2p_ok::Bool)
+    ns <= 1 && return :none
+    if have_nccl && nunique_devices == ns && nccl_ok
+        return :nccl
+    elseif p2p_ok
+        return :p2p
+    else
+        return :host
+    end
+end
+
+rowsum_owned_range(part::EnsemblePartition, p::Integer) =
+    (3 * part.offsets[p] + 1):(3 * part.offsets[p] + 3 * part.counts[p])
+
+# CPU mirrors of exchange_rowsums_nccl! / _p2p! / _host!.
+# NCCL Allreduces the full 3M buffer (non-owned slots must be zero).
+# P2P and host copy each shard's owned 3*mloc slice (assignment, not sum).
+function assemble_rowsums_nccl!(buffers::Vector{V}) where {V<:AbstractVector}
+    isempty(buffers) && return buffers
+    acc = copy(buffers[1])
+    for b in @view buffers[2:end]
+        acc .+= b
+    end
+    for b in buffers
+        copyto!(b, acc)
+    end
+    return buffers
+end
+
+function assemble_rowsums_p2p!(buffers::Vector{V}, part::EnsemblePartition) where {V<:AbstractVector}
+    ns = nshards(part)
+    length(buffers) == ns || error("expected $(ns) shard buffers, got $(length(buffers))")
+    for dst in 1:ns
+        for src in 1:ns
+            src == dst && continue
+            r = rowsum_owned_range(part, src)
+            copyto!(buffers[dst], first(r), buffers[src], first(r), length(r))
+        end
+    end
+    return buffers
+end
+
+function assemble_rowsums_host!(buffers::Vector{V}, part::EnsemblePartition) where {V<:AbstractVector}
+    ns = nshards(part)
+    length(buffers) == ns || error("expected $(ns) shard buffers, got $(length(buffers))")
+    host = similar(buffers[1], 3 * part.M)
+    fill!(host, zero(eltype(host)))
+    for p in 1:ns
+        r = rowsum_owned_range(part, p)
+        copyto!(host, first(r), buffers[p], first(r), length(r))
+    end
+    for b in buffers
+        copyto!(b, host)
+    end
+    return buffers
+end
+
+function assemble_rowsums!(mode::Symbol, buffers::Vector{V},
+                           part::EnsemblePartition) where {V<:AbstractVector}
+    if mode === :nccl
+        return assemble_rowsums_nccl!(buffers)
+    elseif mode === :p2p
+        return assemble_rowsums_p2p!(buffers, part)
+    elseif mode === :host
+        return assemble_rowsums_host!(buffers, part)
+    elseif mode === :none
+        return buffers
+    else
+        error("Unknown row-sum exchange mode = $(mode). Use :nccl, :p2p, :host, or :none.")
+    end
+end

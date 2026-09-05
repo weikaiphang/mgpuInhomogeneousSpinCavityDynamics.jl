@@ -285,28 +285,643 @@ end
     @test QRT_CLOSURE_LEVEL !== :full_second_order_jacobian
 end
 
-if isdefined(Main, :CUDA) || isdefined(@__MODULE__, :CUDA)
-    try
-        using CUDA
-        if CUDA.functional()
-            @testset "GPU↔CPU 2nd-order RHS parity" begin
-                M = PHYS_M
-                Nj = PHYS_NJ
-                u = build_u0_2nd_order(M, Nj, :weak)
-                delta = [0.0, 2π * 5e4, -2π * 5e4]
-                g = [2π * 100, 2π * 90, 2π * 110]
-                mask = ComplexF64.(.!Matrix(I, M, M))
-                E = t -> 0.25 + 0.1im
-                p_cpu = (0.0, 2π * 1e6, 0.0, delta, g, M, mask, E)
-                du_cpu = zero(u)
-                rhs_2nd_order!(du_cpu, u, p_cpu, 1e-6)
+# ---------------------------------------------------------------------------
+# Stress helpers: CPU mirrors of the sharded MGPU layout / kernels.
+# These let the three Devil's-ask areas run without a GPU.
+# ---------------------------------------------------------------------------
 
-                p_gpu = (0.0, 2π * 1e6, 0.0, CuArray(delta), CuArray(g), M, CuArray(mask), E)
-                du_gpu = CUDA.zeros(ComplexF64, length(u))
-                rhs_2nd_order!(du_gpu, CuArray(u), p_gpu, 1e-6)
-                @test Array(du_gpu) ≈ du_cpu rtol=1e-12 atol=1e-12
+@inline _stress_muli(z::Complex) = Complex(-imag(z), real(z))
+
+function _stress_local_rowsums(part::EnsemblePartition, rng=MersenneTwister(1))
+    ns = nshards(part)
+    M = part.M
+    bufs = [zeros(ComplexF64, 3M) for _ in 1:ns]
+    truth = zeros(ComplexF64, 3M)
+    for p in 1:ns
+        r = rowsum_owned_range(part, p)
+        vals = randn(rng, ComplexF64, length(r))
+        bufs[p][r] .= vals
+        truth[r] .= vals
+    end
+    return bufs, truth
+end
+
+function _stress_scatter(u_full, part::EnsemblePartition)
+    M = part.M
+    nsmall = small_length(M)
+    oP = nsmall
+    oZ = nsmall + M * M
+    oM = nsmall + 2 * M * M
+    oZZ = nsmall + 3 * M * M
+    shards = Vector{Vector{ComplexF64}}(undef, nshards(part))
+    for p in 1:nshards(part)
+        mloc = part.counts[p]
+        joff = part.offsets[p]
+        lo = nsmall
+        n = shard_length(M, mloc)
+        u = zeros(ComplexF64, n)
+        u[1:nsmall] .= u_full[1:nsmall]
+        bs = M * mloc
+        @inbounds for jl in 1:mloc
+            j = joff + jl
+            col = (jl - 1) * M
+            for k in 1:M
+                lin = (k - 1) * M + j
+                u[lo + col + k]        = u_full[oP + lin]
+                u[lo + bs + col + k]   = u_full[oZ + lin]
+                u[lo + 2bs + col + k]  = u_full[oZ + (j - 1) * M + k]
+                u[lo + 3bs + col + k]  = u_full[oM + lin]
+                u[lo + 4bs + col + k]  = u_full[oZZ + lin]
             end
         end
+        shards[p] = u
+    end
+    return shards
+end
+
+function _stress_gather(shards, part::EnsemblePartition)
+    M = part.M
+    nsmall = small_length(M)
+    u_full = zeros(ComplexF64, global_state_length(M))
+    u_full[1:nsmall] .= shards[1][1:nsmall]
+    oP = nsmall
+    oZ = nsmall + M * M
+    oM = nsmall + 2 * M * M
+    oZZ = nsmall + 3 * M * M
+    for p in 1:nshards(part)
+        s = shards[p]
+        mloc = part.counts[p]
+        joff = part.offsets[p]
+        lo = nsmall
+        bs = M * mloc
+        @inbounds for jl in 1:mloc
+            j = joff + jl
+            col = (jl - 1) * M
+            for k in 1:M
+                lin = (k - 1) * M + j
+                u_full[oP + lin]  = s[lo + col + k]
+                u_full[oZ + lin]  = s[lo + bs + col + k]
+                u_full[oM + lin]  = s[lo + 3bs + col + k]
+                u_full[oZZ + lin] = s[lo + 4bs + col + k]
+            end
+        end
+    end
+    return u_full
+end
+
+function _stress_cross_and_rowsum!(du, u, delta, g, M, mloc, joff, lo)
+    rowsum = zeros(ComplexF64, 3M)
+    @inbounds a = u[1]
+    ca = conj(a)
+    oSp = 3
+    oSz = 3 + M
+    oadSp = 3 + 2M
+    oadSm = 3 + 3M
+    oadSz = 3 + 4M
+    bs = M * mloc
+    for jl in 1:mloc
+        j = joff + jl
+        gj = g[j]
+        dj = delta[j]
+        Spj = u[oSp + j]
+        Szj = u[oSz + j]
+        adSpj = u[oadSp + j]
+        adSmj = u[oadSm + j]
+        adSzj = u[oadSz + j]
+        cSpj = conj(Spj)
+        cadSmj = conj(adSmj)
+        cadSzj = conj(adSzj)
+        colbase = lo + (jl - 1) * M
+        accP = zero(ComplexF64)
+        accM = zero(ComplexF64)
+        accZ = zero(ComplexF64)
+        for k in 1:M
+            i1 = colbase + k
+            P = u[i1]
+            Z = u[i1 + bs]
+            ZT = u[i1 + 2bs]
+            Mm = u[i1 + 3bs]
+            ZZ = u[i1 + 4bs]
+            if k == j
+                z = zero(ComplexF64)
+                du[i1] = z
+                du[i1 + bs] = z
+                du[i1 + 2bs] = z
+                du[i1 + 3bs] = z
+                du[i1 + 4bs] = z
+            else
+                gk = g[k]
+                dk = delta[k]
+                Spk = u[oSp + k]
+                Szk = u[oSz + k]
+                adSpk = u[oadSp + k]
+                adSmk = u[oadSm + k]
+                adSzk = u[oadSz + k]
+                cSpk = conj(Spk)
+                cadSmk = conj(adSmk)
+                cadSzk = conj(adSzk)
+
+                W = Spk * adSzj + ca * Z + adSpk * Szj - 2 * Spk * ca * Szj
+                Ws = Spj * adSzk + ca * ZT + adSpj * Szk - 2 * Spj * ca * Szk
+                du[i1] = _stress_muli((dj + dk) * P - 2 * gj * W - 2 * gk * Ws)
+
+                U1 = Spk * cadSmj + Spj * cadSmk + a * P - 2 * Spk * Spj * a
+                U2 = Spk * adSmj + ca * Mm + adSpk * cSpj - 2 * Spk * ca * cSpj
+                U2s = Spj * adSmk + ca * conj(Mm) + adSpj * cSpk - 2 * Spj * ca * cSpk
+                U3 = ZZ * ca + Szk * adSzj + Szj * adSzk - 2 * ca * Szk * Szj
+                du[i1 + bs] = _stress_muli(dk * Z - gj * U1 + gj * U2 - 2 * gk * U3)
+                du[i1 + 2bs] = _stress_muli(dj * ZT - gk * U1 + gk * U2s - 2 * gj * U3)
+
+                Y1 = cadSzj * Spk + cadSmk * Szj + a * Z - 2 * Spk * a * Szj
+                Y1s = cadSzk * Spj + cadSmj * Szk + a * ZT - 2 * Spj * a * Szk
+                Y2 = ca * conj(ZT) + Szk * adSmj + cSpj * adSzk - 2 * ca * Szk * cSpj
+                Y2s = ca * conj(Z) + Szj * adSmk + cSpk * adSzj - 2 * ca * Szj * cSpk
+                du[i1 + 3bs] = _stress_muli((dk - dj) * Mm + 2 * gj * Y1 - 2 * gk * Y2)
+                du[i1 + 4bs] = _stress_muli(gj * (Y2 - Y1s) + gk * (Y2s - Y1))
+
+                accP += gk * P
+                accM += gk * Mm
+                accZ += gk * Z
+            end
+        end
+        rb = 3 * (j - 1)
+        rowsum[rb + 1] = accP
+        rowsum[rb + 2] = accM
+        rowsum[rb + 3] = accZ
+    end
+    return rowsum
+end
+
+function _stress_small_rhs!(du, u, rowsum, gsums, delta, g, Et, delta0, kappa_t, sqrt_ke, M)
+    @inbounds begin
+        a = u[1]
+        ad_ad = u[2]
+        ad_a = u[3]
+    end
+    ca = conj(a)
+    cEt = conj(Et)
+    half = 0.5
+    S1, S2, S3 = gsums[1], gsums[2], gsums[3]
+    du[1] = sqrt_ke * Et - _stress_muli(delta0 * a) - _stress_muli(S1) - half * kappa_t * a
+    du[2] = 2 * _stress_muli(delta0 * ad_ad) + 2 * _stress_muli(S2) -
+            kappa_t * ad_ad + 2 * sqrt_ke * ca * cEt
+    du[3] = _stress_muli(conj(S3)) - _stress_muli(S3) - kappa_t * ad_a +
+            sqrt_ke * Et * ca + sqrt_ke * cEt * a
+
+    oSp = 3
+    oSz = 3 + M
+    oadSp = 3 + 2M
+    oadSm = 3 + 3M
+    oadSz = 3 + 4M
+    oSpSp_s = 3 + 5M
+    oSzSp_s = 3 + 6M
+    oSmSp_s = 3 + 7M
+    oSzSz_s = 3 + 8M
+    @inbounds for j in 1:M
+        gj = g[j]
+        dj = delta[j]
+        Sp = u[oSp + j]
+        Sz = u[oSz + j]
+        adSp = u[oadSp + j]
+        adSm = u[oadSm + j]
+        adSz = u[oadSz + j]
+        SpSp_s = u[oSpSp_s + j]
+        SzSp_s = u[oSzSp_s + j]
+        SmSp_s = u[oSmSp_s + j]
+        SzSz_s = u[oSzSz_s + j]
+        rb = 3 * (j - 1)
+        sum_gSpSp = gj * SpSp_s + rowsum[rb + 1]
+        sum_gSmSp = gj * SmSp_s + rowsum[rb + 2]
+        sum_gSzSp = gj * SzSp_s + rowsum[rb + 3]
+        cSp = conj(Sp)
+        cadSm = conj(adSm)
+        cadSz = conj(adSz)
+        du[oSp + j] = _stress_muli(dj * Sp - 2 * gj * adSz)
+        du[oSz + j] = _stress_muli(gj * adSm - gj * cadSm)
+        du[oadSp + j] = _stress_muli(delta0 * adSp + dj * adSp + sum_gSpSp -
+                                    2 * gj * (2 * ca * adSz + ad_ad * Sz - 2 * ca * ca * Sz)) -
+                        half * kappa_t * adSp + sqrt_ke * cEt * Sp
+        du[oadSm + j] = _stress_muli(delta0 * adSm - dj * adSm + 2 * gj * Sz + sum_gSmSp +
+                                    2 * gj * (cadSz * ca + a * adSz + Sz * ad_a - 2 * ca * a * Sz)) -
+                        half * kappa_t * adSm + sqrt_ke * cEt * cSp
+        du[oadSz + j] = _stress_muli(delta0 * adSz + sum_gSzSp -
+                                    gj * (Sp + Sp * ad_a + ca * cadSm + a * adSp - 2 * Sp * ca * a) +
+                                    gj * (2 * ca * adSm + ad_ad * cSp - 2 * ca * ca * cSp)) -
+                        half * kappa_t * adSz + sqrt_ke * cEt * Sz
+        du[oSpSp_s + j] = _stress_muli(2 * dj * SpSp_s + 2 * gj * adSp -
+                                      4 * gj * (Sp * adSz + SzSp_s * ca + adSp * Sz - 2 * Sp * ca * Sz))
+        du[oSzSp_s + j] = _stress_muli(dj * SzSp_s -
+                                      gj * (2 * Sp * cadSm + a * SpSp_s - 2 * Sp * Sp * a) +
+                                      gj * (Sp * adSm + ca * SmSp_s + adSp * cSp - 2 * Sp * ca * cSp) -
+                                      2 * gj * (SzSz_s * ca + 2 * adSz * Sz - 2 * ca * Sz * Sz))
+        Q1 = cadSz * Sp + SzSp_s * a + cadSm * Sz - 2 * Sp * a * Sz
+        Q2 = ca * conj(SzSp_s) + cSp * adSz + adSm * Sz - 2 * ca * cSp * Sz
+        du[oSmSp_s + j] = _stress_muli(2 * gj * Q1 - 2 * gj * Q2)
+        du[oSzSz_s + j] = _stress_muli(gj * cadSm - gj * adSm - 2 * gj * Q1 + 2 * gj * Q2)
+    end
+    return nothing
+end
+
+function _stress_gsums(u, g, M)
+    s1 = zero(ComplexF64)
+    s2 = zero(ComplexF64)
+    s3 = zero(ComplexF64)
+    @inbounds for j in 1:M
+        gj = g[j]
+        s1 += gj * conj(u[3 + j])
+        s2 += gj * u[3 + 2M + j]
+        s3 += gj * u[3 + 3M + j]
+    end
+    return (s1, s2, s3)
+end
+
+function _stress_mgpu_rhs(u_full, delta, g, Et, delta0, kappa_e, kappa_i, part, mode::Symbol)
+    M = part.M
+    nsmall = small_length(M)
+    shards = _stress_scatter(u_full, part)
+    dus = [zeros(ComplexF64, length(s)) for s in shards]
+    locals = Vector{Vector{ComplexF64}}(undef, nshards(part))
+    gsums = _stress_gsums(shards[1], g, M)
+    kappa_t = kappa_e + kappa_i
+    sqrt_ke = sqrt(kappa_e)
+    for p in 1:nshards(part)
+        locals[p] = _stress_cross_and_rowsum!(
+            dus[p], shards[p], delta, g, M, part.counts[p], part.offsets[p], nsmall)
+    end
+    assemble_rowsums!(mode, locals, part)
+    for p in 1:nshards(part)
+        _stress_small_rhs!(dus[p], shards[p], locals[p], gsums, delta, g,
+                           Et, delta0, kappa_t, sqrt_ke, M)
+    end
+    return _stress_gather(dus, part)
+end
+
+function _stress_mgpu_cross_init(M, Nj, kind::Symbol)
+    u = zeros(ComplexF64, state_length_2nd_order(M))
+    u_mono = build_u0_2nd_order(M, Nj, kind)
+    nsmall0 = small_length(M)
+    u[1:nsmall0] .= u_mono[1:nsmall0]
+    fill_szsz = kind === :ground || kind === :inverted ||
+                kind === :weak || kind === :weak_inverted
+    fill_sp_cross = kind === :equator || kind === :weak || kind === :weak_inverted
+    nsmall = small_length(M)
+    SpSp = reshape(@view(u[nsmall + 1:nsmall + M * M]), M, M)
+    SzSp = reshape(@view(u[nsmall + M * M + 1:nsmall + 2M * M]), M, M)
+    SmSp = reshape(@view(u[nsmall + 2M * M + 1:nsmall + 3M * M]), M, M)
+    SzSz = reshape(@view(u[nsmall + 3M * M + 1:nsmall + 4M * M]), M, M)
+    if fill_szsz
+        @inbounds for k in 1:M, j in 1:M
+            j == k && continue
+            SzSz[j, k] = Nj[j] * Nj[k] / 4
+        end
+    end
+    if fill_sp_cross
+        sp_scale = kind === :equator ? 0.5 : _WEAK_SEED / 2
+        sz_scale = kind === :equator ? 0.0 : (kind === :weak ? -0.5 : 0.5)
+        @inbounds for k in 1:M, j in 1:M
+            j == k && continue
+            SpSp[j, k] = (sp_scale * Nj[j]) * (sp_scale * Nj[k])
+            SmSp[j, k] = (sp_scale * Nj[j]) * (sp_scale * Nj[k])
+            if sz_scale != 0
+                SzSp[j, k] = (sz_scale * Nj[j]) * (sp_scale * Nj[k])
+            end
+        end
+    end
+    return u
+end
+
+function _stress_phys_p(M, Nj; ke=2π * 1e6, ki=2π * 1e5, Et=0.25 + 0.1im, delta0=0.0)
+    delta = [2π * 5e4 * sin(2π * j / max(M, 1)) for j in 1:M]
+    g = [2π * (80.0 + 15.0 * cos(2π * j / max(M, 1))) for j in 1:M]
+    if M == length(PHYS_NJ) && Nj == PHYS_NJ
+        delta = Float64[0.0, 2π * 5e4, -2π * 5e4]
+        g = Float64[2π * 100, 2π * 90, 2π * 110]
+    end
+    return delta, g, ke, ki, ComplexF64(Et), delta0
+end
+
+function _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+    M = length(delta)
+    mask = ComplexF64.(.!Matrix(I, M, M))
+    p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
+    du = zero(u)
+    rhs_2nd_order!(du, u, p, 0.0)
+    return du
+end
+
+@testset "EnsemblePartition edge sizes and uneven splits" begin
+    for (M, ns) in ((1, 1), (2, 1), (2, 2), (3, 2), (5, 3), (7, 5), (8, 3),
+                    (11, 4), (16, 5), (17, 16), (64, 7))
+        part = EnsemblePartition(M, ns)
+        @test nshards(part) == ns
+        @test sum(part.counts) == M
+        @test all(c -> c >= 1, part.counts)
+        @test maximum(part.counts) - minimum(part.counts) <= 1
+        covered = vcat((part[p] for p in 1:ns)...)
+        @test covered == 1:M
+        @test part.offsets[1] == 0
+        for p in 2:ns
+            @test part.offsets[p] == part.offsets[p-1] + part.counts[p-1]
+        end
+        @test last(rowsum_owned_range(part, ns)) == 3M
+    end
+    @test_throws ErrorException EnsemblePartition(0, 1)
+    @test_throws ErrorException EnsemblePartition(3, 0)
+    @test_throws ErrorException EnsemblePartition(3, 4)
+    @test_throws ErrorException EnsemblePartition(5, -1)
+end
+
+@testset "rowsum backend chooser (NCCL / P2P / host ladder)" begin
+    @test choose_rowsum_exchange(1; have_nccl=true, nunique_devices=1, nccl_ok=true, p2p_ok=true) === :none
+    @test choose_rowsum_exchange(2; have_nccl=true, nunique_devices=2, nccl_ok=true, p2p_ok=true) === :nccl
+    @test choose_rowsum_exchange(2; have_nccl=true, nunique_devices=2, nccl_ok=false, p2p_ok=true) === :p2p
+    @test choose_rowsum_exchange(2; have_nccl=false, nunique_devices=2, nccl_ok=false, p2p_ok=true) === :p2p
+    @test choose_rowsum_exchange(2; have_nccl=true, nunique_devices=1, nccl_ok=true, p2p_ok=true) === :p2p
+    @test choose_rowsum_exchange(3; have_nccl=true, nunique_devices=2, nccl_ok=true, p2p_ok=false) === :host
+    @test choose_rowsum_exchange(4; have_nccl=false, nunique_devices=4, nccl_ok=false, p2p_ok=false) === :host
+    @test choose_rowsum_exchange(2; have_nccl=true, nunique_devices=2, nccl_ok=false, p2p_ok=false) === :host
+end
+
+@testset "rowsum NCCL / P2P / host agree on clean uneven partitions" begin
+    for (M, ns) in ((1, 1), (2, 2), (3, 2), (5, 3), (7, 5), (8, 3), (11, 4), (17, 5), (64, 7))
+        part = EnsemblePartition(M, ns)
+        rng = MersenneTwister(1000 + 17 * M + ns)
+        src, truth = _stress_local_rowsums(part, rng)
+        for mode in (:nccl, :p2p, :host)
+            bufs = [copy(b) for b in src]
+            assemble_rowsums!(mode, bufs, part)
+            for b in bufs
+                @test b ≈ truth rtol=0 atol=0
+            end
+        end
+        if ns == 1
+            bufs = [copy(src[1])]
+            assemble_rowsums!(:none, bufs, part)
+            @test bufs[1] == src[1]
+        end
+    end
+end
+
+@testset "rowsum dirty non-owned slots: NCCL sums, P2P/host assign" begin
+    part = EnsemblePartition(11, 4)
+    rng = MersenneTwister(99)
+    clean, truth = _stress_local_rowsums(part, rng)
+    dirty = [copy(b) for b in clean]
+    for p in 1:nshards(part)
+        dirty[p] .+= randn(rng, ComplexF64, 3 * part.M)
+        dirty[p][rowsum_owned_range(part, p)] .= clean[p][rowsum_owned_range(part, p)]
+    end
+
+    nccl = [copy(b) for b in dirty]
+    assemble_rowsums_nccl!(nccl)
+    p2p = [copy(b) for b in dirty]
+    assemble_rowsums_p2p!(p2p, part)
+    host = [copy(b) for b in dirty]
+    assemble_rowsums_host!(host, part)
+
+    @test p2p[1] ≈ truth
+    @test host[1] ≈ truth
+    @test p2p[1] ≈ host[1]
+    @test maximum(abs.(nccl[1] .- truth)) > 1e-8
+    for b in p2p
+        @test b ≈ truth
+    end
+    for b in host
+        @test b ≈ truth
+    end
+end
+
+@testset "rowsum single-shard vs multi-shard owned coverage" begin
+    M = 13
+    full = randn(MersenneTwister(4), ComplexF64, 3M)
+    one = EnsemblePartition(M, 1)
+    b1 = [copy(full)]
+    assemble_rowsums!(:none, b1, one)
+    @test b1[1] == full
+
+    for ns in (2, 3, 5, 12, 13)
+        part = EnsemblePartition(M, ns)
+        bufs = [zeros(ComplexF64, 3M) for _ in 1:ns]
+        for p in 1:ns
+            r = rowsum_owned_range(part, p)
+            bufs[p][r] .= full[r]
+        end
+        for mode in (:nccl, :p2p, :host)
+            got = [copy(b) for b in bufs]
+            assemble_rowsums!(mode, got, part)
+            for b in got
+                @test b ≈ full
+            end
+        end
+    end
+end
+
+@testset "order-2 ground / equator IC sweeps (weird Nj, M)" begin
+    kinds = (:ground, :inverted, :equator, :weak, :weak_inverted)
+    Nj_cases = (
+        [1.0],
+        [2.0],
+        [0.5],
+        [1e12],
+        [1.0, 2.0, 3.0],
+        [1.0, 1.0, 1.0],
+        [0.25, 4.0, 1e6],
+        [2.0, 4.0, 6.0],
+        collect(1.0:7.0),
+        [1e-3, 1.0, 50.0, 1e8],
+    )
+    for Nj in Nj_cases
+        M = length(Nj)
+        for kind in kinds
+            u = build_u0_2nd_order(M, Nj, kind)
+            Sp, Sz, SmSp, SzSz, SpSp, SzSp = _phys_unpack_same(u, M)
+            Sp0, Sz0 = _spin_means_2nd_order(Nj, kind)
+            @test Sp ≈ ComplexF64.(Sp0)
+            @test Sz ≈ ComplexF64.(Sz0)
+            @test SmSp ≈ ComplexF64.(product_SmSp_same.(Nj, Sp0, Sz0))
+            @test SzSz ≈ ComplexF64.(product_SzSz_same.(Nj, Sz0))
+            @test SpSp ≈ ComplexF64.(product_SpSp_same.(Nj, Sp0))
+            @test SzSp ≈ ComplexF64.(product_SzSp_same.(Nj, Sz0, Sp0))
+            @test u[small_range(M, F_SmSp_s)] ≈ ComplexF64.(product_SmSp_same.(Nj, Sp0, Sz0))
+
+            st = unpack_state_2nd_order_u(u, M)
+            SpSp_x, SzSp_x, SmSp_x, SzSz_x = st[13], st[14], st[15], st[16]
+            @test all(iszero, diag(SpSp_x))
+            @test all(iszero, diag(SzSp_x))
+            @test all(iszero, diag(SmSp_x))
+            @test all(iszero, diag(SzSz_x))
+            @inbounds for k in 1:M, j in 1:M
+                j == k && continue
+                @test SpSp_x[j, k] ≈ ComplexF64(Sp0[j] * Sp0[k])
+                @test SzSp_x[j, k] ≈ ComplexF64(Sz0[j] * Sp0[k])
+                @test SmSp_x[j, k] ≈ ComplexF64(conj(Sp0[j]) * Sp0[k])
+                @test SzSz_x[j, k] ≈ ComplexF64(Sz0[j] * Sz0[k])
+            end
+
+            u_mgpu = _stress_mgpu_cross_init(M, Nj, kind)
+            @test u_mgpu ≈ u rtol=1e-13 atol=1e-13
+        end
+
+        u_g = build_u0_2nd_order(M, Nj, :ground)
+        _, Sz_g, SmSp_g, _, _, _ = _phys_unpack_same(u_g, M)
+        @test real.(SmSp_g) ≈ Nj
+        @test SmSp_g .+ 2 .* Sz_g ≈ zero(SmSp_g) atol=1e-12 * max(1.0, maximum(abs.(Nj)))
+        @test all(iszero, imag.(SmSp_g))
+
+        u_e = build_u0_2nd_order(M, Nj, :equator)
+        Sp_e, Sz_e, SmSp_e, SzSz_e, _, _ = _phys_unpack_same(u_e, M)
+        @test all(iszero, Sz_e)
+        @test Sp_e ≈ Nj ./ 2
+        @test real.(SzSz_e) ≈ Nj ./ 4 atol=1e-12 * max(1.0, maximum(abs.(Nj)))
+        @test maximum(abs.(SmSp_e .- abs2.(Sp_e))) > 0 || all(Nj .== 1)
+    end
+    @test_throws ErrorException build_u0_2nd_order(2, [1.0], :ground)
+    @test_throws ErrorException build_u0_2nd_order(1, [1.0], :nope)
+end
+
+@testset "order-2 ground is a fixed point; equator is not" begin
+    for (M, Nj) in ((1, [4.0]), (2, [1.0, 3.0]), (3, PHYS_NJ), (5, [1.0, 2.0, 0.5, 8.0, 1e3]),
+                    (7, collect(range(0.75, 6.25; length=7))))
+        delta, g, ke, ki, Et0, delta0 = _stress_phys_p(M, Nj; ki=2π * 2e5, Et=0)
+        u_g = build_u0_2nd_order(M, Nj, :ground)
+        du_g = _stress_monolith_rhs(u_g, delta, g, ke, ki, Et0, delta0)
+        @test maximum(abs.(du_g)) < 1e-10 * max(1.0, maximum(abs.(g)) * maximum(abs.(Nj)))
+
+        u_e = build_u0_2nd_order(M, Nj, :equator)
+        du_e = _stress_monolith_rhs(u_e, delta, g, ke, 0.0, 0.0 + 0.0im, 0.0)
+        @test all(isfinite, du_e)
+        @test maximum(abs.(du_e)) > 1e-8
+
+        u_step = copy(u_g)
+        for _ in 1:8
+            du = _stress_monolith_rhs(u_step, delta, g, ke, ki, Et0, delta0)
+            u_step .+= 1e-12 .* du
+        end
+        @test maximum(abs.(u_step .- u_g)) < 1e-18 * length(u_g) + 1e-15
+        @test all(isfinite, u_step)
+
+        u_estep = copy(u_e)
+        du1 = _stress_monolith_rhs(u_estep, delta, g, ke, 0.0, 0.0 + 0.0im, 0.0)
+        u_estep .+= 1e-14 .* du1
+        @test all(isfinite, u_estep)
+        @test maximum(abs.(u_estep .- u_e)) > 0 || maximum(abs.(du1)) == 0
+    end
+end
+
+@testset "CPU-sharded MGPU RHS vs monolith (single vs multi, all backends)" begin
+    cases = (
+        (3, PHYS_NJ, :ground),
+        (3, PHYS_NJ, :equator),
+        (3, PHYS_NJ, :weak),
+        (3, PHYS_NJ, :inverted),
+        (1, [5.0], :ground),
+        (1, [5.0], :equator),
+        (5, [1.0, 2.0, 0.5, 8.0, 3.0], :equator),
+        (7, collect(1.0:7.0), :weak),
+        (8, fill(2.0, 8), :ground),
+    )
+    for (M, Nj, kind) in cases
+        delta, g, ke, ki, Et, delta0 = _stress_phys_p(M, Nj)
+        u = build_u0_2nd_order(M, Nj, kind)
+        du_mono = _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+        du_cpu = zero(u)
+        rhs_cpu!(du_cpu, u, delta0, ke, ki, delta, g, Et)
+        @test du_cpu ≈ du_mono rtol=1e-13 atol=1e-13
+
+        shard_counts = unique(vcat(1, 2, min(3, M), min(5, M), M))
+        dus = Dict{Tuple{Int,Symbol},Vector{ComplexF64}}()
+        for ns in shard_counts
+            part = EnsemblePartition(M, ns)
+            modes = ns == 1 ? (:none,) : (:nccl, :p2p, :host)
+            for mode in modes
+                du = _stress_mgpu_rhs(u, delta, g, Et, delta0, ke, ki, part, mode)
+                dus[(ns, mode)] = du
+                @test du ≈ du_mono rtol=1e-11 atol=1e-11
+                @test all(isfinite, du)
+            end
+        end
+        if M >= 2
+            @test dus[(1, :none)] ≈ dus[(min(3, M), :host)] rtol=1e-12 atol=1e-12
+            @test dus[(min(3, M), :nccl)] ≈ dus[(min(3, M), :p2p)] rtol=0 atol=0
+            @test dus[(min(3, M), :p2p)] ≈ dus[(min(3, M), :host)] rtol=0 atol=0
+        end
+    end
+
+    rng = MersenneTwister(2710)
+    for M in (3, 5, 8)
+        delta, g, ke, ki, Et, delta0 = _stress_phys_p(M, ones(M))
+        u = randn(rng, ComplexF64, state_length_2nd_order(M))
+        du_mono = _stress_monolith_rhs(u, delta, g, ke, ki, Et, delta0)
+        @test maximum(abs.(du_mono)) > 1e-8
+        for ns in unique((1, 2, min(3, M), M))
+            part = EnsemblePartition(M, ns)
+            mode = ns == 1 ? :none : :host
+            du = _stress_mgpu_rhs(u, delta, g, Et, delta0, ke, ki, part, mode)
+            @test du ≈ du_mono rtol=1e-10 atol=1e-10
+        end
+        if M >= 3
+            part = EnsemblePartition(M, 3)
+            d_nccl = _stress_mgpu_rhs(u, delta, g, Et, delta0, ke, ki, part, :nccl)
+            d_p2p = _stress_mgpu_rhs(u, delta, g, Et, delta0, ke, ki, part, :p2p)
+            d_host = _stress_mgpu_rhs(u, delta, g, Et, delta0, ke, ki, part, :host)
+            @test d_nccl ≈ d_p2p rtol=0 atol=0
+            @test d_p2p ≈ d_host rtol=0 atol=0
+        end
+    end
+end
+
+@testset "rhs_cpu! vs rhs_2nd_order! numerical edges" begin
+    edges = (
+        (1, [1.0], :ground, 0.0, 2π * 1e6, 0.0, 0.0 + 0.0im),
+        (1, [1.0], :equator, 2π * 1e5, 2π * 1e6, 2π * 1e5, 1.0 + 0.3im),
+        (2, [1e-2, 1e6], :weak, 0.0, 1e-8, 1e-8, 0.0 + 0.0im),
+        (4, [1.0, 1.0, 1.0, 1.0], :inverted, -2π * 1e4, 2π * 2e6, 0.0, -0.4 + 0.9im),
+    )
+    for (M, Nj, kind, delta0, ke, ki, Et) in edges
+        u = build_u0_2nd_order(M, Nj, kind)
+        delta = collect(range(-2π * 1e5, 2π * 1e5; length=M))
+        g = collect(range(2π * 50, 2π * 150; length=M))
+        mask = ComplexF64.(.!Matrix(I, M, M))
+        p = (delta0, ke, ki, delta, g, M, mask, Returns(Et))
+        du2 = zero(u)
+        rhs_2nd_order!(du2, u, p, 0.0)
+        du_cpu = zero(u)
+        rhs_cpu!(du_cpu, u, delta0, ke, ki, delta, g, Et)
+        @test du_cpu ≈ du2 rtol=1e-13 atol=1e-13
+        @test all(isfinite, du2)
+    end
+end
+
+@testset "GPU↔CPU 2nd-order RHS parity" begin
+    gpu_ok = false
+    try
+        gpu_ok = CUDA.functional()
     catch
+        gpu_ok = false
+    end
+    if !gpu_ok
+        @test_skip "CUDA.functional() is false on this worker; device RHS not executed"
+        return
+    end
+
+    for (M, Nj, kind) in ((PHYS_M, PHYS_NJ, :weak), (PHYS_M, PHYS_NJ, :ground),
+                          (PHYS_M, PHYS_NJ, :equator), (5, [1.0, 2.0, 3.0, 4.0, 5.0], :weak))
+        u = build_u0_2nd_order(M, Nj, kind)
+        delta = [2π * 5e4 * sin(2π * j / M) for j in 1:M]
+        g = [2π * (90.0 + 10.0 * j) for j in 1:M]
+        if M == PHYS_M
+            delta = [0.0, 2π * 5e4, -2π * 5e4]
+            g = [2π * 100, 2π * 90, 2π * 110]
+        end
+        mask = ComplexF64.(.!Matrix(I, M, M))
+        E = t -> 0.25 + 0.1im
+        p_cpu = (0.0, 2π * 1e6, 2π * 1e5, delta, g, M, mask, E)
+        du_cpu = zero(u)
+        rhs_2nd_order!(du_cpu, u, p_cpu, 1e-6)
+
+        p_gpu = (0.0, 2π * 1e6, 2π * 1e5, CuArray(delta), CuArray(g), M, CuArray(mask), E)
+        du_gpu = CUDA.zeros(ComplexF64, length(u))
+        rhs_2nd_order!(du_gpu, CuArray(u), p_gpu, 1e-6)
+        @test Array(du_gpu) ≈ du_cpu rtol=1e-12 atol=1e-12
     end
 end
